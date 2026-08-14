@@ -1,6 +1,7 @@
 package app
 
 import (
+	"fmt"
 	"regexp"
 	"strings"
 	"testing"
@@ -264,6 +265,233 @@ func TestRenderMarkdownCachesRendererAndStylesCodeBlocks(t *testing.T) {
 	title := regexp.MustCompile(`(?m)^\s*BIG TITLE`).FindString(stripANSI(m.preview.View()))
 	if title == "" {
 		t.Fatalf("expected uppercased H1 title in preview: %q", stripANSI(m.preview.View()))
+	}
+}
+
+func TestFindSearchMatchesIsCaseInsensitive(t *testing.T) {
+	matches := findSearchMatches("Hello World\nhello again", "HELLO")
+	if len(matches) != 2 {
+		t.Fatalf("expected 2 case-insensitive matches, got %d", len(matches))
+	}
+	if matches[0].line != 0 || matches[0].start != 0 || matches[0].end != 5 {
+		t.Fatalf("unexpected first match %+v", matches[0])
+	}
+	if matches[1].line != 1 || matches[1].start != 0 {
+		t.Fatalf("unexpected second match %+v", matches[1])
+	}
+}
+
+func TestHighlightSearchContentUsesReverse(t *testing.T) {
+	content := "Hello World\nhello again"
+	out := highlightSearchContent(content, "hello")
+	if !strings.Contains(out, "\x1b[7m") {
+		t.Fatalf("expected reverse highlight codes, got %q", out)
+	}
+	if strings.Count(out, "\x1b[7m") != 2 {
+		t.Fatalf("expected both matches highlighted, got %q", out)
+	}
+}
+
+func TestSearchModeNavigatesAndExits(t *testing.T) {
+	store := storage.New(t.TempDir())
+	note, err := store.CreateNote("", "search-note")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := New(store)
+	m.resize(100, 30)
+	m.selectPath(note)
+	m.openSelectedNote()
+	m.editor.SetValue("alpha beta alpha\nbeta alpha")
+	m.renderMarkdown()
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlF})
+	m = updated.(Model)
+	if m.mode != modeSearch {
+		t.Fatalf("expected search mode after Ctrl+F, got %v", m.mode)
+	}
+	if !m.input.Focused() {
+		t.Fatal("expected search input to be focused")
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("alpha")})
+	m = updated.(Model)
+	want := findSearchMatches(m.renderedPlain, "alpha")
+	if len(m.searchMatches) != len(want) || len(m.searchMatches) == 0 {
+		t.Fatalf("expected %d search matches, got %d", len(want), len(m.searchMatches))
+	}
+	if !strings.Contains(m.preview.View(), "\x1b[7m") {
+		t.Fatal("expected highlight codes in preview while searching")
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	if m.searchIndex != 1 {
+		t.Fatalf("expected Enter to advance to match 2, got index %d", m.searchIndex)
+	}
+	if m.input.Focused() {
+		t.Fatal("expected search input to blur after Enter")
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	m = updated.(Model)
+	if m.searchIndex != 2 {
+		t.Fatalf("expected n to advance to match 3, got index %d", m.searchIndex)
+	}
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'N'}})
+	m = updated.(Model)
+	if m.searchIndex != 1 {
+		t.Fatalf("expected N to go back to match 2, got index %d", m.searchIndex)
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+	if m.mode != modeNormal {
+		t.Fatalf("expected Esc to leave search mode, got %v", m.mode)
+	}
+	if len(m.searchMatches) != 0 {
+		t.Fatal("expected search matches cleared on exit")
+	}
+	if strings.Contains(m.preview.View(), "\x1b[7m") {
+		t.Fatal("expected highlights cleared after leaving search mode")
+	}
+}
+
+func TestGotoLineInEditMode(t *testing.T) {
+	store := storage.New(t.TempDir())
+	note, err := store.CreateNote("", "goto-note")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := New(store)
+	m.resize(100, 30)
+	m.selectPath(note)
+	m.openSelectedNote()
+	m.toggleEdit()
+	m.editor.SetValue("line one\nline two\nline three\nline four")
+
+	m.startGotoLine()
+	m.input.SetValue("3")
+	updated, _ := m.updateGotoLinePrompt(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	if m.mode != modeEdit {
+		t.Fatalf("expected to return to edit mode after goto line, got %v", m.mode)
+	}
+	if m.editor.Line() != 2 {
+		t.Fatalf("expected cursor on line 3 (0-based 2), got %d", m.editor.Line())
+	}
+}
+
+func TestGotoLineClampsToLastLineInPreview(t *testing.T) {
+	store := storage.New(t.TempDir())
+	note, err := store.CreateNote("", "goto-preview")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := New(store)
+	m.resize(100, 30)
+	m.selectPath(note)
+	m.openSelectedNote()
+	var b strings.Builder
+	for i := 0; i < 80; i++ {
+		b.WriteString("line of content number " + fmt.Sprint(i) + "\n")
+	}
+	m.editor.SetValue(b.String())
+	m.renderMarkdown()
+
+	m.startGotoLine()
+	m.input.SetValue("999")
+	updated, _ := m.updateGotoLinePrompt(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	if m.mode != modeNormal {
+		t.Fatalf("expected preview mode after goto line, got %v", m.mode)
+	}
+	if m.preview.YOffset <= 0 {
+		t.Fatalf("expected out-of-range line to scroll to last, got offset %d", m.preview.YOffset)
+	}
+	if !m.statusErr {
+		t.Fatal("expected out-of-range status message")
+	}
+}
+
+func TestEditStatusBarShowsPosition(t *testing.T) {
+	store := storage.New(t.TempDir())
+	note, err := store.CreateNote("", "status-edit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := New(store)
+	m.resize(100, 30)
+	m.selectPath(note)
+	m.openSelectedNote()
+	m.toggleEdit()
+	m.editor.SetValue("a\nb\nc")
+	m.gotoLineEdit(0)
+
+	bar := stripANSI(m.editShortcutBar())
+	if !strings.Contains(bar, "Ln 1 / 3 · Col 1") {
+		t.Fatalf("edit status bar missing position: %q", bar)
+	}
+}
+
+func TestPreviewStatusBarShowsStats(t *testing.T) {
+	store := storage.New(t.TempDir())
+	note, err := store.CreateNote("", "status-preview")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := New(store)
+	m.resize(100, 30)
+	m.selectPath(note)
+	m.openSelectedNote()
+	m.editor.SetValue("one two three\nfour five")
+	m.renderMarkdown()
+
+	bar := stripANSI(m.shortcutBar())
+	if !strings.Contains(bar, "5 words · 2 lines · ~1 min read") {
+		t.Fatalf("preview status bar missing stats: %q", bar)
+	}
+}
+
+func TestAutoIndentOnEnter(t *testing.T) {
+	store := storage.New(t.TempDir())
+	note, err := store.CreateNote("", "indent-note")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := New(store)
+	m.resize(100, 30)
+	m.selectPath(note)
+	m.openSelectedNote()
+	m.toggleEdit()
+
+	m.editor.SetValue("- item")
+	m.editor.SetCursor(6)
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	if m.editor.Value() != "- item\n- " {
+		t.Fatalf("expected list continuation, got %q", m.editor.Value())
+	}
+}
+
+func TestAutoIndentInheritsIndentation(t *testing.T) {
+	store := storage.New(t.TempDir())
+	note, err := store.CreateNote("", "indent-space")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := New(store)
+	m.resize(100, 30)
+	m.selectPath(note)
+	m.openSelectedNote()
+	m.toggleEdit()
+
+	m.editor.SetValue("  hello")
+	m.editor.SetCursor(7)
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	if m.editor.Value() != "  hello\n  " {
+		t.Fatalf("expected indentation inherited, got %q", m.editor.Value())
 	}
 }
 

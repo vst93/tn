@@ -6,8 +6,10 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/atotto/clipboard"
 	"github.com/charmbracelet/bubbles/textarea"
@@ -42,6 +44,7 @@ const (
 	modePrompt
 	modeConfirm
 	modeHelp
+	modeSearch
 )
 
 type promptKind int
@@ -50,6 +53,7 @@ const (
 	promptNote promptKind = iota
 	promptDir
 	promptRename
+	promptGotoLine
 )
 
 type flatNode struct {
@@ -67,6 +71,12 @@ type selectionModeMsg struct{}
 type statusClearMsg struct{ id uint64 }
 
 type cursorPos struct{ row, col int }
+
+type matchPos struct {
+	line  int
+	start int
+	end   int
+}
 
 type editorSel struct {
 	anchor cursorPos
@@ -86,14 +96,20 @@ type Model struct {
 	mode       mode
 	beforeHelp mode
 
-	currentPath  string
-	original     string
-	editor       textarea.Model
-	preview      viewport.Model
-	renderedPlain string
-	editSel      *editorSel
-	input        textinput.Model
-	promptKind   promptKind
+	currentPath     string
+	original        string
+	editor          textarea.Model
+	preview         viewport.Model
+	renderedPlain   string
+	renderedContent string
+	editSel         *editorSel
+	input           textinput.Model
+	promptKind      promptKind
+	beforePrompt    mode
+
+	searchQuery   string
+	searchMatches []matchPos
+	searchIndex   int
 
 	width, height int
 	treeWidth     int
@@ -192,6 +208,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
+		if m.mode == modeSearch {
+			return m.updateSearch(msg)
+		}
 
 		if handled, quit := m.globalKey(key); handled {
 			if quit {
@@ -211,6 +230,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.editSel.end = m.cursorPos()
 				}
 			} else {
+				if msg.Type == tea.KeyEnter {
+					if indent := m.enterIndent(); indent != "" {
+						m.editor.InsertString("\n" + indent)
+						m.editSel = nil
+						return m, nil
+					}
+				}
 				m.editSel = nil
 				m.editor, cmd = m.editor.Update(msg)
 			}
@@ -306,6 +332,19 @@ func (m *Model) globalKey(key string) (handled, quit bool) {
 		return true, false
 	case "ctrl+y":
 		m.copyCurrent()
+		return true, false
+	case "ctrl+f":
+		if m.mode == modeEdit {
+			return false, false
+		}
+		if m.currentPath == "" {
+			m.setStatus("Open a note first", true)
+			return true, false
+		}
+		m.startSearch()
+		return true, false
+	case "alt+g":
+		m.startGotoLine()
 		return true, false
 	case "ctrl+l":
 		if m.mode == modeEdit {
@@ -723,6 +762,9 @@ func (m *Model) startPrompt(kind promptKind) {
 }
 
 func (m Model) updatePrompt(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.promptKind == promptGotoLine {
+		return m.updateGotoLinePrompt(msg)
+	}
 	switch msg.String() {
 	case "esc":
 		m.mode = modeNormal
@@ -880,6 +922,259 @@ func (m *Model) dirty() bool {
 	return m.currentPath != "" && m.editor.Value() != m.original
 }
 
+func (m *Model) lineCount() int {
+	return m.editor.LineCount()
+}
+
+func (m *Model) previewLineCount() int {
+	if m.renderedContent == "" {
+		return 0
+	}
+	return strings.Count(m.renderedContent, "\n") + 1
+}
+
+func (m *Model) startSearch() {
+	m.mode = modeSearch
+	m.active = contentPane
+	m.searchQuery = ""
+	m.searchMatches = nil
+	m.searchIndex = 0
+	m.status = ""
+	m.input.Prompt = "Search: "
+	m.input.Placeholder = "type to search"
+	m.input.SetValue("")
+	m.input.Width = max(10, min(50, m.width-12))
+	m.input.Focus()
+	m.preview.SetContent(m.renderedContent)
+	m.adjustPreviewHeight()
+}
+
+func (m *Model) exitSearch() {
+	m.mode = modeNormal
+	m.active = contentPane
+	m.searchQuery = ""
+	m.searchMatches = nil
+	m.searchIndex = 0
+	m.input.Blur()
+	m.input.Prompt = "› "
+	m.preview.SetContent(m.renderedContent)
+	m.adjustPreviewHeight()
+}
+
+func (m Model) updateSearch(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	focused := m.input.Focused()
+	switch msg.String() {
+	case "esc":
+		m.exitSearch()
+		return m, nil
+	case "enter":
+		m.nextSearchMatch(1)
+		m.blurSearchInput()
+		return m, nil
+	case "shift+enter":
+		m.nextSearchMatch(-1)
+		m.blurSearchInput()
+		return m, nil
+	case "n":
+		if !focused {
+			m.nextSearchMatch(1)
+			return m, nil
+		}
+	case "N":
+		if !focused {
+			m.nextSearchMatch(-1)
+			return m, nil
+		}
+	}
+	if !focused {
+		m.input.Focus()
+	}
+	var cmd tea.Cmd
+	m.input, cmd = m.input.Update(msg)
+	query := m.input.Value()
+	if query != m.searchQuery {
+		m.searchQuery = query
+		m.searchMatches = findSearchMatches(m.renderedPlain, query)
+		m.searchIndex = 0
+		m.applySearchHighlight()
+		m.scrollToCurrentMatch()
+	}
+	return m, cmd
+}
+
+func (m *Model) blurSearchInput() {
+	if m.input.Focused() {
+		m.input.Blur()
+	}
+}
+
+func (m *Model) applySearchHighlight() {
+	if m.searchQuery == "" {
+		m.preview.SetContent(m.renderedContent)
+		return
+	}
+	m.preview.SetContent(highlightSearchContent(m.renderedContent, m.searchQuery))
+}
+
+func (m *Model) nextSearchMatch(delta int) {
+	n := len(m.searchMatches)
+	if n == 0 {
+		return
+	}
+	m.searchIndex = ((m.searchIndex+delta)%n + n) % n
+	m.scrollToCurrentMatch()
+}
+
+func (m *Model) scrollToCurrentMatch() {
+	if len(m.searchMatches) == 0 {
+		return
+	}
+	idx := m.searchIndex
+	if idx < 0 || idx >= len(m.searchMatches) {
+		return
+	}
+	m.scrollPreviewToLine(m.searchMatches[idx].line)
+}
+
+func (m *Model) scrollPreviewToLine(line0 int) {
+	total := m.previewLineCount()
+	visible := max(1, m.preview.Height)
+	if total <= visible {
+		m.preview.SetYOffset(0)
+		return
+	}
+	target := line0 - visible/2
+	target = max(0, min(total-visible, target))
+	m.preview.SetYOffset(target)
+}
+
+func (m *Model) adjustPreviewHeight() {
+	base := max(1, m.contentHeight()-2)
+	if m.mode == modeSearch {
+		base = max(1, base-1)
+	}
+	m.preview.Height = base
+}
+
+func (m *Model) startGotoLine() {
+	if m.currentPath == "" {
+		m.flashStatus("Open a note first", true, 2*time.Second)
+		return
+	}
+	m.beforePrompt = m.mode
+	m.promptKind = promptGotoLine
+	m.mode = modePrompt
+	m.statusErr = false
+	m.input.SetValue("")
+	m.input.Placeholder = "line number"
+	m.input.Prompt = "Go to line: "
+	m.input.Width = max(8, min(20, m.width-14))
+	m.input.Focus()
+}
+
+func (m Model) updateGotoLinePrompt(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.mode = m.beforePrompt
+		m.input.Blur()
+		m.input.Prompt = "› "
+		m.restoreEditFocus()
+		return m, nil
+	case "enter":
+		value := m.input.Value()
+		m.mode = m.beforePrompt
+		m.input.Blur()
+		m.input.Prompt = "› "
+		m.restoreEditFocus()
+		m.performGotoLine(value)
+		return m, nil
+	}
+	if !isGotoLineKey(msg) {
+		return m, nil
+	}
+	var cmd tea.Cmd
+	m.input, cmd = m.input.Update(msg)
+	return m, cmd
+}
+
+func isGotoLineKey(msg tea.KeyMsg) bool {
+	if msg.Type == tea.KeyRunes && len(msg.Runes) == 1 {
+		r := msg.Runes[0]
+		return r >= '0' && r <= '9'
+	}
+	switch msg.Type {
+	case tea.KeyBackspace, tea.KeyDelete, tea.KeyLeft, tea.KeyRight, tea.KeyHome, tea.KeyEnd, tea.KeyCtrlA, tea.KeyCtrlE, tea.KeyCtrlK, tea.KeyCtrlU, tea.KeyCtrlW:
+		return true
+	}
+	return false
+}
+
+func (m *Model) performGotoLine(value string) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return
+	}
+	line, err := strconv.Atoi(value)
+	if err != nil || line < 1 {
+		m.flashStatus("Invalid line number", true, 2*time.Second)
+		return
+	}
+	if m.mode == modeEdit {
+		total := m.editor.LineCount()
+		if line > total {
+			line = total
+			m.flashStatus("Line out of range · jumped to last line", true, 2*time.Second)
+		} else {
+			m.setStatus(fmt.Sprintf("Jumped to line %d", line), false)
+		}
+		m.gotoLineEdit(line - 1)
+		return
+	}
+	total := m.previewLineCount()
+	if line > total {
+		line = total
+		m.flashStatus("Line out of range · jumped to last line", true, 2*time.Second)
+	}
+	m.scrollPreviewToLine(line - 1)
+}
+
+func (m *Model) gotoLineEdit(line int) {
+	if line < 0 {
+		line = 0
+	}
+	if line > m.editor.LineCount()-1 {
+		line = m.editor.LineCount() - 1
+	}
+	current := m.editor.Line()
+	for current > line {
+		m.editor.CursorUp()
+		current--
+	}
+	for current < line {
+		m.editor.CursorDown()
+		current++
+	}
+	m.editor.SetCursor(0)
+}
+
+func (m *Model) restoreEditFocus() {
+	if m.mode == modeEdit {
+		m.editor.Focus()
+	}
+}
+
+func (m Model) enterIndent() string {
+	pos := m.cursorPos()
+	line := m.currentLineText()
+	if pos.col < len([]rune(line)) {
+		return ""
+	}
+	if cont := listContinuation(line); cont != "" {
+		return cont
+	}
+	return leadingIndent(line)
+}
+
 func (m *Model) refresh(preferred string) {
 	tree, err := m.store.Tree()
 	if err != nil {
@@ -996,7 +1291,7 @@ func (m *Model) resize(width, height int) {
 	m.editor.SetWidth(max(10, contentWidth-4))
 	m.editor.SetHeight(max(1, m.contentHeight()-2))
 	m.preview.Width = max(10, contentWidth-4)
-	m.preview.Height = max(1, m.contentHeight()-2)
+	m.adjustPreviewHeight()
 	m.ensureSelectionVisible()
 	m.renderMarkdown()
 }
@@ -1004,6 +1299,7 @@ func (m *Model) resize(width, height int) {
 func (m *Model) renderMarkdown() {
 	if m.currentPath == "" {
 		m.preview.SetContent("")
+		m.renderedContent = ""
 		return
 	}
 	width := max(20, m.preview.Width-1)
@@ -1017,6 +1313,7 @@ func (m *Model) renderMarkdown() {
 		if err != nil {
 			m.setStatus("Markdown renderer: "+err.Error(), true)
 			m.preview.SetContent(m.editor.Value())
+			m.renderedContent = m.editor.Value()
 			m.renderedPlain = m.editor.Value()
 			return
 		}
@@ -1027,11 +1324,13 @@ func (m *Model) renderMarkdown() {
 	if err != nil {
 		m.setStatus("Markdown preview: "+err.Error(), true)
 		m.preview.SetContent(m.editor.Value())
+		m.renderedContent = m.editor.Value()
 		m.renderedPlain = m.editor.Value()
 		return
 	}
 	content := strings.TrimSpace(decorateCodeBlocks(rendered, width))
 	m.preview.SetContent(content)
+	m.renderedContent = content
 	m.renderedPlain = extractPlainText(content)
 }
 
@@ -1106,30 +1405,30 @@ func markdownStyle() glamansi.StyleConfig {
 			},
 			Margin: uintPtr(1),
 		}, Chroma: &glamansi.Chroma{
-			Text:              glamansi.StylePrimitive{Color: stringPtr(textColor)},
-			Background:        glamansi.StylePrimitive{BackgroundColor: stringPtr(surfaceColor)},
-			Comment:           glamansi.StylePrimitive{Color: stringPtr(mutedColor), Italic: boolPtr(true)},
-			CommentPreproc:    glamansi.StylePrimitive{Color: stringPtr(warningColor)},
-			Keyword:           glamansi.StylePrimitive{Color: stringPtr(accentColor)},
-			KeywordType:       glamansi.StylePrimitive{Color: stringPtr(accentColor)},
-			Name:              glamansi.StylePrimitive{Color: stringPtr(textColor)},
-			NameBuiltin:       glamansi.StylePrimitive{Color: stringPtr(accentColor)},
-			NameTag:           glamansi.StylePrimitive{Color: stringPtr(accentColor)},
-			NameAttribute:     glamansi.StylePrimitive{Color: stringPtr(greenColor)},
-			NameClass:         glamansi.StylePrimitive{Color: stringPtr(textColor), Bold: boolPtr(true)},
-			NameConstant:      glamansi.StylePrimitive{Color: stringPtr(textColor)},
-			NameFunction:      glamansi.StylePrimitive{Color: stringPtr(accentColor)},
-			Literal:           glamansi.StylePrimitive{Color: stringPtr(textColor)},
-			LiteralNumber:     glamansi.StylePrimitive{Color: stringPtr(warningColor)},
-			LiteralString:     glamansi.StylePrimitive{Color: stringPtr(greenColor)},
+			Text:                glamansi.StylePrimitive{Color: stringPtr(textColor)},
+			Background:          glamansi.StylePrimitive{BackgroundColor: stringPtr(surfaceColor)},
+			Comment:             glamansi.StylePrimitive{Color: stringPtr(mutedColor), Italic: boolPtr(true)},
+			CommentPreproc:      glamansi.StylePrimitive{Color: stringPtr(warningColor)},
+			Keyword:             glamansi.StylePrimitive{Color: stringPtr(accentColor)},
+			KeywordType:         glamansi.StylePrimitive{Color: stringPtr(accentColor)},
+			Name:                glamansi.StylePrimitive{Color: stringPtr(textColor)},
+			NameBuiltin:         glamansi.StylePrimitive{Color: stringPtr(accentColor)},
+			NameTag:             glamansi.StylePrimitive{Color: stringPtr(accentColor)},
+			NameAttribute:       glamansi.StylePrimitive{Color: stringPtr(greenColor)},
+			NameClass:           glamansi.StylePrimitive{Color: stringPtr(textColor), Bold: boolPtr(true)},
+			NameConstant:        glamansi.StylePrimitive{Color: stringPtr(textColor)},
+			NameFunction:        glamansi.StylePrimitive{Color: stringPtr(accentColor)},
+			Literal:             glamansi.StylePrimitive{Color: stringPtr(textColor)},
+			LiteralNumber:       glamansi.StylePrimitive{Color: stringPtr(warningColor)},
+			LiteralString:       glamansi.StylePrimitive{Color: stringPtr(greenColor)},
 			LiteralStringEscape: glamansi.StylePrimitive{Color: stringPtr(warningColor)},
-			Operator:          glamansi.StylePrimitive{Color: stringPtr(warningColor)},
-			Punctuation:       glamansi.StylePrimitive{Color: stringPtr(mutedColor)},
-			GenericDeleted:    glamansi.StylePrimitive{Color: stringPtr(dangerColor)},
-			GenericInserted:   glamansi.StylePrimitive{Color: stringPtr(greenColor)},
-			GenericEmph:       glamansi.StylePrimitive{Italic: boolPtr(true)},
-			GenericStrong:     glamansi.StylePrimitive{Bold: boolPtr(true)},
-			GenericSubheading: glamansi.StylePrimitive{Color: stringPtr(mutedColor)},
+			Operator:            glamansi.StylePrimitive{Color: stringPtr(warningColor)},
+			Punctuation:         glamansi.StylePrimitive{Color: stringPtr(mutedColor)},
+			GenericDeleted:      glamansi.StylePrimitive{Color: stringPtr(dangerColor)},
+			GenericInserted:     glamansi.StylePrimitive{Color: stringPtr(greenColor)},
+			GenericEmph:         glamansi.StylePrimitive{Italic: boolPtr(true)},
+			GenericStrong:       glamansi.StylePrimitive{Bold: boolPtr(true)},
+			GenericSubheading:   glamansi.StylePrimitive{Color: stringPtr(mutedColor)},
 		}},
 		Table: glamansi.StyleTable{
 			StyleBlock: glamansi.StyleBlock{
@@ -1175,6 +1474,136 @@ func extractPlainText(rendered string) string {
 		lines[i] = strings.TrimRight(line, " 	")
 	}
 	return strings.Join(lines, "\n")
+}
+
+func plainTextLine(s string) string {
+	s = stripANSI(s)
+	var b strings.Builder
+	for _, r := range s {
+		if (r < 0x20 && r != '\n' && r != '\t' && r != '\r') || r == 0x7f {
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+func findSearchMatches(plain, query string) []matchPos {
+	var matches []matchPos
+	if query == "" {
+		return matches
+	}
+	qLower := []rune(strings.ToLower(query))
+	if len(qLower) == 0 {
+		return matches
+	}
+	for li, line := range strings.Split(plain, "\n") {
+		lower := []rune(strings.ToLower(line))
+		if len(qLower) > len(lower) {
+			continue
+		}
+		for i := 0; i+len(qLower) <= len(lower); {
+			if string(lower[i:i+len(qLower)]) == string(qLower) {
+				matches = append(matches, matchPos{line: li, start: i, end: i + len(qLower)})
+				i += len(qLower)
+			} else {
+				i++
+			}
+		}
+	}
+	return matches
+}
+
+func highlightSearchContent(content, query string) string {
+	if query == "" {
+		return content
+	}
+	hi := "\x1b[7m"
+	hiEnd := "\x1b[27m"
+	lines := strings.Split(content, "\n")
+	changed := false
+	for i, line := range lines {
+		ranges := findSearchMatches(plainTextLine(line), query)
+		if len(ranges) == 0 {
+			continue
+		}
+		lines[i] = applyHighlightRanges(line, ranges, hi, hiEnd)
+		changed = true
+	}
+	if !changed {
+		return content
+	}
+	return strings.Join(lines, "\n")
+}
+
+func applyHighlightRanges(line string, ranges []matchPos, hi, hiEnd string) string {
+	if len(ranges) == 0 {
+		return line
+	}
+	startAt := make(map[int]bool, len(ranges))
+	endAt := make(map[int]bool, len(ranges))
+	for _, r := range ranges {
+		startAt[r.start] = true
+		endAt[r.end] = true
+	}
+	var b strings.Builder
+	vis := 0
+	i := 0
+	for i < len(line) {
+		if line[i] == 0x1b {
+			j := i + 1
+			for j < len(line) && line[j] != 'm' {
+				j++
+			}
+			if j < len(line) {
+				j++
+			}
+			b.WriteString(line[i:j])
+			i = j
+			continue
+		}
+		r, size := utf8.DecodeRuneInString(line[i:])
+		if (r < 0x20 && r != '\t') || r == 0x7f {
+			b.WriteRune(r)
+			i += size
+			continue
+		}
+		if startAt[vis] {
+			b.WriteString(hi)
+		}
+		b.WriteRune(r)
+		vis++
+		if endAt[vis] {
+			b.WriteString(hiEnd)
+		}
+		i += size
+	}
+	return b.String()
+}
+
+var orderedListRe = regexp.MustCompile(`^[0-9]+[.)] `)
+
+func leadingIndent(s string) string {
+	i := 0
+	for i < len(s) && (s[i] == ' ' || s[i] == '\t') {
+		i++
+	}
+	return s[:i]
+}
+
+func listContinuation(line string) string {
+	trimmed := strings.TrimLeft(line, " \t")
+	indent := line[:len(line)-len(trimmed)]
+	switch {
+	case strings.HasPrefix(trimmed, "- "), strings.HasPrefix(trimmed, "* "), strings.HasPrefix(trimmed, "+ "):
+		return indent + trimmed[:2]
+	case strings.HasPrefix(trimmed, "[ ] "), strings.HasPrefix(trimmed, "[x] "):
+		return indent + "[ ] "
+	}
+	if m := orderedListRe.FindString(trimmed); m != "" {
+		return indent + m
+	}
+	return ""
 }
 
 // decorateCodeBlocks restores a solid surface background behind code blocks.
@@ -1248,7 +1677,7 @@ func (m Model) View() string {
 	if m.mode == modeHelp {
 		return m.helpView()
 	}
-	if m.mode == modePrompt || m.mode == modeConfirm {
+	if (m.mode == modePrompt && m.promptKind != promptGotoLine) || m.mode == modeConfirm {
 		return m.dialogView()
 	}
 
@@ -1270,9 +1699,24 @@ func (m Model) View() string {
 	} else {
 		body = lipgloss.JoinHorizontal(lipgloss.Top, m.treeView(m.treeWidth), m.contentView(m.width-m.treeWidth))
 	}
-	status := m.statusView()
-	view := header + "\n" + body + "\n" + status
+	var bottom string
+	switch {
+	case m.mode == modeSearch:
+		bottom = m.searchBarView() + "\n" + m.searchStatusView()
+	case m.mode == modePrompt && m.promptKind == promptGotoLine:
+		bottom = m.gotoBarView()
+	default:
+		bottom = m.statusView()
+	}
+	view := header + "\n" + body + "\n" + bottom
 	return lipgloss.NewStyle().Background(bg).Width(m.width).Height(m.height).Render(view)
+}
+
+func (m Model) bodyRenderHeight() int {
+	if m.mode == modeSearch {
+		return max(1, m.bodyHeight-1)
+	}
+	return m.bodyHeight
 }
 
 func (m Model) headerView() string {
@@ -1402,7 +1846,7 @@ func (m Model) treeViewSides(width int, leftB, rightB bool) string {
 	if len(m.flat) == 0 {
 		lines = append(lines, mutedSty.Render("  No notes"), mutedSty.Render("  Press n to create one"))
 	}
-	return borderedPanelPart(title, strings.Join(lines, "\n"), width, m.bodyHeight, focused, leftB, rightB)
+	return borderedPanelPart(title, strings.Join(lines, "\n"), width, m.bodyRenderHeight(), focused, leftB, rightB)
 }
 
 func (m Model) contentView(width int) string {
@@ -1447,7 +1891,7 @@ func (m Model) contentViewSides(width int, leftB, rightB bool) string {
 		content = m.preview.View()
 	}
 
-	return borderedPanelPart(title, meta+content, width, m.bodyHeight, focused, leftB, rightB)
+	return borderedPanelPart(title, meta+content, width, m.bodyRenderHeight(), focused, leftB, rightB)
 }
 
 func (m Model) contentHeight() int {
@@ -1562,39 +2006,82 @@ func (m Model) statusView() string {
 	return m.shortcutBar()
 }
 
-func (m Model) shortcutBar() string {
-	if m.mode == modeEdit {
-		return m.editShortcutBar()
-	}
+func (m Model) toolbarShortcut(budget int) string {
 	var b strings.Builder
-	b.WriteString(" ")
 	for _, item := range m.toolbarItems() {
 		key, label, _ := strings.Cut(item.label, " ")
 		chunk := "[" + key + "] " + label + "  "
-		if lipgloss.Width(b.String())+lipgloss.Width(chunk) > m.width {
+		if lipgloss.Width(b.String())+lipgloss.Width(chunk) > budget {
 			break
 		}
 		b.WriteString(mutedSty.Render("[" + key + "]"))
 		b.WriteString(" " + mutedSty.Render(label) + "  ")
 	}
-	status := truncate(m.status, max(0, m.width-lipgloss.Width(b.String())-2))
-	if status != "" && m.width-lipgloss.Width(b.String()) > lipgloss.Width(status)+1 {
-		b.WriteString(strings.Repeat(" ", m.width-lipgloss.Width(b.String())-lipgloss.Width(status)-1))
+	return b.String()
+}
+
+func (m Model) shortcutBar() string {
+	if m.mode == modeEdit {
+		return m.editShortcutBar()
+	}
+	right := ""
+	if m.currentPath != "" {
+		content := m.editor.Value()
+		words := len(strings.Fields(content))
+		lines := m.lineCount()
+		minutes := (words + 199) / 200
+		right = fmt.Sprintf("%d words · %d lines · ~%d min read", words, lines, minutes)
+	}
+	return m.composeBar(m.toolbarShortcut(m.width-lipgloss.Width(right)-2), right)
+}
+
+func (m Model) editShortcutBar() string {
+	left := mutedSty.Render("Ctrl+S 保存 · Esc 退出 · Ctrl+L 复制行")
+	pos := m.cursorPos()
+	total := m.editor.LineCount()
+	right := fmt.Sprintf("Ln %d / %d · Col %d", pos.row+1, total, pos.col+1)
+	return m.composeBar(left, right)
+}
+
+func (m Model) composeBar(left, right string) string {
+	var b strings.Builder
+	b.WriteString(" ")
+	b.WriteString(left)
+	lw := lipgloss.Width(b.String())
+	rw := lipgloss.Width(right)
+	status := truncate(m.status, max(0, m.width-lw-rw-6))
+	if status != "" && m.width-lw-rw > lipgloss.Width(status)+4 {
+		b.WriteString("  ")
 		b.WriteString(m.statusText(status))
+		lw = lipgloss.Width(b.String())
+	}
+	pad := m.width - lw - rw - 2
+	if pad > 0 {
+		b.WriteString(strings.Repeat(" ", pad))
+	}
+	if right != "" {
+		b.WriteString(" " + right)
 	}
 	return lipgloss.NewStyle().Foreground(muted).Width(m.width).MaxHeight(1).Render(b.String())
 }
 
-func (m Model) editShortcutBar() string {
-	hint := mutedSty.Render("Ctrl+S 保存 · Esc 退出 · Ctrl+L 复制行")
-	var b strings.Builder
-	b.WriteString(" " + hint)
-	status := truncate(m.status, max(0, m.width-lipgloss.Width(b.String())-2))
-	if status != "" && m.width-lipgloss.Width(b.String()) > lipgloss.Width(status)+1 {
-		b.WriteString(strings.Repeat(" ", m.width-lipgloss.Width(b.String())-lipgloss.Width(status)-1))
-		b.WriteString(m.statusText(status))
+func (m Model) searchBarView() string {
+	return lipgloss.NewStyle().Background(surface).Foreground(text).Width(m.width).MaxHeight(1).Render(" " + m.input.View())
+}
+
+func (m Model) searchStatusView() string {
+	left := mutedSty.Render("Next: Enter · Prev: Shift+Enter · Close: Esc")
+	var right string
+	if len(m.searchMatches) == 0 {
+		right = errorSty.Render("No matches")
+	} else {
+		right = statusSty.Render(fmt.Sprintf("%d / %d matches", m.searchIndex+1, len(m.searchMatches)))
 	}
-	return lipgloss.NewStyle().Foreground(muted).Width(m.width).MaxHeight(1).Render(b.String())
+	return m.composeBar(left, right)
+}
+
+func (m Model) gotoBarView() string {
+	return lipgloss.NewStyle().Background(surface).Foreground(text).Width(m.width).MaxHeight(1).Render(" " + m.input.View())
 }
 
 func (m Model) statusText(status string) string {
@@ -1639,7 +2126,7 @@ func (m Model) dialogView() string {
 func (m Model) helpView() string {
 	help := brandSty.Render("Vnote shortcuts") + "\n\n" +
 		"Navigate\n" + mutedSty.Render("  ↑/↓ or J/K     Select item\n  ←/→ or H/L     Collapse / expand\n  Enter           Open note\n  Tab             Switch panel\n") +
-		"\nNotes\n" + mutedSty.Render("  Ctrl+N          New note\n  Ctrl+D          New folder\n  F2              Rename\n  Delete          Delete\n  Ctrl+E          Edit / preview\n  Ctrl+S          Save\n  Ctrl+C / Ctrl+Y Copy text\n  Ctrl+L          Copy current line\n  Ctrl+G          Select terminal text\n  Ctrl+R          Refresh\n") +
+		"\nNotes\n" + mutedSty.Render("  Ctrl+N          New note\n  Ctrl+D          New folder\n  F2              Rename\n  Delete          Delete\n  Ctrl+E          Edit / preview\n  Ctrl+S          Save\n  Ctrl+C / Ctrl+Y Copy text\n  Ctrl+L          Copy current line\n  Ctrl+F          Search preview\n  Alt+G           Go to line\n  Ctrl+G          Select terminal text\n  Ctrl+R          Refresh\n") +
 		"\nApp\n" + mutedSty.Render("  Ctrl+Q          Quit\n  ? / Esc         Close help\n") +
 		"\n" + lipgloss.NewStyle().Foreground(accent).Render("Mouse and touch") + "\n" + mutedSty.Render("  Click rows and top actions. Scroll either panel.\n  In Select mode, drag over preview text; press any key to return.")
 	box := lipgloss.NewStyle().Background(surface).Foreground(text).Border(lipgloss.RoundedBorder()).BorderForeground(muted).Padding(1, 3).Width(min(70, max(32, m.width-4))).Render(help)
