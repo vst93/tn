@@ -98,8 +98,60 @@ func TestCopyCurrentUsesMarkdownAndReportsResult(t *testing.T) {
 	if copied != "# Unsaved selection\n" {
 		t.Fatalf("copied %q", copied)
 	}
-	if m.status != "Copied Markdown to clipboard" || m.statusErr {
-		t.Fatalf("unexpected copy status %q, error=%v", m.status, m.statusErr)
+	if m.status != "✓ Copied to clipboard" || m.statusErr || !m.statusOK {
+		t.Fatalf("unexpected copy status %q, error=%v, ok=%v", m.status, m.statusErr, m.statusOK)
+	}
+}
+
+func TestCreateNoteAutoEntersEditMode(t *testing.T) {
+	store := storage.New(t.TempDir())
+	m := New(store)
+	m.resize(100, 30)
+
+	m.startPrompt(promptNote)
+	m.input.SetValue("fresh")
+	updated, _ := m.updatePrompt(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+
+	if m.mode != modeEdit {
+		t.Fatalf("expected edit mode after creating a note, got mode %v", m.mode)
+	}
+	if m.active != contentPane {
+		t.Fatalf("expected content pane active after creating a note, got %v", m.active)
+	}
+	if !m.editor.Focused() {
+		t.Fatal("expected editor to be focused after creating a note")
+	}
+	if m.currentPath == "" {
+		t.Fatal("expected newly created note to be opened")
+	}
+}
+
+func TestStatusFlashAutoClears(t *testing.T) {
+	store := storage.New(t.TempDir())
+	note, err := store.CreateNote("", "status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := New(store)
+	m.resize(100, 30)
+	m.selectPath(note)
+	m.openSelectedNote()
+	m.editor.SetValue("# Changed\n")
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlS})
+	m = updated.(Model)
+	if cmd == nil {
+		t.Fatal("expected a status timeout command after saving")
+	}
+	if m.status != "✓ Saved "+note || !m.statusOK {
+		t.Fatalf("unexpected save status %q, ok=%v", m.status, m.statusOK)
+	}
+
+	updated, _ = m.Update(statusClearMsg{id: m.statusID})
+	m = updated.(Model)
+	if m.status != "" || m.statusOK {
+		t.Fatalf("expected status to clear after timeout, got %q ok=%v", m.status, m.statusOK)
 	}
 }
 

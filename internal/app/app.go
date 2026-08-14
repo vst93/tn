@@ -22,6 +22,11 @@ import (
 	"github.com/vst93/vnote/internal/storage"
 )
 
+var (
+	successSty = lipgloss.NewStyle().Foreground(green).Bold(true)
+	editBadge  = lipgloss.NewStyle().Bold(true).Background(accent).Foreground(bg)
+)
+
 type pane int
 
 const (
@@ -56,6 +61,7 @@ type toolbarItem struct{ label, action string }
 
 type copyResultMsg struct{ err error }
 type selectionModeMsg struct{}
+type statusClearMsg struct{ id uint64 }
 
 // Model is the Vnote Bubble Tea application.
 type Model struct {
@@ -88,9 +94,13 @@ type Model struct {
 	renderer      *glamour.TermRenderer
 	rendererWidth int
 
-	status    string
-	statusErr bool
-	confirm   string
+	status     string
+	statusErr  bool
+	statusOK   bool
+	statusID   uint64
+	statusCmd  tea.Cmd
+	confirm    string
+	confirmDir bool
 }
 
 func New(store *storage.Store) Model {
@@ -184,15 +194,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.active == treePane {
 			m.treeKey(key)
-			return m, nil
+			return m, m.takePending()
 		}
 		m.preview, cmd = m.preview.Update(msg)
 		return m, cmd
 	case copyResultMsg:
 		if msg.err != nil {
-			m.setStatus("Copy failed: "+msg.err.Error(), true)
+			m.flashStatus("Copy failed: "+msg.err.Error(), true, 2*time.Second)
 		} else {
-			m.setStatus("Copied Markdown to clipboard", false)
+			m.flashStatus("✓ Copied to clipboard", false, 1500*time.Millisecond)
+		}
+		return m, m.takePending()
+	case statusClearMsg:
+		if msg.id == m.statusID {
+			m.status, m.statusErr, m.statusOK = "", false, false
 		}
 		return m, nil
 	case selectionModeMsg:
@@ -263,7 +278,7 @@ func (m *Model) globalKey(key string) (handled, quit bool) {
 		return true, true
 	case "ctrl+r":
 		m.refresh(m.selectedPath())
-		m.setStatus("Notebook refreshed", false)
+		m.flashStatus("Notebook refreshed", false, 2*time.Second)
 		return true, false
 	case "ctrl+y":
 		m.copyCurrent()
@@ -324,9 +339,9 @@ func (m *Model) handleMouse(msg tea.MouseEvent) {
 	}
 	if msg.Y == 0 && msg.Button == tea.MouseButtonLeft {
 		if msg.X >= 10 && msg.X < 20 {
-			m.active = treePane
+			m.switchToTree()
 		} else if msg.X >= 20 && msg.X < 34 {
-			m.active = contentPane
+			m.switchToContent()
 		}
 		return
 	}
@@ -345,7 +360,7 @@ func (m *Model) handleMouse(msg tea.MouseEvent) {
 		inTree = m.active == treePane
 	}
 	if inTree {
-		m.active = treePane
+		m.switchToTree()
 		if msg.Button == tea.MouseButtonWheelUp {
 			m.treeOffset = max(0, m.treeOffset-3)
 			return
@@ -368,10 +383,7 @@ func (m *Model) handleMouse(msg tea.MouseEvent) {
 		return
 	}
 
-	m.active = contentPane
-	if msg.Button == tea.MouseButtonLeft && m.currentPath != "" && m.mode == modeEdit {
-		m.editor.Focus()
-	}
+	m.switchToContent()
 	if m.mode == modeNormal && msg.IsWheel() {
 		updated, _ := m.preview.Update(tea.MouseMsg(msg))
 		m.preview = updated
@@ -421,7 +433,7 @@ func (m *Model) enterSelectionMode() {
 
 func (m *Model) copyCurrent() {
 	if m.currentPath == "" {
-		m.setStatus("Open a note first", true)
+		m.flashStatus("Open a note first", true, 2*time.Second)
 		return
 	}
 	content := m.editor.Value()
@@ -434,9 +446,16 @@ func (m *Model) copyCurrent() {
 }
 
 func (m *Model) takePending() tea.Cmd {
-	cmd := m.pending
+	cmds := make([]tea.Cmd, 0, 2)
+	if m.pending != nil {
+		cmds = append(cmds, m.pending)
+	}
+	if m.statusCmd != nil {
+		cmds = append(cmds, m.statusCmd)
+	}
 	m.pending = nil
-	return cmd
+	m.statusCmd = nil
+	return tea.Batch(cmds...)
 }
 
 func copyText(content string) error {
@@ -454,9 +473,23 @@ func copyCmd(copier func(string) error, content string) tea.Cmd {
 
 func (m *Model) togglePane() {
 	if m.active == treePane {
-		m.active = contentPane
+		m.switchToContent()
 	} else {
-		m.active = treePane
+		m.switchToTree()
+	}
+}
+
+func (m *Model) switchToTree() {
+	if m.mode == modeEdit && !m.dirty() {
+		m.leaveEdit()
+	}
+	m.active = treePane
+}
+
+func (m *Model) switchToContent() {
+	m.active = contentPane
+	if m.mode == modeEdit {
+		m.editor.Focus()
 	}
 }
 
@@ -474,7 +507,7 @@ func (m *Model) activateSelected() {
 	}
 	m.openSelectedNote()
 	if m.currentPath == n.RelPath {
-		m.active = contentPane
+		m.switchToContent()
 	}
 }
 
@@ -499,7 +532,7 @@ func (m *Model) openSelectedNote() {
 	m.editor.SetValue(content)
 	m.preview.GotoTop()
 	m.renderMarkdown()
-	m.setStatus("Opened "+path, false)
+	m.flashStatus("Opened "+path, false, 2*time.Second)
 }
 
 func (m *Model) collapseOrParent() {
@@ -530,7 +563,7 @@ func (m *Model) moveSelection(delta int) {
 
 func (m *Model) startPrompt(kind promptKind) {
 	if kind == promptRename && len(m.flat) == 0 {
-		m.setStatus("Select an item to rename", true)
+		m.flashStatus("Select an item to rename", true, 2*time.Second)
 		return
 	}
 	m.promptKind = kind
@@ -579,12 +612,13 @@ func (m Model) updatePrompt(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.promptKind == promptNote {
 			m.openSelectedNote()
 			m.active = contentPane
+			m.toggleEdit()
 		} else if m.promptKind == promptDir {
-			m.setStatus("Created "+path, false)
+			m.flashStatus("Created "+path, false, 2*time.Second)
 		} else {
-			m.setStatus("Renamed to "+path, false)
+			m.flashStatus("Renamed to "+path, false, 2*time.Second)
 		}
-		return m, nil
+		return m, m.takePending()
 	}
 	var cmd tea.Cmd
 	m.input, cmd = m.input.Update(msg)
@@ -614,15 +648,12 @@ func (m *Model) renameSelected(name string) (string, error) {
 
 func (m *Model) startDelete() {
 	if len(m.flat) == 0 {
-		m.setStatus("Nothing selected", true)
+		m.flashStatus("Nothing selected", true, 2*time.Second)
 		return
 	}
 	n := m.flat[m.selected].node
-	if n.IsDir {
-		m.confirm = "Delete folder “" + n.Name + "” and all notes inside?"
-	} else {
-		m.confirm = "Delete note “" + n.Name + "”?"
-	}
+	m.confirm = n.Name
+	m.confirmDir = n.IsDir
 	m.mode = modeConfirm
 }
 
@@ -637,17 +668,17 @@ func (m Model) updateConfirm(key string) (tea.Model, tea.Cmd) {
 			m.preview.SetContent("")
 		}
 		if err := m.store.Delete(path); err != nil {
-			m.setStatus(err.Error(), true)
+			m.flashStatus(err.Error(), true, 2*time.Second)
 		} else {
 			m.refresh("")
-			m.setStatus("Deleted "+path, false)
+			m.flashStatus("Deleted "+path, false, 2*time.Second)
 		}
 		m.mode = modeNormal
 	case "n", "N", "esc":
 		m.mode = modeNormal
-		m.setStatus("Delete cancelled", false)
+		m.flashStatus("Delete cancelled", false, 2*time.Second)
 	}
-	return m, nil
+	return m, m.takePending()
 }
 
 func (m *Model) toggleEdit() {
@@ -662,7 +693,7 @@ func (m *Model) toggleEdit() {
 	m.mode = modeEdit
 	m.active = contentPane
 	m.editor.Focus()
-	m.setStatus("Editing · Ctrl+S to save · Esc to preview", false)
+	m.setStatus("Editing "+m.currentPath, false)
 }
 
 func (m *Model) leaveEdit() {
@@ -678,17 +709,17 @@ func (m *Model) leaveEdit() {
 
 func (m *Model) save() bool {
 	if m.currentPath == "" || !m.dirty() {
-		m.setStatus("Nothing to save", false)
+		m.flashStatus("Nothing to save", false, 2*time.Second)
 		return true
 	}
 	content := m.editor.Value()
 	if err := m.store.Write(m.currentPath, content); err != nil {
-		m.setStatus(err.Error(), true)
+		m.flashStatus("Save failed: "+err.Error(), true, 2*time.Second)
 		return false
 	}
 	m.original = content
 	m.renderMarkdown()
-	m.setStatus("Saved "+m.currentPath+" at "+time.Now().Format("15:04"), false)
+	m.flashStatus("✓ Saved "+m.currentPath, false, 2*time.Second)
 	return true
 }
 
@@ -1017,7 +1048,17 @@ func boolPtr(value bool) *bool       { return &value }
 func uintPtr(value uint) *uint       { return &value }
 
 func (m *Model) setStatus(message string, isError bool) {
-	m.status, m.statusErr = message, isError
+	m.status, m.statusErr, m.statusOK = message, isError, false
+	m.statusID++
+	m.statusCmd = nil
+}
+
+func (m *Model) flashStatus(message string, isError bool, d time.Duration) tea.Cmd {
+	m.setStatus(message, isError)
+	m.statusOK = !isError
+	id := m.statusID
+	m.statusCmd = tea.Tick(d, func(time.Time) tea.Msg { return statusClearMsg{id: id} })
+	return m.statusCmd
 }
 
 func (m Model) View() string {
@@ -1059,14 +1100,11 @@ func (m Model) headerView() string {
 			name += "  " + dangerStyle("● unsaved")
 		}
 	}
-	modeName := "preview"
+	var badge string
 	if m.mode == modeEdit {
-		modeName = "edit"
+		badge = editBadge.Render(" EDIT ") + " "
 	}
-	if m.selecting {
-		modeName = "select"
-	}
-	right := mutedSty.Render(modeName+"  ·  ") + truncateANSI(name, max(1, m.width-lipgloss.Width(left)-12))
+	right := badge + truncateANSI(name, max(1, m.width-lipgloss.Width(left)-lipgloss.Width(badge)-12))
 	space := max(1, m.width-lipgloss.Width(left)-lipgloss.Width(right)-2)
 	line := " " + left + strings.Repeat(" ", space) + right
 	return headerSty.Width(m.width).MaxHeight(1).Render(line)
@@ -1102,6 +1140,9 @@ func (m Model) toolbarItems() []toolbarItem {
 }
 
 func (m Model) footerActionAt(x int) string {
+	if m.mode == modeEdit {
+		return ""
+	}
 	position := 1
 	for _, item := range m.toolbarItems() {
 		key, label, _ := strings.Cut(item.label, " ")
@@ -1173,7 +1214,7 @@ func (m Model) treeView(width int) string {
 }
 
 func (m Model) contentView(width int) string {
-	focused := m.active == contentPane
+	focused := m.active == contentPane || m.mode == modeEdit
 	title := "Note"
 	if m.mode == modeEdit {
 		title = "Markdown"
@@ -1298,6 +1339,9 @@ func (m Model) statusView() string {
 }
 
 func (m Model) shortcutBar() string {
+	if m.mode == modeEdit {
+		return m.editShortcutBar()
+	}
 	var b strings.Builder
 	b.WriteString(" ")
 	for _, item := range m.toolbarItems() {
@@ -1312,16 +1356,41 @@ func (m Model) shortcutBar() string {
 	status := truncate(m.status, max(0, m.width-lipgloss.Width(b.String())-2))
 	if status != "" && m.width-lipgloss.Width(b.String()) > lipgloss.Width(status)+1 {
 		b.WriteString(strings.Repeat(" ", m.width-lipgloss.Width(b.String())-lipgloss.Width(status)-1))
-		b.WriteString(statusSty.Render(status))
+		b.WriteString(m.statusText(status))
 	}
 	return lipgloss.NewStyle().Foreground(muted).Width(m.width).MaxHeight(1).Render(b.String())
+}
+
+func (m Model) editShortcutBar() string {
+	hint := lipgloss.NewStyle().Foreground(accent).Bold(true).Render("Ctrl+S 保存") + " · " + mutedSty.Render("Esc 退出编辑")
+	var b strings.Builder
+	b.WriteString(" " + hint)
+	status := truncate(m.status, max(0, m.width-lipgloss.Width(b.String())-2))
+	if status != "" && m.width-lipgloss.Width(b.String()) > lipgloss.Width(status)+1 {
+		b.WriteString(strings.Repeat(" ", m.width-lipgloss.Width(b.String())-lipgloss.Width(status)-1))
+		b.WriteString(m.statusText(status))
+	}
+	return lipgloss.NewStyle().Foreground(muted).Width(m.width).MaxHeight(1).Render(b.String())
+}
+
+func (m Model) statusText(status string) string {
+	if m.statusOK {
+		return successSty.Render(status)
+	}
+	return statusSty.Render(status)
 }
 
 func (m Model) dialogView() string {
 	var title, body string
 	if m.mode == modeConfirm {
-		title = "Delete"
-		body = m.confirm + "\n\n" + dangerStyle("Enter / Y  delete") + "  " + mutedSty.Render("Esc / N  cancel")
+		if m.confirmDir {
+			title = "Delete folder"
+			body = "Delete “" + m.confirm + "” and all contents?"
+		} else {
+			title = "Delete note"
+			body = "Delete “" + m.confirm + "”?"
+		}
+		body += "\n\n" + dangerStyle("Enter / Y  确认删除") + "    " + mutedSty.Render("Esc / N  取消")
 	} else {
 		switch m.promptKind {
 		case promptNote:
