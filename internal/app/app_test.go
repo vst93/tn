@@ -755,3 +755,280 @@ func TestExportEscCancels(t *testing.T) {
 	}
 }
 
+func TestFocusModeTogglesAndRendersFullScreen(t *testing.T) {
+	m := New(storage.New(t.TempDir()))
+	m.resize(100, 30)
+
+	if handled, _ := m.globalKey("ctrl+shift+f"); !handled {
+		t.Fatal("expected Ctrl+Shift+F to be handled")
+	}
+	if !m.focusing {
+		t.Fatal("expected focus mode to be enabled")
+	}
+	view := m.View()
+	if !strings.Contains(view, "Esc 退出专注") {
+		t.Fatalf("expected focus hint in view, got %q", view)
+	}
+	if strings.Contains(view, "◆ vnote") {
+		t.Fatal("expected header to be hidden in focus mode")
+	}
+
+	if handled, _ := m.globalKey("esc"); !handled {
+		t.Fatal("expected Esc to be handled in focus mode")
+	}
+	if m.focusing {
+		t.Fatal("expected Esc to exit focus mode")
+	}
+}
+
+func TestFocusModeKeepsEditControls(t *testing.T) {
+	store := storage.New(t.TempDir())
+	note, err := store.CreateNote("", "focus-edit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := New(store)
+	m.resize(100, 30)
+	m.selectPath(note)
+	m.openSelectedNote()
+	m.toggleEdit()
+	before := m.editor.Width()
+
+	if handled, _ := m.globalKey("ctrl+shift+f"); !handled {
+		t.Fatal("expected Ctrl+Shift+F to be handled in edit mode")
+	}
+	if !m.focusing || m.mode != modeEdit || !m.editor.Focused() {
+		t.Fatalf("expected focused edit mode, focusing=%v mode=%v focused=%v", m.focusing, m.mode, m.editor.Focused())
+	}
+	if m.editor.Width() <= before {
+		t.Fatalf("expected editor to widen in focus mode, before=%d after=%d", before, m.editor.Width())
+	}
+
+	m.editor.SetValue("focused content")
+	if !m.dirty() {
+		t.Fatal("expected editing to remain available in focus mode")
+	}
+	if handled, _ := m.globalKey("ctrl+s"); !handled {
+		t.Fatal("expected Ctrl+S to save in focus mode")
+	}
+}
+
+func TestSessionPersistsAndRestores(t *testing.T) {
+	store := storage.New(t.TempDir())
+	dir, err := store.CreateDir("", "work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	note, err := store.CreateNote(dir, "session")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	m := New(store)
+	m.sessionPath = filepath.Join(t.TempDir(), "session.json")
+	m.resize(100, 30)
+	m.selectPath(note)
+	m.openSelectedNote()
+	var sb strings.Builder
+	for i := 0; i < 30; i++ {
+		sb.WriteString(fmt.Sprintf("line %d\n\n", i))
+	}
+	m.editor.SetValue(sb.String())
+	if err := store.Write(note, m.editor.Value()); err != nil {
+		t.Fatal(err)
+	}
+	m.renderMarkdown()
+	m.expanded[dir] = false
+	m.treeOffset = 1
+	m.preview.SetYOffset(3)
+	m.toggleEdit()
+	m.gotoLineEdit(4)
+	m.editor.SetCursor(2)
+	m.saveSession()
+
+	if _, err := os.Stat(m.sessionPath); err != nil {
+		t.Fatalf("expected session file to be written: %v", err)
+	}
+
+	restored := New(store)
+	restored.sessionPath = m.sessionPath
+	restored = restored.restoreSession()
+	if restored.currentPath != note {
+		t.Fatalf("expected restored path %q, got %q", note, restored.currentPath)
+	}
+	if restored.mode != modeEdit || restored.active != contentPane {
+		t.Fatalf("expected restored edit mode, mode=%v active=%v", restored.mode, restored.active)
+	}
+	pos := restored.cursorPos()
+	if pos.row != 4 || pos.col != 2 {
+		t.Fatalf("expected restored cursor row=5 col=3, got %+v", pos)
+	}
+	if restored.expanded[dir] {
+		t.Fatal("expected restored collapsed folder state")
+	}
+	if restored.preview.YOffset != 3 {
+		t.Fatalf("expected restored preview offset 3, got %d", restored.preview.YOffset)
+	}
+}
+
+func TestGlobalSearchFindsContentAndOpensAtLine(t *testing.T) {
+	store := storage.New(t.TempDir())
+	note, err := store.CreateNote("", "topic")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var b strings.Builder
+	for i := 0; i < 20; i++ {
+		b.WriteString(fmt.Sprintf("filler %d\n", i))
+	}
+	b.WriteString("needle line")
+	if err := store.Write(note, b.String()); err != nil {
+		t.Fatal(err)
+	}
+
+	m := New(store)
+	m.resize(100, 30)
+	m.selectPath(note)
+	m.openSelectedNote()
+	m.toggleEdit()
+
+	if handled, _ := m.globalKey("ctrl+shift+o"); !handled {
+		t.Fatal("expected Ctrl+Shift+O to be handled")
+	}
+	if m.mode != modeSearchGlobal {
+		t.Fatalf("expected global search mode, got %v", m.mode)
+	}
+	if view := m.View(); view == "" {
+		t.Fatal("expected global search view to render")
+	}
+
+	m.input.SetValue("needle")
+	updated, cmd := m.updateGlobalSearch(tea.KeyMsg{Type: tea.KeyCtrlA})
+	m = updated.(Model)
+	if cmd == nil {
+		t.Fatal("expected debounced search command")
+	}
+	updated, _ = m.Update(cmd())
+	m = updated.(Model)
+	if len(m.globalSearchResults) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(m.globalSearchResults))
+	}
+	if m.globalSearchResults[0].lineNum != 21 || m.globalSearchResults[0].snippet != "needle line" {
+		t.Fatalf("unexpected result %+v", m.globalSearchResults[0])
+	}
+
+	m.openGlobalSearchResult()
+	if m.currentPath != note {
+		t.Fatalf("expected opened note %q, got %q", note, m.currentPath)
+	}
+	if m.mode != modeEdit {
+		t.Fatalf("expected to stay in edit mode, got %v", m.mode)
+	}
+	if m.editor.Line() != 20 {
+		t.Fatalf("expected cursor on line 21 (0-based 20), got %d", m.editor.Line())
+	}
+}
+
+func TestGlobalSearchMatchesTitlesAndNavigates(t *testing.T) {
+	store := storage.New(t.TempDir())
+	noteA, err := store.CreateNote("", "quarterly-report")
+	if err != nil {
+		t.Fatal(err)
+	}
+	noteB, err := store.CreateNote("", "other-notes")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Write(noteA, "# Report\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Write(noteB, "quarterly totals here"); err != nil {
+		t.Fatal(err)
+	}
+
+	m := New(store)
+	m.resize(100, 30)
+	m.runGlobalSearch("quarterly")
+	if len(m.globalSearchResults) != 2 {
+		t.Fatalf("expected 2 results, got %d", len(m.globalSearchResults))
+	}
+	titles := map[string]bool{}
+	for _, r := range m.globalSearchResults {
+		titles[r.title] = true
+	}
+	if !titles["quarterly-report"] || !titles["other-notes"] {
+		t.Fatalf("unexpected results %+v", m.globalSearchResults)
+	}
+
+	m.moveGlobalSearch(1)
+	if m.globalSearchIndex != 1 {
+		t.Fatalf("expected index 1 after down, got %d", m.globalSearchIndex)
+	}
+	m.moveGlobalSearch(1)
+	if m.globalSearchIndex != 0 {
+		t.Fatalf("expected wrap to 0, got %d", m.globalSearchIndex)
+	}
+
+	m.globalSearchIndex = -1
+	for i, r := range m.globalSearchResults {
+		if r.path == noteA {
+			m.globalSearchIndex = i
+		}
+	}
+	m.openGlobalSearchResult()
+	if m.currentPath != noteA {
+		t.Fatalf("expected opened note %q, got %q", noteA, m.currentPath)
+	}
+	if m.mode != modeNormal {
+		t.Fatalf("expected preview mode after open, got %v", m.mode)
+	}
+}
+
+func TestGlobalSearchEscRestoresMode(t *testing.T) {
+	m, _, _ := openEditModel(t, "gs-esc")
+	m.globalKey("ctrl+shift+o")
+	if m.mode != modeSearchGlobal {
+		t.Fatalf("expected global search mode, got %v", m.mode)
+	}
+	updated, _ := m.updateGlobalSearch(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+	if m.mode != modeEdit {
+		t.Fatalf("expected Esc to restore edit mode, got %v", m.mode)
+	}
+	if !m.editor.Focused() {
+		t.Fatal("expected editor to be focused after cancel")
+	}
+}
+
+func TestAutoIndentIncrementsOrderedList(t *testing.T) {
+	m, _, _ := openEditModel(t, "ordered")
+	m.editor.SetValue("1. first")
+	m.editor.SetCursor(8)
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	if m.editor.Value() != "1. first\n2. " {
+		t.Fatalf("expected incremented ordered list, got %q", m.editor.Value())
+	}
+}
+
+func TestEnterOnEmptyListClearsMarker(t *testing.T) {
+	m, _, _ := openEditModel(t, "empty-list")
+	m.editor.SetValue("- ")
+	m.editor.SetCursor(2)
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	if m.editor.Value() != "" {
+		t.Fatalf("expected empty list marker to be cleared, got %q", m.editor.Value())
+	}
+}
+
+func TestCheckboxListContinuation(t *testing.T) {
+	m, _, _ := openEditModel(t, "checkbox")
+	m.editor.SetValue("[ ] task")
+	m.editor.SetCursor(8)
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	if m.editor.Value() != "[ ] task\n[ ] " {
+		t.Fatalf("expected checkbox continuation, got %q", m.editor.Value())
+	}
+}

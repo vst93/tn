@@ -1,6 +1,7 @@
 package app
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -27,6 +28,7 @@ import (
 var (
 	successSty = lipgloss.NewStyle().Foreground(green).Bold(true)
 	editBadge  = lipgloss.NewStyle().Bold(true).Background(accent).Foreground(bg)
+	keywordSty = lipgloss.NewStyle().Foreground(accent).Bold(true)
 )
 
 type pane int
@@ -46,6 +48,7 @@ const (
 	modeHelp
 	modeSearch
 	modeExport
+	modeSearchGlobal
 )
 
 type promptKind int
@@ -72,6 +75,29 @@ type selectionModeMsg struct{}
 type statusClearMsg struct{ id uint64 }
 
 type cursorPos struct{ row, col int }
+
+// SessionState is the persisted workspace state restored on startup.
+type SessionState struct {
+	CurrentPath string          `json:"currentPath"`
+	CursorRow   int             `json:"cursorRow"`
+	CursorCol   int             `json:"cursorCol"`
+	Mode        string          `json:"mode"`
+	Expanded    map[string]bool `json:"expanded"`
+	TreeOffset  int             `json:"treeOffset"`
+	PreviewOff  int             `json:"previewOff"`
+	ActivePane  string          `json:"activePane"`
+}
+
+type globalSearchResult struct {
+	path    string
+	title   string
+	snippet string
+	lineNum int
+}
+
+type globalSearchMsg struct {
+	query string
+}
 
 type matchPos struct {
 	line  int
@@ -124,6 +150,13 @@ type Model struct {
 	copier        func(string) error
 	pending       tea.Cmd
 
+	focusing            bool
+	sessionPath         string
+	beforeGlobalSearch  mode
+	globalSearchQuery   string
+	globalSearchResults []globalSearchResult
+	globalSearchIndex   int
+
 	renderer      *glamour.TermRenderer
 	rendererWidth int
 
@@ -158,20 +191,114 @@ func New(store *storage.Store) Model {
 	input.Cursor.Style = lipgloss.NewStyle().Foreground(accent)
 
 	m := Model{
-		store:    store,
-		expanded: make(map[string]bool),
-		active:   treePane,
-		mode:     modeNormal,
-		editor:   editor,
-		preview:  viewport.New(60, 20),
-		input:    input,
-		copier:   copyText,
-		status:   "Ready",
+		store:       store,
+		expanded:    make(map[string]bool),
+		active:      treePane,
+		mode:        modeNormal,
+		editor:      editor,
+		preview:     viewport.New(60, 20),
+		input:       input,
+		copier:      copyText,
+		status:      "Ready",
+		sessionPath: defaultSessionPath(),
 	}
 	m.preview.MouseWheelEnabled = true
 	m.preview.MouseWheelDelta = 3
 	m.refresh("")
+	m = m.restoreSession()
 	return m
+}
+
+func defaultSessionPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".vnote", "session.json")
+}
+
+func (m Model) restoreSession() Model {
+	if m.sessionPath == "" {
+		return m
+	}
+	data, err := os.ReadFile(m.sessionPath)
+	if err != nil {
+		return m
+	}
+	var s SessionState
+	if err := json.Unmarshal(data, &s); err != nil {
+		return m
+	}
+	if s.Expanded != nil {
+		m.expanded = s.Expanded
+		m.rebuildFlat()
+	}
+	m.treeOffset = max(0, s.TreeOffset)
+	m.active = treePane
+	if s.ActivePane == "content" {
+		m.active = contentPane
+	}
+	if s.CurrentPath != "" {
+		content, err := m.store.Read(s.CurrentPath)
+		if err == nil {
+			m.currentPath = s.CurrentPath
+			m.original = content
+			m.editor.SetValue(content)
+			m.undoStack = nil
+			m.redoStack = nil
+			m.editSel = nil
+			m.selectPath(s.CurrentPath)
+			m.setEditorBackground(bg)
+			m.renderMarkdown()
+		}
+	}
+	if s.Mode == "edit" && m.currentPath != "" {
+		m.mode = modeEdit
+		m.active = contentPane
+		m.setEditorBackground(surface)
+		m.editor.Focus()
+		m.setCursor(s.CursorRow, s.CursorCol)
+	}
+	if s.PreviewOff > 0 && m.renderedContent != "" {
+		m.preview.SetYOffset(s.PreviewOff)
+	}
+	return m
+}
+
+func (m Model) saveSession() {
+	if m.sessionPath == "" {
+		return
+	}
+	s := SessionState{
+		CurrentPath: m.currentPath,
+		CursorRow:   m.cursorPos().row,
+		CursorCol:   m.cursorPos().col,
+		Mode:        "preview",
+		Expanded:    m.expanded,
+		TreeOffset:  m.treeOffset,
+		PreviewOff:  m.preview.YOffset,
+		ActivePane:  "tree",
+	}
+	if m.mode == modeEdit {
+		s.Mode = "edit"
+	}
+	if m.active == contentPane {
+		s.ActivePane = "content"
+	}
+	data, err := json.MarshalIndent(s, "", "  ")
+	if err != nil {
+		return
+	}
+	dir := filepath.Dir(m.sessionPath)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return
+	}
+	_ = os.WriteFile(m.sessionPath, data, 0o600)
+}
+
+func (m *Model) setCursor(row, col int) {
+	m.gotoLineEdit(row)
+	m.editor.SetCursor(col)
 }
 
 func (m Model) Init() tea.Cmd { return textarea.Blink }
@@ -186,7 +313,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.selecting {
 			return m, nil
 		}
-		if m.mode == modeNormal || m.mode == modeEdit {
+		if !m.focusing && (m.mode == modeNormal || m.mode == modeEdit) {
 			m.handleMouse(tea.MouseEvent(msg))
 		}
 		return m, m.takePending()
@@ -216,6 +343,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.mode == modeSearch {
 			return m.updateSearch(msg)
 		}
+		if m.mode == modeSearchGlobal {
+			return m.updateGlobalSearch(msg)
+		}
 		if m.mode == modeExport {
 			return m.updateExport(msg)
 		}
@@ -240,10 +370,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			} else {
 				if msg.Type == tea.KeyEnter {
-					if indent := m.enterIndent(); indent != "" {
-						m.editor.InsertString("\n" + indent)
+					if m.handleEditEnter(before) {
 						m.editSel = nil
-						m.recordEdit(before, m.editor.Value())
 						return m, nil
 					}
 				}
@@ -278,6 +406,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case selectionModeMsg:
 		m.selecting = true
 		return m, nil
+	case globalSearchMsg:
+		if msg.query == m.globalSearchQuery {
+			m.runGlobalSearch(msg.query)
+		}
+		return m, nil
 	}
 
 	if m.mode == modeEdit {
@@ -298,6 +431,7 @@ func (m *Model) globalKey(key string) (handled, quit bool) {
 			m.setStatus("Save or discard changes before quitting", true)
 			return true, false
 		}
+		m.saveSession()
 		return true, true
 	case "ctrl+s":
 		m.save()
@@ -369,7 +503,14 @@ func (m *Model) globalKey(key string) (handled, quit bool) {
 			m.setStatus("Save or discard changes before quitting", true)
 			return true, false
 		}
+		m.saveSession()
 		return true, true
+	case "ctrl+shift+o":
+		m.startGlobalSearch()
+		return true, false
+	case "ctrl+shift+f":
+		m.toggleFocus()
+		return true, false
 	case "ctrl+r":
 		m.refresh(m.selectedPath())
 		m.flashStatus("Notebook refreshed", false, 2*time.Second)
@@ -406,7 +547,9 @@ func (m *Model) globalKey(key string) (handled, quit bool) {
 		m.togglePane()
 		return true, false
 	case "esc":
-		if m.mode == modeEdit {
+		if m.focusing {
+			m.exitFocus()
+		} else if m.mode == modeEdit {
 			m.leaveEdit()
 		} else {
 			m.active = treePane
@@ -514,6 +657,7 @@ func (m *Model) runAction(action string) {
 		if m.dirty() {
 			m.setStatus("Save or discard changes before quitting", true)
 		} else {
+			m.saveSession()
 			m.pending = tea.Quit
 		}
 	case "edit":
@@ -1124,6 +1268,289 @@ func (m *Model) previewLineCount() int {
 	return strings.Count(m.renderedContent, "\n") + 1
 }
 
+func (m *Model) toggleFocus() {
+	m.focusing = !m.focusing
+	if m.focusing {
+		m.active = contentPane
+		if m.mode == modeEdit {
+			m.editor.Focus()
+		}
+		m.setStatus("Focus mode", false)
+	} else {
+		m.setStatus("Focus off", false)
+	}
+	m.resize(m.width, m.height)
+}
+
+func (m *Model) exitFocus() {
+	m.focusing = false
+	m.resize(m.width, m.height)
+	m.setStatus("Focus off", false)
+}
+
+func (m Model) focusView() string {
+	top := "≡"
+	if m.currentPath != "" {
+		top = "≡ " + truncate(m.currentPath, max(1, m.width-6))
+	}
+	topLine := lipgloss.NewStyle().Foreground(muted).Width(m.width).MaxHeight(1).Render(" " + top)
+	bottomLine := lipgloss.NewStyle().Foreground(muted).Width(m.width).MaxHeight(1).Render("  Esc 退出专注")
+
+	var body string
+	if m.mode == modeEdit {
+		body = m.editor.View()
+	} else {
+		body = m.preview.View()
+	}
+	body = lipgloss.Place(m.width, max(1, m.height-2), lipgloss.Center, lipgloss.Top, body)
+	return topLine + "\n" + body + "\n" + bottomLine
+}
+
+func (m Model) inNoteSearchFocusView() string {
+	var b strings.Builder
+	b.WriteString(brandSty.Render("Search note") + "\n\n")
+	b.WriteString(m.input.View() + "\n")
+	if len(m.searchMatches) == 0 {
+		b.WriteString("\n" + errorSty.Render("No matches"))
+	} else {
+		b.WriteString("\n" + statusSty.Render(fmt.Sprintf("%d / %d matches", m.searchIndex+1, len(m.searchMatches))))
+	}
+	b.WriteString("\n\n" + mutedSty.Render("Enter next · Shift+Enter prev · Esc close"))
+	return m.bottomOverlay(b.String())
+}
+
+func (m *Model) startGlobalSearch() {
+	m.beforeGlobalSearch = m.mode
+	m.mode = modeSearchGlobal
+	m.active = contentPane
+	m.globalSearchQuery = ""
+	m.globalSearchResults = nil
+	m.globalSearchIndex = 0
+	m.status = ""
+	m.input.Prompt = "Search everywhere: "
+	m.input.Placeholder = "type to search"
+	m.input.SetValue("")
+	m.input.Width = max(10, min(50, m.width-12))
+	m.input.Focus()
+}
+
+func (m Model) updateGlobalSearch(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.exitGlobalSearch()
+		return m, nil
+	case "enter":
+		m.openGlobalSearchResult()
+		return m, nil
+	case "up", "shift+tab":
+		m.moveGlobalSearch(-1)
+		return m, nil
+	case "down", "tab":
+		m.moveGlobalSearch(1)
+		return m, nil
+	}
+	var cmd tea.Cmd
+	m.input, cmd = m.input.Update(msg)
+	query := m.input.Value()
+	if query == m.globalSearchQuery {
+		return m, cmd
+	}
+	m.globalSearchQuery = query
+	if strings.TrimSpace(query) == "" {
+		m.globalSearchResults = nil
+		m.globalSearchIndex = 0
+		return m, nil
+	}
+	q := query
+	return m, tea.Tick(150*time.Millisecond, func(time.Time) tea.Msg {
+		return globalSearchMsg{query: q}
+	})
+}
+
+func (m *Model) exitGlobalSearch() {
+	mode := m.beforeGlobalSearch
+	m.mode = mode
+	m.input.Blur()
+	m.input.Prompt = "› "
+	m.globalSearchQuery = ""
+	m.globalSearchResults = nil
+	m.globalSearchIndex = 0
+	m.renderMarkdown()
+	m.adjustPreviewHeight()
+	if mode == modeEdit && m.currentPath != "" {
+		m.active = contentPane
+		m.setEditorBackground(surface)
+		m.editor.Focus()
+	} else {
+		m.active = contentPane
+		m.setEditorBackground(bg)
+	}
+}
+
+func (m *Model) runGlobalSearch(query string) {
+	m.globalSearchQuery = query
+	m.globalSearchResults = nil
+	m.globalSearchIndex = 0
+	q := strings.ToLower(strings.TrimSpace(query))
+	if q == "" {
+		return
+	}
+	var results []globalSearchResult
+	var walk func([]*storage.Node)
+	walk = func(nodes []*storage.Node) {
+		for _, n := range nodes {
+			if n.IsDir {
+				walk(n.Children)
+				continue
+			}
+			title := strings.TrimSuffix(n.Name, filepath.Ext(n.Name))
+			if strings.Contains(strings.ToLower(title), q) {
+				results = append(results, globalSearchResult{path: n.RelPath, title: title, snippet: title, lineNum: 1})
+			}
+			if len(results) >= 20 {
+				break
+			}
+			content, err := m.store.Read(n.RelPath)
+			if err != nil {
+				continue
+			}
+			for li, line := range strings.Split(content, "\n") {
+				if strings.Contains(strings.ToLower(line), q) {
+					results = append(results, globalSearchResult{path: n.RelPath, title: title, snippet: strings.TrimSpace(line), lineNum: li + 1})
+				}
+				if len(results) >= 20 {
+					break
+				}
+			}
+		}
+	}
+	walk(m.tree)
+	if len(results) > 20 {
+		results = results[:20]
+	}
+	m.globalSearchResults = results
+}
+
+func (m *Model) moveGlobalSearch(delta int) {
+	n := len(m.globalSearchResults)
+	if n == 0 {
+		return
+	}
+	m.globalSearchIndex = ((m.globalSearchIndex+delta)%n + n) % n
+}
+
+func (m *Model) openGlobalSearchResult() {
+	if len(m.globalSearchResults) == 0 || m.globalSearchIndex < 0 || m.globalSearchIndex >= len(m.globalSearchResults) {
+		return
+	}
+	r := m.globalSearchResults[m.globalSearchIndex]
+	if m.dirty() && !m.save() {
+		return
+	}
+	content, err := m.store.Read(r.path)
+	if err != nil {
+		m.setStatus(err.Error(), true)
+		return
+	}
+	m.currentPath = r.path
+	m.original = content
+	m.editor.SetValue(content)
+	m.undoStack = nil
+	m.redoStack = nil
+	m.editSel = nil
+	m.expandParents(r.path)
+	m.rebuildFlat()
+	m.selectPath(r.path)
+	mode := m.beforeGlobalSearch
+	m.mode = mode
+	m.active = contentPane
+	m.input.Blur()
+	m.input.Prompt = "› "
+	m.globalSearchQuery = ""
+	m.globalSearchResults = nil
+	m.globalSearchIndex = 0
+	if mode == modeEdit {
+		m.setEditorBackground(surface)
+		m.editor.Focus()
+	} else {
+		m.setEditorBackground(bg)
+	}
+	m.renderMarkdown()
+	m.adjustPreviewHeight()
+	if r.lineNum > 0 {
+		m.performGotoLine(strconv.Itoa(r.lineNum))
+	}
+}
+
+func (m Model) globalSearchView() string {
+	var b strings.Builder
+	b.WriteString(brandSty.Render("Global search") + "\n\n")
+	b.WriteString(m.input.View() + "\n")
+	if len(m.globalSearchResults) == 0 {
+		if strings.TrimSpace(m.globalSearchQuery) == "" {
+			b.WriteString("\n" + mutedSty.Render("Type to search all notes"))
+		} else {
+			b.WriteString("\n" + errorSty.Render("No matches"))
+		}
+	} else {
+		for i, r := range m.globalSearchResults {
+			if i >= 20 {
+				break
+			}
+			b.WriteString("\n" + m.globalSearchResultRow(r, i == m.globalSearchIndex))
+		}
+	}
+	b.WriteString("\n\n" + mutedSty.Render("↑/↓ select · Enter open · Esc cancel"))
+	return m.bottomOverlay(b.String())
+}
+
+func (m Model) globalSearchResultRow(r globalSearchResult, selected bool) string {
+	folder := filepath.Dir(r.path)
+	var title string
+	if folder != "." {
+		title = lipgloss.NewStyle().Foreground(accent).Bold(true).Render(folder+"/") + lipgloss.NewStyle().Foreground(text).Bold(true).Render(r.title)
+	} else {
+		title = lipgloss.NewStyle().Foreground(text).Bold(true).Render(r.title)
+	}
+	snippet := highlightKeyword(r.snippet, m.globalSearchQuery)
+	row := title + "   " + snippet
+	if selected {
+		row = lipgloss.NewStyle().Background(selection).Foreground(text).Render(row)
+	}
+	return row
+}
+
+func (m Model) bottomOverlay(content string) string {
+	panel := lipgloss.NewStyle().Background(surface).Foreground(text).Border(lipgloss.RoundedBorder()).BorderForeground(muted).Padding(1, 3).Width(min(82, max(44, m.width-6))).Render(content)
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Bottom, panel, lipgloss.WithWhitespaceBackground(bg))
+}
+
+func highlightKeyword(s, query string) string {
+	q := strings.ToLower(strings.TrimSpace(query))
+	if q == "" {
+		return s
+	}
+	lower := strings.ToLower(s)
+	if !strings.Contains(lower, q) {
+		return s
+	}
+	var b strings.Builder
+	rest := s
+	lo := lower
+	for {
+		idx := strings.Index(lo, q)
+		if idx < 0 {
+			b.WriteString(rest)
+			break
+		}
+		b.WriteString(rest[:idx])
+		b.WriteString(keywordSty.Render(rest[idx : idx+len(q)]))
+		rest = rest[idx+len(q):]
+		lo = lo[idx+len(q):]
+	}
+	return b.String()
+}
+
 func (m *Model) startSearch() {
 	m.mode = modeSearch
 	m.active = contentPane
@@ -1354,16 +1781,47 @@ func (m *Model) restoreEditFocus() {
 	}
 }
 
-func (m Model) enterIndent() string {
+func (m *Model) handleEditEnter(before string) bool {
 	pos := m.cursorPos()
 	line := m.currentLineText()
 	if pos.col < len([]rune(line)) {
-		return ""
+		return false
+	}
+	if m.handleListEnter() {
+		m.recordEdit(before, m.editor.Value())
+		return true
+	}
+	if indent := leadingIndent(line); indent != "" {
+		m.editor.InsertString("\n" + indent)
+		m.recordEdit(before, m.editor.Value())
+		return true
+	}
+	return false
+}
+
+func (m *Model) handleListEnter() bool {
+	line := m.currentLineText()
+	if isEmptyListLine(line) {
+		m.clearEmptyListLine()
+		return true
 	}
 	if cont := listContinuation(line); cont != "" {
-		return cont
+		m.editor.InsertString("\n" + cont)
+		return true
 	}
-	return leadingIndent(line)
+	return false
+}
+
+func (m *Model) clearEmptyListLine() {
+	lines := strings.Split(m.editor.Value(), "\n")
+	row := m.editor.Line()
+	if row < 0 || row >= len(lines) {
+		return
+	}
+	lines[row] = ""
+	m.editor.SetValue(strings.Join(lines, "\n"))
+	m.gotoLineEdit(row)
+	m.editor.SetCursor(0)
 }
 
 func (m *Model) refresh(preferred string) {
@@ -1459,6 +1917,17 @@ func (m *Model) treeRows() int { return max(1, m.bodyHeight-2) }
 func (m *Model) resize(width, height int) {
 	m.width, m.height = max(1, width), max(1, height)
 	m.bodyHeight = max(3, m.height-2)
+
+	if m.focusing {
+		ew := max(10, m.width-4)
+		eh := max(1, m.height-2)
+		m.editor.SetWidth(ew)
+		m.editor.SetHeight(eh)
+		m.preview.Width = max(10, ew)
+		m.preview.Height = max(1, eh)
+		m.renderMarkdown()
+		return
+	}
 
 	// Three-tier width response:
 	//   narrow (<=60)  → single panel, switch via Tab
@@ -1772,7 +2241,7 @@ func applyHighlightRanges(line string, ranges []matchPos, hi, hiEnd string) stri
 	return b.String()
 }
 
-var orderedListRe = regexp.MustCompile(`^[0-9]+[.)] `)
+var orderedListRe = regexp.MustCompile(`^([0-9]+)([.)]) `)
 
 func leadingIndent(s string) string {
 	i := 0
@@ -1782,19 +2251,54 @@ func leadingIndent(s string) string {
 	return s[:i]
 }
 
+func listMarker(trimmed string) (string, bool) {
+	switch {
+	case strings.HasPrefix(trimmed, "- "), strings.HasPrefix(trimmed, "* "), strings.HasPrefix(trimmed, "+ "):
+		return trimmed[:2], true
+	case strings.HasPrefix(trimmed, "[ ] "), strings.HasPrefix(trimmed, "[x] "):
+		return "[ ] ", true
+	}
+	if m := orderedListRe.FindString(trimmed); m != "" {
+		return m, true
+	}
+	return "", false
+}
+
+func parseOrderedMarker(marker string) (int, string, bool) {
+	m := orderedListRe.FindStringSubmatch(marker)
+	if m == nil {
+		return 0, "", false
+	}
+	n, err := strconv.Atoi(m[1])
+	if err != nil {
+		return 0, "", false
+	}
+	return n, m[2], true
+}
+
+func isEmptyListLine(line string) bool {
+	trimmed := strings.TrimLeft(line, " \t")
+	if trimmed == "" {
+		return false
+	}
+	marker, ok := listMarker(trimmed)
+	if !ok {
+		return false
+	}
+	return strings.TrimSpace(trimmed[len(marker):]) == ""
+}
+
 func listContinuation(line string) string {
 	trimmed := strings.TrimLeft(line, " \t")
 	indent := line[:len(line)-len(trimmed)]
-	switch {
-	case strings.HasPrefix(trimmed, "- "), strings.HasPrefix(trimmed, "* "), strings.HasPrefix(trimmed, "+ "):
-		return indent + trimmed[:2]
-	case strings.HasPrefix(trimmed, "[ ] "), strings.HasPrefix(trimmed, "[x] "):
-		return indent + "[ ] "
+	marker, ok := listMarker(trimmed)
+	if !ok {
+		return ""
 	}
-	if m := orderedListRe.FindString(trimmed); m != "" {
-		return indent + m
+	if n, delim, ok := parseOrderedMarker(marker); ok {
+		return fmt.Sprintf("%s%d%s ", indent, n+1, delim)
 	}
-	return ""
+	return indent + marker
 }
 
 // decorateCodeBlocks restores a solid surface background behind code blocks.
@@ -1871,8 +2375,17 @@ func (m Model) View() string {
 	if m.mode == modeExport {
 		return m.exportDialogView()
 	}
+	if m.mode == modeSearchGlobal {
+		return m.globalSearchView()
+	}
 	if (m.mode == modePrompt && m.promptKind != promptGotoLine) || m.mode == modeConfirm {
 		return m.dialogView()
+	}
+	if m.focusing {
+		if m.mode == modeSearch {
+			return m.inNoteSearchFocusView()
+		}
+		return m.focusView()
 	}
 
 	header := m.headerView()
@@ -2332,7 +2845,7 @@ func (m Model) dialogView() string {
 func (m Model) helpView() string {
 	help := brandSty.Render("Vnote shortcuts") + "\n\n" +
 		"Navigate\n" + mutedSty.Render("  ↑/↓ or J/K     Select item\n  ←/→ or H/L     Collapse / expand\n  Enter           Open note\n  Tab             Switch panel\n") +
-		"\nNotes\n" + mutedSty.Render("  Ctrl+N          New note\n  Ctrl+D          New folder\n  F2              Rename\n  Delete          Delete\n  Ctrl+E          Edit / preview\n  Ctrl+S          Save\n  Ctrl+Z          Undo\n  Ctrl+Shift+Z / Ctrl+Y  Redo\n  Ctrl+Shift+E    Export\n  Ctrl+C / Ctrl+Y Copy text\n  Ctrl+L          Copy current line\n  Ctrl+F          Search preview\n  Alt+G           Go to line\n  Ctrl+G          Select terminal text\n  Ctrl+R          Refresh\n") +
+		"\nNotes\n" + mutedSty.Render("  Ctrl+N          New note\n  Ctrl+D          New folder\n  F2              Rename\n  Delete          Delete\n  Ctrl+E          Edit / preview\n  Ctrl+S          Save\n  Ctrl+Z          Undo\n  Ctrl+Shift+Z / Ctrl+Y  Redo\n  Ctrl+Shift+E    Export\n  Ctrl+C / Ctrl+Y Copy text\n  Ctrl+L          Copy current line\n  Ctrl+F          Search preview\n  Ctrl+Shift+O    Search everywhere\n  Alt+G           Go to line\n  Ctrl+G          Select terminal text\n  Ctrl+R          Refresh\n  Ctrl+Shift+F    Focus mode\n") +
 		"\nApp\n" + mutedSty.Render("  Ctrl+Q          Quit\n  ? / Esc         Close help\n") +
 		"\n" + lipgloss.NewStyle().Foreground(accent).Render("Mouse and touch") + "\n" + mutedSty.Render("  Click rows and top actions. Scroll either panel.\n  In Select mode, drag over preview text; press any key to return.")
 	box := lipgloss.NewStyle().Background(surface).Foreground(text).Border(lipgloss.RoundedBorder()).BorderForeground(muted).Padding(1, 3).Width(min(70, max(32, m.width-4))).Render(help)
