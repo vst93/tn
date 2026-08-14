@@ -49,6 +49,9 @@ const (
 	modeSearch
 	modeExport
 	modeSearchGlobal
+	modeTag
+	modeTagFilter
+	modeTemplate
 )
 
 type promptKind int
@@ -63,6 +66,127 @@ const (
 type flatNode struct {
 	node  *storage.Node
 	depth int
+}
+
+// FrontMatter holds the YAML metadata stored at the top of a note file.
+type FrontMatter struct {
+	Title   string
+	Tags    []string
+	Created string
+}
+
+var noteTemplates = map[string]string{
+	"blank":   "# {{title}}\n\n",
+	"daily":   "## 今日完成\n\n\n## 明日计划\n\n\n## 问题/阻塞\n\n",
+	"meeting": "## 参会人\n\n\n## 议题\n\n\n## 结论\n\n\n## 待办\n\n",
+	"book":    "## 书名\n\n\n## 作者\n\n\n## 核心观点\n\n\n## 摘录\n\n\n## 我的思考\n\n",
+}
+
+var noteTemplateNames = []string{"blank", "daily", "meeting", "book"}
+
+var noteTemplateLabels = map[string]string{
+	"blank":   "空白笔记",
+	"daily":   "日报",
+	"meeting": "会议记录",
+	"book":    "读书笔记",
+}
+
+// parseFrontMatter extracts YAML metadata from the top of a note. When the
+// file has no front matter it returns empty metadata and the unchanged body.
+func parseFrontMatter(content string) (FrontMatter, string) {
+	var meta FrontMatter
+	lines := strings.Split(content, "\n")
+	if len(lines) == 0 || strings.TrimSpace(lines[0]) != "---" {
+		return meta, content
+	}
+	end := -1
+	for i := 1; i < len(lines); i++ {
+		if strings.TrimSpace(lines[i]) == "---" {
+			end = i
+			break
+		}
+	}
+	if end < 0 {
+		return meta, content
+	}
+	for _, line := range lines[1:end] {
+		key, value, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		switch strings.TrimSpace(key) {
+		case "title":
+			meta.Title = unquote(value)
+		case "created":
+			meta.Created = unquote(value)
+		case "tags":
+			meta.Tags = parseFrontTags(value)
+		}
+	}
+	return meta, strings.Join(lines[end+1:], "\n")
+}
+
+func unquote(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) >= 2 {
+		if (s[0] == '"' && s[len(s)-1] == '"') || (s[0] == '\'' && s[len(s)-1] == '\'') {
+			return s[1 : len(s)-1]
+		}
+	}
+	return s
+}
+
+func parseFrontTags(value string) []string {
+	value = strings.TrimSpace(value)
+	value = strings.TrimSpace(strings.TrimPrefix(value, "["))
+	value = strings.TrimSpace(strings.TrimSuffix(value, "]"))
+	var tags []string
+	seen := make(map[string]bool)
+	for _, part := range strings.Split(value, ",") {
+		part = unquote(strings.TrimSpace(part))
+		if part == "" || seen[part] {
+			continue
+		}
+		seen[part] = true
+		tags = append(tags, part)
+	}
+	return tags
+}
+
+func parseTagsInput(raw string) []string {
+	return parseFrontTags(raw)
+}
+
+// writeFrontMatter serializes a note body with YAML front matter. Fields are
+// only emitted when present so a note with no tags stays minimal.
+func writeFrontMatter(body string, meta FrontMatter) string {
+	var b strings.Builder
+	b.WriteString("---\n")
+	if meta.Title != "" {
+		b.WriteString("title: " + meta.Title + "\n")
+	}
+	if len(meta.Tags) > 0 {
+		b.WriteString("tags: [" + strings.Join(meta.Tags, ", ") + "]\n")
+	}
+	if meta.Created != "" {
+		b.WriteString("created: " + meta.Created + "\n")
+	}
+	b.WriteString("---\n\n")
+	body = strings.TrimLeft(body, "\n")
+	b.WriteString(body)
+	if !strings.HasSuffix(body, "\n") {
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+func containsTag(tags []string, query string) bool {
+	for _, tag := range tags {
+		if strings.EqualFold(tag, query) {
+			return true
+		}
+	}
+	return false
 }
 
 type toolbarItem struct{ label, action string }
@@ -157,6 +281,11 @@ type Model struct {
 	globalSearchResults []globalSearchResult
 	globalSearchIndex   int
 
+	tagFilter       string
+	nodeTags        map[string][]string
+	templateIndex   int
+	pendingTemplate string
+
 	renderer      *glamour.TermRenderer
 	rendererWidth int
 
@@ -193,6 +322,7 @@ func New(store *storage.Store) Model {
 	m := Model{
 		store:       store,
 		expanded:    make(map[string]bool),
+		nodeTags:    make(map[string][]string),
 		active:      treePane,
 		mode:        modeNormal,
 		editor:      editor,
@@ -349,6 +479,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.mode == modeExport {
 			return m.updateExport(msg)
 		}
+		if m.mode == modeTag {
+			return m.updateTagEdit(msg)
+		}
+		if m.mode == modeTagFilter {
+			return m.updateTagFilter(msg)
+		}
+		if m.mode == modeTemplate {
+			return m.updateTemplate(msg)
+		}
 
 		if handled, quit := m.globalKey(key); handled {
 			if quit {
@@ -466,7 +605,7 @@ func (m *Model) globalKey(key string) (handled, quit bool) {
 		m.startExport()
 		return true, false
 	case "ctrl+n":
-		m.startPrompt(promptNote)
+		m.startTemplate()
 		return true, false
 	case "ctrl+d":
 		m.startPrompt(promptDir)
@@ -481,7 +620,7 @@ func (m *Model) globalKey(key string) (handled, quit bool) {
 		m.startPrompt(promptRename)
 		return true, false
 	case "n":
-		m.startPrompt(promptNote)
+		m.startTemplate()
 		return true, false
 	case "d":
 		m.startPrompt(promptDir)
@@ -510,6 +649,13 @@ func (m *Model) globalKey(key string) (handled, quit bool) {
 		return true, false
 	case "ctrl+shift+f":
 		m.toggleFocus()
+		return true, false
+	case "ctrl+shift+t":
+		if m.mode != modeEdit {
+			m.setStatus("Open a note and press Ctrl+E to edit first", true)
+			return true, false
+		}
+		m.startTagEdit()
 		return true, false
 	case "ctrl+r":
 		m.refresh(m.selectedPath())
@@ -646,7 +792,9 @@ func (m *Model) handleMouse(msg tea.MouseEvent) {
 func (m *Model) runAction(action string) {
 	switch action {
 	case "note":
-		m.startPrompt(promptNote)
+		m.startTemplate()
+	case "tagfilter":
+		m.startTagFilter()
 	case "folder":
 		m.startPrompt(promptDir)
 	case "rename":
@@ -1109,6 +1257,13 @@ func (m Model) updatePrompt(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		switch m.promptKind {
 		case promptNote:
 			path, err = m.store.CreateNote(m.selectedParent(), value)
+			if err == nil && m.pendingTemplate != "" {
+				if tmpl, ok := noteTemplates[m.pendingTemplate]; ok {
+					title := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+					_ = m.store.Write(path, strings.ReplaceAll(tmpl, "{{title}}", title))
+				}
+				m.pendingTemplate = ""
+			}
 		case promptDir:
 			path, err = m.store.CreateDir(m.selectedParent(), value)
 		case promptRename:
@@ -1136,6 +1291,169 @@ func (m Model) updatePrompt(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	m.input, cmd = m.input.Update(msg)
 	return m, cmd
+}
+
+func (m *Model) startTemplate() {
+	m.templateIndex = 0
+	m.pendingTemplate = ""
+	m.mode = modeTemplate
+	m.statusErr = false
+	m.status = ""
+}
+
+func (m Model) updateTemplate(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.mode = modeNormal
+		return m, nil
+	case "1", "2", "3", "4":
+		idx, _ := strconv.Atoi(msg.String())
+		m.templateIndex = idx - 1
+		return m, nil
+	case "enter":
+		if m.templateIndex < 0 || m.templateIndex >= len(noteTemplateNames) {
+			m.setStatus("Select a template first", true)
+			return m, nil
+		}
+		m.pendingTemplate = noteTemplateNames[m.templateIndex]
+		m.mode = modeNormal
+		m.startPrompt(promptNote)
+		return m, nil
+	}
+	return m, nil
+}
+
+func (m Model) templateView() string {
+	var b strings.Builder
+	b.WriteString(brandSty.Render("选择模板") + "\n\n")
+	for i, key := range noteTemplateNames {
+		marker := "  "
+		if i == m.templateIndex {
+			marker = "▸ "
+		}
+		b.WriteString(marker + fmt.Sprintf("%d. %s\n", i+1, noteTemplateLabels[key]))
+	}
+	b.WriteString("\n" + mutedSty.Render("1-4 选择 · Enter 确认 · Esc 取消"))
+	return m.bottomOverlay(b.String())
+}
+
+func (m *Model) startTagEdit() {
+	if m.currentPath == "" {
+		m.setStatus("Open a note first", true)
+		return
+	}
+	meta, _ := parseFrontMatter(m.editor.Value())
+	m.input.SetValue(strings.Join(meta.Tags, ", "))
+	m.input.Prompt = "Tags: "
+	m.input.Placeholder = "tag1, tag2"
+	m.input.Width = max(20, min(60, m.width-12))
+	m.input.Focus()
+	m.mode = modeTag
+	m.statusErr = false
+	m.status = ""
+}
+
+func (m Model) updateTagEdit(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.mode = modeEdit
+		m.input.Blur()
+		m.input.Prompt = "› "
+		m.editor.Focus()
+		return m, nil
+	case "enter":
+		m.saveTags(m.input.Value())
+		if m.mode == modeTag {
+			return m, nil
+		}
+		m.input.Blur()
+		m.input.Prompt = "› "
+		m.editor.Focus()
+		return m, m.takePending()
+	}
+	var cmd tea.Cmd
+	m.input, cmd = m.input.Update(msg)
+	return m, cmd
+}
+
+func (m *Model) saveTags(raw string) {
+	if m.currentPath == "" {
+		m.setStatus("Open a note first", true)
+		return
+	}
+	meta, body := parseFrontMatter(m.editor.Value())
+	if meta.Title == "" {
+		meta.Title = strings.TrimSuffix(filepath.Base(m.currentPath), filepath.Ext(m.currentPath))
+	}
+	if meta.Created == "" {
+		meta.Created = time.Now().Format("2006-01-02")
+	}
+	meta.Tags = parseTagsInput(raw)
+	content := writeFrontMatter(body, meta)
+	m.editor.SetValue(content)
+	if err := m.store.Write(m.currentPath, content); err != nil {
+		m.setStatus("Save tags failed: "+err.Error(), true)
+		return
+	}
+	m.original = content
+	m.redoStack = m.redoStack[:0]
+	m.mode = modeEdit
+	m.renderMarkdown()
+	m.nodeTags[m.currentPath] = meta.Tags
+	m.rebuildFlat()
+	m.flashStatus("Tags saved", false, 2*time.Second)
+}
+
+func (m Model) tagEditView() string {
+	title := "Edit tags"
+	body := m.input.View() + "\n\n" + mutedSty.Render("Enter 保存 · Esc 取消")
+	if m.statusErr {
+		body += "\n" + errorSty.Render(m.status)
+	}
+	dialog := lipgloss.NewStyle().Background(surface).Foreground(text).Border(lipgloss.RoundedBorder()).BorderForeground(muted).Padding(1, 3).Width(min(64, max(28, m.width-6))).Render(brandSty.Render(title) + "\n\n" + body)
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, dialog, lipgloss.WithWhitespaceBackground(bg))
+}
+
+func (m *Model) startTagFilter() {
+	m.mode = modeTagFilter
+	m.input.Prompt = "# "
+	m.input.Placeholder = "tag name"
+	m.input.SetValue(m.tagFilter)
+	m.input.Width = max(10, min(50, m.width-12))
+	m.input.Focus()
+	m.statusErr = false
+	m.status = ""
+}
+
+func (m Model) updateTagFilter(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.tagFilter = ""
+		m.mode = modeNormal
+		m.input.Blur()
+		m.input.Prompt = "› "
+		m.rebuildFlat()
+		m.flashStatus("Tag filter cleared", false, 2*time.Second)
+		return m, m.takePending()
+	case "enter":
+		m.mode = modeNormal
+		m.input.Blur()
+		m.input.Prompt = "› "
+		m.setStatus("Filtering by #"+strings.TrimSpace(m.tagFilter), false)
+		return m, nil
+	}
+	var cmd tea.Cmd
+	m.input, cmd = m.input.Update(msg)
+	filter := strings.TrimSpace(m.input.Value())
+	if filter != m.tagFilter {
+		m.tagFilter = filter
+		m.rebuildFlat()
+	}
+	return m, cmd
+}
+
+func (m Model) tagFilterBarView() string {
+	return lipgloss.NewStyle().Background(surface).Foreground(text).Width(m.width).MaxHeight(1).Render(" # " + m.input.View())
 }
 
 func (m *Model) renameSelected(name string) (string, error) {
@@ -1248,6 +1566,11 @@ func (m *Model) save() bool {
 	}
 	m.original = content
 	m.redoStack = m.redoStack[:0]
+	meta, _ := parseFrontMatter(content)
+	m.nodeTags[m.currentPath] = meta.Tags
+	if m.tagFilter != "" {
+		m.rebuildFlat()
+	}
 	m.renderMarkdown()
 	m.flashStatus("✓ Saved "+m.currentPath, false, 2*time.Second)
 	return true
@@ -1849,16 +2172,65 @@ func (m *Model) refresh(preferred string) {
 
 func (m *Model) rebuildFlat() {
 	m.flat = m.flat[:0]
+	m.nodeTags = make(map[string][]string)
+	filter := strings.ToLower(strings.TrimSpace(m.tagFilter))
 	var walk func([]*storage.Node, int)
 	walk = func(nodes []*storage.Node, depth int) {
 		for _, n := range nodes {
-			m.flat = append(m.flat, flatNode{node: n, depth: depth})
-			if n.IsDir && m.expanded[n.RelPath] {
-				walk(n.Children, depth+1)
+			if n.IsDir {
+				m.flat = append(m.flat, flatNode{node: n, depth: depth})
+				if m.expanded[n.RelPath] {
+					walk(n.Children, depth+1)
+				}
+				continue
 			}
+			tags := m.tagsForNode(n)
+			m.nodeTags[n.RelPath] = tags
+			if filter != "" && !containsTag(tags, filter) {
+				continue
+			}
+			m.flat = append(m.flat, flatNode{node: n, depth: depth})
 		}
 	}
 	walk(m.tree, 0)
+}
+
+func (m *Model) tagsForNode(n *storage.Node) []string {
+	content, err := m.store.Read(n.RelPath)
+	if err != nil {
+		return nil
+	}
+	meta, _ := parseFrontMatter(content)
+	return meta.Tags
+}
+
+func (m Model) tagsRow(tags []string, width int) string {
+	if len(tags) == 0 {
+		return ""
+	}
+	width = max(4, width)
+	var lines []string
+	var b strings.Builder
+	for i, tag := range tags {
+		chip := lipgloss.NewStyle().Foreground(accent).Render("▍ " + tag)
+		sep := 0
+		if i > 0 {
+			sep = 1
+		}
+		if i > 0 && lipgloss.Width(b.String())+sep+lipgloss.Width(chip) > width {
+			lines = append(lines, b.String())
+			b.Reset()
+			sep = 0
+		}
+		if sep > 0 {
+			b.WriteString(" ")
+		}
+		b.WriteString(chip)
+	}
+	if b.Len() > 0 {
+		lines = append(lines, b.String())
+	}
+	return strings.Join(lines, "\n")
 }
 
 func (m *Model) expandParents(path string) {
@@ -2378,6 +2750,12 @@ func (m Model) View() string {
 	if m.mode == modeSearchGlobal {
 		return m.globalSearchView()
 	}
+	if m.mode == modeTemplate {
+		return m.templateView()
+	}
+	if m.mode == modeTag {
+		return m.tagEditView()
+	}
 	if (m.mode == modePrompt && m.promptKind != promptGotoLine) || m.mode == modeConfirm {
 		return m.dialogView()
 	}
@@ -2412,6 +2790,8 @@ func (m Model) View() string {
 		bottom = m.searchBarView() + "\n" + m.searchStatusView()
 	case m.mode == modePrompt && m.promptKind == promptGotoLine:
 		bottom = m.gotoBarView()
+	case m.mode == modeTagFilter:
+		bottom = m.tagFilterBarView()
 	default:
 		bottom = m.statusView()
 	}
@@ -2465,7 +2845,7 @@ func (m Model) headerTabs() string {
 
 func (m Model) toolbarItems() []toolbarItem {
 	items := []toolbarItem{
-		{"? help", "help"}, {"n note", "note"}, {"d folder", "folder"}, {"e edit", "edit"}, {"s save", "save"}, {"y copy", "copy"}, {"g select", "select"}, {"r rename", "rename"}, {"x delete", "delete"}, {"q quit", "quit"},
+		{"? help", "help"}, {"# tag", "tagfilter"}, {"n note", "note"}, {"d folder", "folder"}, {"e edit", "edit"}, {"s save", "save"}, {"y copy", "copy"}, {"g select", "select"}, {"r rename", "rename"}, {"x delete", "delete"}, {"q quit", "quit"},
 	}
 	if m.compact {
 		label := "→ note"
@@ -2514,6 +2894,9 @@ func (m Model) treeViewSides(width int, leftB, rightB bool) string {
 	if len(m.flat) > 0 {
 		title += mutedSty.Render("  " + fmt.Sprintf("%d", len(m.flat)))
 	}
+	if m.tagFilter != "" {
+		title += "  " + lipgloss.NewStyle().Foreground(accent).Bold(true).Render("#"+m.tagFilter)
+	}
 	innerWidth := max(1, width)
 	if leftB {
 		innerWidth--
@@ -2539,6 +2922,9 @@ func (m Model) treeViewSides(width int, leftB, rightB bool) string {
 		} else {
 			name := strings.TrimSuffix(item.node.Name, filepath.Ext(item.node.Name))
 			label = mutedSty.Render(name)
+			if count := len(m.nodeTags[item.node.RelPath]); count > 0 {
+				label = label + " " + lipgloss.NewStyle().Foreground(accent).Bold(true).Render(fmt.Sprintf("#%d", count))
+			}
 		}
 		row := " " + indent + label
 		if i == m.selected {
@@ -2587,6 +2973,16 @@ func (m Model) contentViewSides(width int, leftB, rightB bool) string {
 			lipgloss.NewStyle().Foreground(accent).Bold(true).Render(state) + "   " +
 			mutedSty.Render(modeName) + "   " +
 			mutedSty.Render(fmt.Sprintf("%d words", words)) + "\n"
+		if tags := m.nodeTags[m.currentPath]; len(tags) > 0 {
+			inner := max(1, width)
+			if leftB {
+				inner--
+			}
+			if rightB {
+				inner--
+			}
+			meta += " " + m.tagsRow(tags, max(4, inner-2)) + "\n"
+		}
 	}
 
 	var content string
@@ -2845,7 +3241,7 @@ func (m Model) dialogView() string {
 func (m Model) helpView() string {
 	help := brandSty.Render("Vnote shortcuts") + "\n\n" +
 		"Navigate\n" + mutedSty.Render("  ↑/↓ or J/K     Select item\n  ←/→ or H/L     Collapse / expand\n  Enter           Open note\n  Tab             Switch panel\n") +
-		"\nNotes\n" + mutedSty.Render("  Ctrl+N          New note\n  Ctrl+D          New folder\n  F2              Rename\n  Delete          Delete\n  Ctrl+E          Edit / preview\n  Ctrl+S          Save\n  Ctrl+Z          Undo\n  Ctrl+Shift+Z / Ctrl+Y  Redo\n  Ctrl+Shift+E    Export\n  Ctrl+C / Ctrl+Y Copy text\n  Ctrl+L          Copy current line\n  Ctrl+F          Search preview\n  Ctrl+Shift+O    Search everywhere\n  Alt+G           Go to line\n  Ctrl+G          Select terminal text\n  Ctrl+R          Refresh\n  Ctrl+Shift+F    Focus mode\n") +
+		"\nNotes\n" + mutedSty.Render("  Ctrl+N          New note (template)\n  Ctrl+D          New folder\n  F2              Rename\n  Delete          Delete\n  Ctrl+E          Edit / preview\n  Ctrl+S          Save\n  Ctrl+Z          Undo\n  Ctrl+Shift+Z / Ctrl+Y  Redo\n  Ctrl+Shift+E    Export\n  Ctrl+Shift+T    Edit tags\n  Ctrl+C / Ctrl+Y Copy text\n  Ctrl+L          Copy current line\n  Ctrl+F          Search preview\n  Ctrl+Shift+O    Search everywhere\n  Alt+G           Go to line\n  Ctrl+G          Select terminal text\n  Ctrl+R          Refresh\n  Ctrl+Shift+F    Focus mode\n") +
 		"\nApp\n" + mutedSty.Render("  Ctrl+Q          Quit\n  ? / Esc         Close help\n") +
 		"\n" + lipgloss.NewStyle().Foreground(accent).Render("Mouse and touch") + "\n" + mutedSty.Render("  Click rows and top actions. Scroll either panel.\n  In Select mode, drag over preview text; press any key to return.")
 	box := lipgloss.NewStyle().Background(surface).Foreground(text).Border(lipgloss.RoundedBorder()).BorderForeground(muted).Padding(1, 3).Width(min(70, max(32, m.width-4))).Render(help)

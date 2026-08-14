@@ -69,8 +69,11 @@ func TestCompactToolbarHitTargets(t *testing.T) {
 	if action := m.toolbarActionAt(1); action != "help" {
 		t.Fatalf("first action = %q, want help", action)
 	}
-	if action := m.toolbarActionAt(11); action != "note" {
-		t.Fatalf("second action = %q, want note", action)
+	if action := m.toolbarActionAt(11); action != "tagfilter" {
+		t.Fatalf("second action = %q, want tagfilter", action)
+	}
+	if action := m.toolbarActionAt(21); action != "note" {
+		t.Fatalf("third action = %q, want note", action)
 	}
 }
 
@@ -1030,5 +1033,198 @@ func TestCheckboxListContinuation(t *testing.T) {
 	m = updated.(Model)
 	if m.editor.Value() != "[ ] task\n[ ] " {
 		t.Fatalf("expected checkbox continuation, got %q", m.editor.Value())
+	}
+}
+
+func TestParseFrontMatterRoundTrip(t *testing.T) {
+	content := "---\ntitle: 会议记录\ntags: [work, meeting]\ncreated: 2026-08-14\n---\n\n# 今日会议\n"
+	meta, body := parseFrontMatter(content)
+	if meta.Title != "会议记录" || meta.Created != "2026-08-14" {
+		t.Fatalf("unexpected meta %+v", meta)
+	}
+	if len(meta.Tags) != 2 || meta.Tags[0] != "work" || meta.Tags[1] != "meeting" {
+		t.Fatalf("unexpected tags %v", meta.Tags)
+	}
+	if strings.TrimSpace(body) != "# 今日会议" {
+		t.Fatalf("unexpected body %q", body)
+	}
+
+	if got := writeFrontMatter(body, meta); got != content {
+		t.Fatalf("round trip mismatch:\n got %q\nwant %q", got, content)
+	}
+
+	emptyMeta, emptyBody := parseFrontMatter("# plain\n")
+	if len(emptyMeta.Tags) != 0 || emptyMeta.Title != "" {
+		t.Fatalf("expected empty meta for plain note, got %+v", emptyMeta)
+	}
+	if emptyBody != "# plain\n" {
+		t.Fatalf("expected unchanged body, got %q", emptyBody)
+	}
+}
+
+func TestEditTagsWritesFrontMatter(t *testing.T) {
+	store := storage.New(t.TempDir())
+	note, err := store.CreateNote("", "tagged")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := New(store)
+	m.resize(100, 30)
+	m.selectPath(note)
+	m.openSelectedNote()
+	m.toggleEdit()
+
+	if handled, _ := m.globalKey("ctrl+shift+t"); !handled {
+		t.Fatal("expected Ctrl+Shift+T to be handled in edit mode")
+	}
+	if m.mode != modeTag {
+		t.Fatalf("expected tag edit mode, got %v", m.mode)
+	}
+	m.input.SetValue("work, meeting")
+	updated, _ := m.updateTagEdit(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	if m.mode != modeEdit {
+		t.Fatalf("expected to return to edit mode, got %v", m.mode)
+	}
+
+	content, err := store.Read(note)
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta, body := parseFrontMatter(content)
+	if len(meta.Tags) != 2 || meta.Tags[0] != "work" || meta.Tags[1] != "meeting" {
+		t.Fatalf("unexpected saved tags %v", meta.Tags)
+	}
+	if meta.Title != "tagged" {
+		t.Fatalf("expected title derived from filename, got %q", meta.Title)
+	}
+	if strings.TrimSpace(body) != "# tagged" {
+		t.Fatalf("unexpected body %q", body)
+	}
+	if len(m.nodeTags[note]) != 2 {
+		t.Fatalf("expected node tags recorded, got %v", m.nodeTags[note])
+	}
+	view := stripANSI(m.contentView(100))
+	if !strings.Contains(view, "▍ work") || !strings.Contains(view, "▍ meeting") {
+		t.Fatalf("expected tags in metadata row, got %q", view)
+	}
+}
+
+func TestTagFilterShowsOnlyMatchingNotes(t *testing.T) {
+	store := storage.New(t.TempDir())
+	noteA, err := store.CreateNote("", "alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	noteB, err := store.CreateNote("", "beta")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Write(noteA, writeFrontMatter("# Alpha\n\n", FrontMatter{Tags: []string{"work"}})); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Write(noteB, writeFrontMatter("# Beta\n\n", FrontMatter{Tags: []string{"home"}})); err != nil {
+		t.Fatal(err)
+	}
+
+	m := New(store)
+	m.resize(100, 30)
+	m.startTagFilter()
+	m.input.SetValue("work")
+	updated, _ := m.updateTagFilter(tea.KeyMsg{Type: tea.KeyRight})
+	m = updated.(Model)
+	if m.tagFilter != "work" {
+		t.Fatalf("expected tag filter work, got %q", m.tagFilter)
+	}
+	if len(m.flat) != 1 || m.flat[0].node.RelPath != noteA {
+		t.Fatalf("expected only alpha visible, got %d rows", len(m.flat))
+	}
+	if view := stripANSI(m.treeView(100)); !strings.Contains(view, "#work") {
+		t.Fatalf("expected filter indicator in tree title, got %q", view)
+	}
+
+	updated, _ = m.updateTagFilter(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+	if m.tagFilter != "" || len(m.flat) != 2 {
+		t.Fatalf("expected Esc to clear filter, filter=%q rows=%d", m.tagFilter, len(m.flat))
+	}
+}
+
+func TestTreeShowsTagCount(t *testing.T) {
+	store := storage.New(t.TempDir())
+	note, err := store.CreateNote("", "meeting-notes")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Write(note, writeFrontMatter("# Meeting\n\n", FrontMatter{Tags: []string{"work", "meeting"}})); err != nil {
+		t.Fatal(err)
+	}
+	m := New(store)
+	m.resize(100, 30)
+	view := stripANSI(m.treeView(100))
+	if !strings.Contains(view, "meeting-notes #2") {
+		t.Fatalf("expected tag count in tree, got %q", view)
+	}
+}
+
+func TestNewNoteTemplateFlow(t *testing.T) {
+	store := storage.New(t.TempDir())
+	m := New(store)
+	m.resize(100, 30)
+
+	if handled, _ := m.globalKey("ctrl+n"); !handled {
+		t.Fatal("expected Ctrl+N to be handled")
+	}
+	if m.mode != modeTemplate {
+		t.Fatalf("expected template mode, got %v", m.mode)
+	}
+	if view := stripANSI(m.templateView()); !strings.Contains(view, "选择模板") || !strings.Contains(view, "4. 读书笔记") {
+		t.Fatalf("unexpected template view %q", view)
+	}
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'2'}})
+	m = updated.(Model)
+	if m.templateIndex != 1 {
+		t.Fatalf("expected daily template selected, got %d", m.templateIndex)
+	}
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	if m.mode != modePrompt || m.promptKind != promptNote {
+		t.Fatalf("expected note name prompt, mode=%v kind=%v", m.mode, m.promptKind)
+	}
+
+	m.input.SetValue("standup")
+	updated, _ = m.updatePrompt(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	if m.mode != modeEdit {
+		t.Fatalf("expected edit mode after creating note, got %v", m.mode)
+	}
+	content, err := store.Read(m.currentPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if content != noteTemplates["daily"] {
+		t.Fatalf("expected daily template content, got %q", content)
+	}
+	if m.pendingTemplate != "" {
+		t.Fatalf("expected pending template to be consumed, got %q", m.pendingTemplate)
+	}
+}
+
+func TestBlankTemplateUsesTitle(t *testing.T) {
+	store := storage.New(t.TempDir())
+	m := New(store)
+	m.resize(100, 30)
+	m.startTemplate()
+	m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m.input.SetValue("scratch")
+	updated, _ := m.updatePrompt(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	content, err := store.Read(m.currentPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if content != "# scratch\n\n" {
+		t.Fatalf("expected blank template with title, got %q", content)
 	}
 }
