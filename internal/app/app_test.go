@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -453,8 +454,13 @@ func TestPreviewStatusBarShowsStats(t *testing.T) {
 	m.renderMarkdown()
 
 	bar := stripANSI(m.shortcutBar())
-	if !strings.Contains(bar, "5 words · 2 lines · ~1 min read") {
-		t.Fatalf("preview status bar missing stats: %q", bar)
+	if !strings.Contains(bar, "[?] help") {
+		t.Fatalf("preview status bar missing shortcuts: %q", bar)
+	}
+	m.setStatus("Status right", false)
+	bar = stripANSI(m.shortcutBar())
+	if !strings.Contains(bar, "Status right") {
+		t.Fatalf("preview status bar missing right-side status: %q", bar)
 	}
 }
 
@@ -612,7 +618,7 @@ func TestEditStatusBarShowsUndoRedo(t *testing.T) {
 	m = updated.(Model)
 
 	bar := stripANSI(m.editShortcutBar())
-	if !strings.Contains(bar, "Ctrl+Z 撤销") || !strings.Contains(bar, "Ctrl+Shift+Z 重做") {
+	if !strings.Contains(bar, "Ctrl+Z") || !strings.Contains(bar, "Ctrl+Shift+Z") {
 		t.Fatalf("edit status bar missing undo/redo hints: %q", bar)
 	}
 	if !m.undoable() {
@@ -1226,5 +1232,267 @@ func TestBlankTemplateUsesTitle(t *testing.T) {
 	}
 	if content != "# scratch\n\n" {
 		t.Fatalf("expected blank template with title, got %q", content)
+	}
+}
+
+func TestSpaceTogglesMultiSelectAndCtrlASelectsAll(t *testing.T) {
+	store := storage.New(t.TempDir())
+	noteA, err := store.CreateNote("", "alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	noteB, err := store.CreateNote("", "beta")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	m := New(store)
+	m.resize(100, 30)
+	m.selectPath(noteA)
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeySpace})
+	m = updated.(Model)
+	if !m.selectedItems[noteA] {
+		t.Fatalf("expected Space to select %q", noteA)
+	}
+	view := stripANSI(m.treeView(100))
+	if !strings.Contains(view, "☑ alpha") || !strings.Contains(view, "○ beta") {
+		t.Fatalf("expected selection markers in tree, got %q", view)
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeySpace})
+	m = updated.(Model)
+	if m.selectedItems[noteA] {
+		t.Fatal("expected second Space to deselect")
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlA})
+	m = updated.(Model)
+	if !m.selectedItems[noteA] || !m.selectedItems[noteB] {
+		t.Fatalf("expected Ctrl+A to select all visible notes, got %v", m.selectedItems)
+	}
+	if m.selectedCount() != 2 {
+		t.Fatalf("expected 2 selected, got %d", m.selectedCount())
+	}
+
+	m.treeKey("ctrl+shift+a")
+	if m.selectedCount() != 0 {
+		t.Fatalf("expected Ctrl+Shift+A to clear selection, got %d", m.selectedCount())
+	}
+}
+
+func TestBatchDelete(t *testing.T) {
+	store := storage.New(t.TempDir())
+	noteA, err := store.CreateNote("", "alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	noteB, err := store.CreateNote("", "beta")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	m := New(store)
+	m.resize(100, 30)
+	m.selectAllVisible()
+	m.startDelete()
+	if m.mode != modeConfirm || m.confirmCount != 2 {
+		t.Fatalf("expected batch delete confirm, mode=%v count=%d", m.mode, m.confirmCount)
+	}
+	if view := stripANSI(m.dialogView()); !strings.Contains(view, "将删除 2 个笔记") {
+		t.Fatalf("expected batch delete message, got %q", view)
+	}
+
+	updated, _ := m.updateConfirm("y")
+	m = updated.(Model)
+	if m.mode != modeNormal {
+		t.Fatalf("expected normal mode after delete, got %v", m.mode)
+	}
+	for _, path := range []string{noteA, noteB} {
+		if _, err := os.Stat(filepath.Join(store.Root, path)); !os.IsNotExist(err) {
+			t.Fatalf("expected %q deleted, err=%v", path, err)
+		}
+	}
+	if m.selectedCount() != 0 {
+		t.Fatalf("expected selection cleared after batch delete, got %d", m.selectedCount())
+	}
+}
+
+func TestBatchExport(t *testing.T) {
+	store := storage.New(t.TempDir())
+	noteA, err := store.CreateNote("", "alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	noteB, err := store.CreateNote("", "beta")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Write(noteA, "# Alpha\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Write(noteB, "# Beta\n"); err != nil {
+		t.Fatal(err)
+	}
+
+	m := New(store)
+	m.resize(100, 30)
+	m.selectAllVisible()
+	if handled, _ := m.globalKey("ctrl+shift+e"); !handled {
+		t.Fatal("expected Ctrl+Shift+E to handle batch export")
+	}
+	if m.mode != modeExport || !m.batchExport || !m.exportPath {
+		t.Fatalf("expected batch export path dialog, mode=%v batch=%v path=%v", m.mode, m.batchExport, m.exportPath)
+	}
+
+	outDir := filepath.Join(t.TempDir(), "out")
+	m.input.SetValue(outDir)
+	updated, _ := m.updateExport(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	if m.mode != modeNormal {
+		t.Fatalf("expected export to finish, mode=%v", m.mode)
+	}
+	data, err := os.ReadFile(filepath.Join(outDir, noteA))
+	if err != nil || string(data) != "# Alpha\n" {
+		t.Fatalf("alpha export = %q, %v", string(data), err)
+	}
+	data, err = os.ReadFile(filepath.Join(outDir, noteB))
+	if err != nil || string(data) != "# Beta\n" {
+		t.Fatalf("beta export = %q, %v", string(data), err)
+	}
+}
+
+func TestBatchTag(t *testing.T) {
+	store := storage.New(t.TempDir())
+	noteA, err := store.CreateNote("", "alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	noteB, err := store.CreateNote("", "beta")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Write(noteA, "# Alpha\n\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Write(noteB, "# Beta\n\n"); err != nil {
+		t.Fatal(err)
+	}
+
+	m := New(store)
+	m.resize(100, 30)
+	m.selectAllVisible()
+	if handled, _ := m.globalKey("ctrl+shift+t"); !handled {
+		t.Fatal("expected Ctrl+Shift+T to handle batch tag")
+	}
+	if m.mode != modeTag || !m.batchTag {
+		t.Fatalf("expected batch tag mode, mode=%v batch=%v", m.mode, m.batchTag)
+	}
+
+	m.input.SetValue("work, urgent")
+	updated, _ := m.updateTagEdit(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	if m.mode != modeNormal {
+		t.Fatalf("expected normal mode after batch tag, got %v", m.mode)
+	}
+	for _, path := range []string{noteA, noteB} {
+		content, err := store.Read(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		meta, _ := parseFrontMatter(content)
+		if len(meta.Tags) != 2 || meta.Tags[0] != "work" || meta.Tags[1] != "urgent" {
+			t.Fatalf("unexpected tags for %q: %v", path, meta.Tags)
+		}
+	}
+}
+
+func TestExportCreatesDirectories(t *testing.T) {
+	store := storage.New(t.TempDir())
+	note, err := store.CreateNote("", "export-dir")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := New(store)
+	m.resize(100, 30)
+	m.selectPath(note)
+	m.openSelectedNote()
+	m.editor.SetValue("# Exported\n")
+
+	m.startExport()
+	updated, _ := m.updateExport(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'2'}})
+	m = updated.(Model)
+	m.input.SetValue(filepath.Join("nested", "deep", "copy.md"))
+	updated, _ = m.updateExport(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	if m.mode != modeNormal {
+		t.Fatalf("expected export to finish, mode=%v", m.mode)
+	}
+	want := filepath.Join(store.Root, "nested", "deep", "copy.md")
+	data, err := os.ReadFile(want)
+	if err != nil || string(data) != "# Exported\n" {
+		t.Fatalf("exported content = %q, %v", string(data), err)
+	}
+}
+
+func TestSortByModifiedAndCreated(t *testing.T) {
+	store := storage.New(t.TempDir())
+	noteA, err := store.CreateNote("", "a-note")
+	if err != nil {
+		t.Fatal(err)
+	}
+	noteB, err := store.CreateNote("", "b-note")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Write(noteA, writeFrontMatter("# A\n\n", FrontMatter{Created: "2020-01-01"})); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Write(noteB, writeFrontMatter("# B\n\n", FrontMatter{Created: "2024-01-01"})); err != nil {
+		t.Fatal(err)
+	}
+
+	m := New(store)
+	m.resize(100, 30)
+
+	m.sortMode = sortByCreated
+	m.rebuildFlat()
+	if m.flat[0].node.RelPath != noteB || m.flat[1].node.RelPath != noteA {
+		t.Fatalf("expected newest created first, got %q, %q", m.flat[0].node.RelPath, m.flat[1].node.RelPath)
+	}
+
+	older := time.Now().Add(-time.Hour)
+	newer := time.Now()
+	if err := os.Chtimes(filepath.Join(store.Root, noteA), older, older); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(filepath.Join(store.Root, noteB), newer, newer); err != nil {
+		t.Fatal(err)
+	}
+	m.sortMode = sortByModified
+	m.rebuildFlat()
+	if m.flat[0].node.RelPath != noteB || m.flat[1].node.RelPath != noteA {
+		t.Fatalf("expected newest modified first, got %q, %q", m.flat[0].node.RelPath, m.flat[1].node.RelPath)
+	}
+
+	m.sortMode = sortByName
+	m.rebuildFlat()
+	if m.flat[0].node.RelPath != noteA || m.flat[1].node.RelPath != noteB {
+		t.Fatalf("expected name sort, got %q, %q", m.flat[0].node.RelPath, m.flat[1].node.RelPath)
+	}
+}
+
+func TestSearchHighlightCapped(t *testing.T) {
+	var b strings.Builder
+	for i := 0; i < 500; i++ {
+		b.WriteString("needle line\n")
+	}
+	out := highlightSearchContent(b.String(), "needle")
+	count := strings.Count(out, "\x1b[7m")
+	if count > maxSearchHighlight {
+		t.Fatalf("expected highlights capped at %d, got %d", maxSearchHighlight, count)
+	}
+	if count != maxSearchHighlight {
+		t.Fatalf("expected %d highlights, got %d", maxSearchHighlight, count)
 	}
 }

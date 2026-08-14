@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -61,6 +62,14 @@ const (
 	promptDir
 	promptRename
 	promptGotoLine
+)
+
+type sortMode int
+
+const (
+	sortByName sortMode = iota
+	sortByModified
+	sortByCreated
 )
 
 type flatNode struct {
@@ -296,6 +305,12 @@ type Model struct {
 	statusCmd  tea.Cmd
 	confirm    string
 	confirmDir bool
+
+	selectedItems map[string]bool
+	confirmCount  int
+	batchExport   bool
+	batchTag      bool
+	sortMode      sortMode
 }
 
 func New(store *storage.Store) Model {
@@ -320,17 +335,18 @@ func New(store *storage.Store) Model {
 	input.Cursor.Style = lipgloss.NewStyle().Foreground(accent)
 
 	m := Model{
-		store:       store,
-		expanded:    make(map[string]bool),
-		nodeTags:    make(map[string][]string),
-		active:      treePane,
-		mode:        modeNormal,
-		editor:      editor,
-		preview:     viewport.New(60, 20),
-		input:       input,
-		copier:      copyText,
-		status:      "Ready",
-		sessionPath: defaultSessionPath(),
+		store:         store,
+		expanded:      make(map[string]bool),
+		nodeTags:      make(map[string][]string),
+		selectedItems: make(map[string]bool),
+		active:        treePane,
+		mode:          modeNormal,
+		editor:        editor,
+		preview:       viewport.New(60, 20),
+		input:         input,
+		copier:        copyText,
+		status:        "Ready",
+		sessionPath:   defaultSessionPath(),
 	}
 	m.preview.MouseWheelEnabled = true
 	m.preview.MouseWheelDelta = 3
@@ -598,6 +614,10 @@ func (m *Model) globalKey(key string) (handled, quit bool) {
 		if m.mode == modeEdit {
 			return false, false
 		}
+		if m.selectedCount() > 0 {
+			m.startBatchExport()
+			return true, false
+		}
 		if m.currentPath == "" {
 			m.setStatus("Open a note first", true)
 			return true, false
@@ -651,6 +671,10 @@ func (m *Model) globalKey(key string) (handled, quit bool) {
 		m.toggleFocus()
 		return true, false
 	case "ctrl+shift+t":
+		if m.selectedCount() > 0 {
+			m.startBatchTag()
+			return true, false
+		}
 		if m.mode != modeEdit {
 			m.setStatus("Open a note and press Ctrl+E to edit first", true)
 			return true, false
@@ -725,11 +749,54 @@ func (m *Model) treeKey(key string) {
 		m.moveSelection(-m.treeRows())
 	case "pgdown":
 		m.moveSelection(m.treeRows())
-	case "right", "l", "enter", " ":
+	case "right", "l", "enter":
 		m.activateSelected()
 	case "left", "h":
 		m.collapseOrParent()
+	case " ":
+		m.toggleSelect()
+	case "ctrl+a":
+		m.selectAllVisible()
+	case "ctrl+shift+a":
+		m.clearSelection()
 	}
+}
+
+func (m *Model) toggleSelect() {
+	if len(m.flat) == 0 {
+		return
+	}
+	n := m.flat[m.selected].node
+	if n.IsDir {
+		return
+	}
+	if m.selectedItems[n.RelPath] {
+		delete(m.selectedItems, n.RelPath)
+	} else {
+		m.selectedItems[n.RelPath] = true
+	}
+}
+
+func (m *Model) selectAllVisible() {
+	for _, item := range m.flat {
+		if !item.node.IsDir {
+			m.selectedItems[item.node.RelPath] = true
+		}
+	}
+}
+
+func (m *Model) clearSelection() {
+	m.selectedItems = make(map[string]bool)
+}
+
+func (m *Model) selectedCount() int {
+	count := 0
+	for _, item := range m.flat {
+		if !item.node.IsDir && m.selectedItems[item.node.RelPath] {
+			count++
+		}
+	}
+	return count
 }
 
 func (m *Model) handleMouse(msg tea.MouseEvent) {
@@ -926,6 +993,20 @@ func (m *Model) startExport() {
 	m.input.Blur()
 }
 
+func (m *Model) startBatchExport() {
+	m.mode = modeExport
+	m.exportPath = true
+	m.batchExport = true
+	m.exportCopy = false
+	m.statusErr = false
+	m.status = ""
+	m.input.Prompt = fmt.Sprintf("Export %d notes to: ", m.selectedCount())
+	m.input.Placeholder = "directory path"
+	m.input.SetValue("")
+	m.input.Width = max(20, min(60, m.width-12))
+	m.input.Focus()
+}
+
 func (m Model) updateExport(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if !m.exportPath {
 		switch msg.String() {
@@ -950,10 +1031,15 @@ func (m Model) updateExport(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "esc":
 		m.mode = modeNormal
 		m.exportPath = false
+		m.batchExport = false
 		m.input.Blur()
 		return m, nil
 	case "enter":
-		m.performSaveAs()
+		if m.batchExport {
+			m.performBatchExport()
+		} else {
+			m.performSaveAs()
+		}
 		if m.mode == modeExport {
 			return m, nil
 		}
@@ -982,6 +1068,10 @@ func (m *Model) performSaveAs() {
 	if !filepath.IsAbs(path) {
 		path = filepath.Join(m.exportDir(), path)
 	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		m.setStatus("Export failed: "+err.Error(), true)
+		return
+	}
 	if err := os.WriteFile(path, []byte(m.editor.Value()), 0o644); err != nil {
 		m.setStatus("Export failed: "+err.Error(), true)
 		return
@@ -990,6 +1080,50 @@ func (m *Model) performSaveAs() {
 	m.exportPath = false
 	m.input.Blur()
 	m.flashStatus("✓ Exported to "+path, false, 2*time.Second)
+}
+
+func (m *Model) performBatchExport() {
+	raw := strings.TrimSpace(m.input.Value())
+	if raw == "" {
+		m.setStatus("Enter a directory to export to", true)
+		return
+	}
+	dir := raw
+	if !filepath.IsAbs(dir) {
+		dir = filepath.Join(m.store.Root, dir)
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		m.setStatus("Export failed: "+err.Error(), true)
+		return
+	}
+	count := 0
+	for _, item := range m.flat {
+		path := item.node.RelPath
+		if item.node.IsDir || !m.selectedItems[path] {
+			continue
+		}
+		content, err := m.store.Read(path)
+		if err != nil {
+			continue
+		}
+		target := filepath.Join(dir, path)
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			continue
+		}
+		if err := os.WriteFile(target, []byte(content), 0o644); err != nil {
+			continue
+		}
+		count++
+	}
+	if count == 0 {
+		m.setStatus("Export failed: no notes could be written", true)
+		return
+	}
+	m.mode = modeNormal
+	m.exportPath = false
+	m.batchExport = false
+	m.input.Blur()
+	m.flashStatus(fmt.Sprintf("✓ Exported %d notes to %s", count, dir), false, 2*time.Second)
 }
 
 func (m Model) exportDir() string {
@@ -1010,6 +1144,9 @@ func (m Model) defaultExportPath() string {
 
 func (m Model) exportDialogView() string {
 	title := "Export"
+	if m.batchExport {
+		title = fmt.Sprintf("Export %d notes", m.selectedCount())
+	}
 	var body string
 	if m.exportPath {
 		body = m.input.View() + "\n\n" + mutedSty.Render("Enter 导出  ·  Esc 取消")
@@ -1353,27 +1490,96 @@ func (m *Model) startTagEdit() {
 	m.status = ""
 }
 
+func (m *Model) startBatchTag() {
+	m.mode = modeTag
+	m.batchTag = true
+	m.input.SetValue("")
+	m.input.Prompt = "Tags: "
+	m.input.Placeholder = "tag1, tag2"
+	m.input.Width = max(20, min(60, m.width-12))
+	m.input.Focus()
+	m.statusErr = false
+	m.status = ""
+}
+
 func (m Model) updateTagEdit(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "esc":
-		m.mode = modeEdit
 		m.input.Blur()
 		m.input.Prompt = "› "
+		if m.batchTag {
+			m.batchTag = false
+			m.mode = modeNormal
+			m.active = treePane
+			return m, nil
+		}
+		m.mode = modeEdit
 		m.editor.Focus()
 		return m, nil
 	case "enter":
-		m.saveTags(m.input.Value())
+		wasBatch := m.batchTag
+		if wasBatch {
+			m.saveBatchTags(m.input.Value())
+		} else {
+			m.saveTags(m.input.Value())
+		}
 		if m.mode == modeTag {
 			return m, nil
 		}
 		m.input.Blur()
 		m.input.Prompt = "› "
-		m.editor.Focus()
+		if !wasBatch {
+			m.editor.Focus()
+		}
 		return m, m.takePending()
 	}
 	var cmd tea.Cmd
 	m.input, cmd = m.input.Update(msg)
 	return m, cmd
+}
+
+func (m *Model) saveBatchTags(raw string) {
+	tags := parseTagsInput(raw)
+	count := 0
+	for _, item := range m.flat {
+		path := item.node.RelPath
+		if item.node.IsDir || !m.selectedItems[path] {
+			continue
+		}
+		content, err := m.store.Read(path)
+		if err != nil {
+			continue
+		}
+		meta, body := parseFrontMatter(content)
+		if meta.Title == "" {
+			meta.Title = strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+		}
+		if meta.Created == "" {
+			meta.Created = time.Now().Format("2006-01-02")
+		}
+		meta.Tags = tags
+		if err := m.store.Write(path, writeFrontMatter(body, meta)); err != nil {
+			continue
+		}
+		m.nodeTags[path] = tags
+		count++
+	}
+	if count == 0 {
+		m.setStatus("No notes could be tagged", true)
+		return
+	}
+	m.batchTag = false
+	m.mode = modeNormal
+	m.active = treePane
+	if m.currentPath != "" && m.selectedItems[m.currentPath] {
+		if content, err := m.store.Read(m.currentPath); err == nil {
+			m.original = content
+			m.editor.SetValue(content)
+			m.renderMarkdown()
+		}
+	}
+	m.rebuildFlat()
+	m.flashStatus(fmt.Sprintf("✓ Tagged %d notes", count), false, 2*time.Second)
 }
 
 func (m *Model) saveTags(raw string) {
@@ -1406,6 +1612,9 @@ func (m *Model) saveTags(raw string) {
 
 func (m Model) tagEditView() string {
 	title := "Edit tags"
+	if m.batchTag {
+		title = fmt.Sprintf("Tag %d notes", m.selectedCount())
+	}
 	body := m.input.View() + "\n\n" + mutedSty.Render("Enter 保存 · Esc 取消")
 	if m.statusErr {
 		body += "\n" + errorSty.Render(m.status)
@@ -1474,12 +1683,28 @@ func (m *Model) renameSelected(name string) (string, error) {
 		delete(m.expanded, oldPath)
 		m.expanded[newPath] = true
 	}
+	if m.selectedItems[oldPath] {
+		delete(m.selectedItems, oldPath)
+		m.selectedItems[newPath] = true
+	}
+	prefix := oldPath + string(filepath.Separator)
+	for p := range m.selectedItems {
+		if strings.HasPrefix(p, prefix) {
+			delete(m.selectedItems, p)
+			m.selectedItems[newPath+strings.TrimPrefix(p, oldPath)] = true
+		}
+	}
 	return newPath, nil
 }
 
 func (m *Model) startDelete() {
 	if len(m.flat) == 0 {
 		m.flashStatus("Nothing selected", true, 2*time.Second)
+		return
+	}
+	if m.selectedCount() > 0 {
+		m.confirmCount = m.selectedCount()
+		m.mode = modeConfirm
 		return
 	}
 	n := m.flat[m.selected].node
@@ -1491,8 +1716,43 @@ func (m *Model) startDelete() {
 func (m Model) updateConfirm(key string) (tea.Model, tea.Cmd) {
 	switch key {
 	case "y", "Y", "enter":
-		path := m.selectedPath()
-		if m.currentPath == path || strings.HasPrefix(m.currentPath, path+string(filepath.Separator)) {
+		if m.confirmCount > 0 {
+			m.batchDelete()
+		} else {
+			path := m.selectedPath()
+			if m.currentPath == path || strings.HasPrefix(m.currentPath, path+string(filepath.Separator)) {
+				m.currentPath = ""
+				m.original = ""
+				m.editor.SetValue("")
+				m.undoStack = nil
+				m.redoStack = nil
+				m.preview.SetContent("")
+			}
+			if err := m.store.Delete(path); err != nil {
+				m.flashStatus(err.Error(), true, 2*time.Second)
+			} else {
+				m.refresh("")
+				m.flashStatus("Deleted "+path, false, 2*time.Second)
+			}
+		}
+		m.confirmCount = 0
+		m.mode = modeNormal
+	case "n", "N", "esc":
+		m.confirmCount = 0
+		m.mode = modeNormal
+		m.flashStatus("Delete cancelled", false, 2*time.Second)
+	}
+	return m, m.takePending()
+}
+
+func (m *Model) batchDelete() {
+	count := 0
+	for _, item := range m.flat {
+		path := item.node.RelPath
+		if item.node.IsDir || !m.selectedItems[path] {
+			continue
+		}
+		if m.currentPath == path {
 			m.currentPath = ""
 			m.original = ""
 			m.editor.SetValue("")
@@ -1501,17 +1761,17 @@ func (m Model) updateConfirm(key string) (tea.Model, tea.Cmd) {
 			m.preview.SetContent("")
 		}
 		if err := m.store.Delete(path); err != nil {
-			m.flashStatus(err.Error(), true, 2*time.Second)
-		} else {
-			m.refresh("")
-			m.flashStatus("Deleted "+path, false, 2*time.Second)
+			continue
 		}
-		m.mode = modeNormal
-	case "n", "N", "esc":
-		m.mode = modeNormal
-		m.flashStatus("Delete cancelled", false, 2*time.Second)
+		delete(m.selectedItems, path)
+		count++
 	}
-	return m, m.takePending()
+	m.refresh("")
+	if count > 0 {
+		m.flashStatus(fmt.Sprintf("Deleted %d notes", count), false, 2*time.Second)
+	} else {
+		m.setStatus("Delete failed", true)
+	}
 }
 
 func (m *Model) toggleEdit() {
@@ -1578,10 +1838,6 @@ func (m *Model) save() bool {
 
 func (m *Model) dirty() bool {
 	return m.currentPath != "" && m.editor.Value() != m.original
-}
-
-func (m *Model) lineCount() int {
-	return m.editor.LineCount()
 }
 
 func (m *Model) previewLineCount() int {
@@ -2176,6 +2432,7 @@ func (m *Model) rebuildFlat() {
 	filter := strings.ToLower(strings.TrimSpace(m.tagFilter))
 	var walk func([]*storage.Node, int)
 	walk = func(nodes []*storage.Node, depth int) {
+		nodes = m.sortedNodes(nodes)
 		for _, n := range nodes {
 			if n.IsDir {
 				m.flat = append(m.flat, flatNode{node: n, depth: depth})
@@ -2193,6 +2450,56 @@ func (m *Model) rebuildFlat() {
 		}
 	}
 	walk(m.tree, 0)
+}
+
+func (m *Model) sortedNodes(nodes []*storage.Node) []*storage.Node {
+	sorted := make([]*storage.Node, len(nodes))
+	copy(sorted, nodes)
+	switch m.sortMode {
+	case sortByModified:
+		sort.SliceStable(sorted, func(i, j int) bool {
+			if sorted[i].IsDir != sorted[j].IsDir {
+				return sorted[i].IsDir
+			}
+			return m.nodeModTime(sorted[i]).After(m.nodeModTime(sorted[j]))
+		})
+	case sortByCreated:
+		sort.SliceStable(sorted, func(i, j int) bool {
+			if sorted[i].IsDir != sorted[j].IsDir {
+				return sorted[i].IsDir
+			}
+			return m.nodeCreatedTime(sorted[i]).After(m.nodeCreatedTime(sorted[j]))
+		})
+	default:
+		sort.SliceStable(sorted, func(i, j int) bool {
+			if sorted[i].IsDir != sorted[j].IsDir {
+				return sorted[i].IsDir
+			}
+			return strings.ToLower(sorted[i].Name) < strings.ToLower(sorted[j].Name)
+		})
+	}
+	return sorted
+}
+
+func (m *Model) nodeModTime(n *storage.Node) time.Time {
+	info, err := os.Stat(filepath.Join(m.store.Root, n.RelPath))
+	if err != nil {
+		return time.Time{}
+	}
+	return info.ModTime()
+}
+
+func (m *Model) nodeCreatedTime(n *storage.Node) time.Time {
+	if !n.IsDir {
+		if content, err := m.store.Read(n.RelPath); err == nil {
+			if meta, _ := parseFrontMatter(content); meta.Created != "" {
+				if t, err := time.Parse("2006-01-02", meta.Created); err == nil {
+					return t
+				}
+			}
+		}
+	}
+	return m.nodeModTime(n)
 }
 
 func (m *Model) tagsForNode(n *storage.Node) []string {
@@ -2546,6 +2853,8 @@ func findSearchMatches(plain, query string) []matchPos {
 	return matches
 }
 
+const maxSearchHighlight = 200
+
 func highlightSearchContent(content, query string) string {
 	if query == "" {
 		return content
@@ -2554,11 +2863,19 @@ func highlightSearchContent(content, query string) string {
 	hiEnd := "\x1b[27m"
 	lines := strings.Split(content, "\n")
 	changed := false
+	remaining := maxSearchHighlight
 	for i, line := range lines {
+		if remaining <= 0 {
+			break
+		}
 		ranges := findSearchMatches(plainTextLine(line), query)
 		if len(ranges) == 0 {
 			continue
 		}
+		if len(ranges) > remaining {
+			ranges = ranges[:remaining]
+		}
+		remaining -= len(ranges)
 		lines[i] = applyHighlightRanges(line, ranges, hi, hiEnd)
 		changed = true
 	}
@@ -2894,6 +3211,9 @@ func (m Model) treeViewSides(width int, leftB, rightB bool) string {
 	if len(m.flat) > 0 {
 		title += mutedSty.Render("  " + fmt.Sprintf("%d", len(m.flat)))
 	}
+	if sel := m.selectedCount(); sel > 0 {
+		title += "  " + lipgloss.NewStyle().Foreground(accent).Bold(true).Render(fmt.Sprintf("☑ %d", sel))
+	}
 	if m.tagFilter != "" {
 		title += "  " + lipgloss.NewStyle().Foreground(accent).Bold(true).Render("#"+m.tagFilter)
 	}
@@ -2920,8 +3240,12 @@ func (m Model) treeViewSides(width int, leftB, rightB bool) string {
 			}
 			label = accentText.Render(marker) + textName.Render(item.node.Name)
 		} else {
+			mark := "○ "
+			if m.selectedItems[item.node.RelPath] {
+				mark = "☑ "
+			}
 			name := strings.TrimSuffix(item.node.Name, filepath.Ext(item.node.Name))
-			label = mutedSty.Render(name)
+			label = mark + mutedSty.Render(name)
 			if count := len(m.nodeTags[item.node.RelPath]); count > 0 {
 				label = label + " " + lipgloss.NewStyle().Foreground(accent).Bold(true).Render(fmt.Sprintf("#%d", count))
 			}
@@ -3127,14 +3451,7 @@ func (m Model) shortcutBar() string {
 	if m.mode == modeEdit {
 		return m.editShortcutBar()
 	}
-	right := ""
-	if m.currentPath != "" {
-		content := m.editor.Value()
-		words := len(strings.Fields(content))
-		lines := m.lineCount()
-		minutes := (words + 199) / 200
-		right = fmt.Sprintf("%d words · %d lines · ~%d min read", words, lines, minutes)
-	}
+	right := m.statusText(m.status)
 	return m.composeBar(m.toolbarShortcut(m.width-lipgloss.Width(right)-2), right)
 }
 
@@ -3147,11 +3464,11 @@ func (m Model) editShortcutBar() string {
 	if m.redoable() {
 		redoSty = lipgloss.NewStyle().Foreground(accent)
 	}
-	left := mutedSty.Render("Ctrl+S 保存 · ") +
-		undoSty.Render("Ctrl+Z 撤销") +
+	left := mutedSty.Render("Ctrl+S · ") +
+		undoSty.Render("Ctrl+Z") +
 		mutedSty.Render(" · ") +
-		redoSty.Render("Ctrl+Shift+Z 重做") +
-		mutedSty.Render(" · Esc 退出 · Ctrl+L 复制行")
+		redoSty.Render("Ctrl+Shift+Z") +
+		mutedSty.Render(" · Esc · Ctrl+L")
 	pos := m.cursorPos()
 	total := m.editor.LineCount()
 	right := fmt.Sprintf("Ln %d / %d · Col %d", pos.row+1, total, pos.col+1)
@@ -3159,25 +3476,13 @@ func (m Model) editShortcutBar() string {
 }
 
 func (m Model) composeBar(left, right string) string {
-	var b strings.Builder
-	b.WriteString(" ")
-	b.WriteString(left)
-	lw := lipgloss.Width(b.String())
+	lw := lipgloss.Width(left)
 	rw := lipgloss.Width(right)
-	status := truncate(m.status, max(0, m.width-lw-rw-6))
-	if status != "" && m.width-lw-rw > lipgloss.Width(status)+4 {
-		b.WriteString("  ")
-		b.WriteString(m.statusText(status))
-		lw = lipgloss.Width(b.String())
-	}
 	pad := m.width - lw - rw - 2
-	if pad > 0 {
-		b.WriteString(strings.Repeat(" ", pad))
+	if pad < 0 {
+		pad = 0
 	}
-	if right != "" {
-		b.WriteString(" " + right)
-	}
-	return lipgloss.NewStyle().Foreground(muted).Width(m.width).MaxHeight(1).Render(b.String())
+	return lipgloss.NewStyle().Foreground(muted).Width(m.width).MaxHeight(1).Render(" " + left + strings.Repeat(" ", pad) + " " + right)
 }
 
 func (m Model) searchBarView() string {
@@ -3212,7 +3517,10 @@ func (m Model) statusText(status string) string {
 func (m Model) dialogView() string {
 	var title, body string
 	if m.mode == modeConfirm {
-		if m.confirmDir {
+		if m.confirmCount > 0 {
+			title = "Delete notes"
+			body = fmt.Sprintf("将删除 %d 个笔记", m.confirmCount)
+		} else if m.confirmDir {
 			title = "Delete folder"
 			body = "Delete “" + m.confirm + "” and all contents?"
 		} else {
