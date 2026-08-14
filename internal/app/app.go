@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -83,6 +84,9 @@ type Model struct {
 	selecting     bool
 	copier        func(string) error
 	pending       tea.Cmd
+
+	renderer      *glamour.TermRenderer
+	rendererWidth int
 
 	status    string
 	statusErr bool
@@ -819,61 +823,193 @@ func (m *Model) renderMarkdown() {
 		return
 	}
 	width := max(20, m.preview.Width-1)
-	renderer, err := glamour.NewTermRenderer(
-		glamour.WithStyles(markdownStyle()),
-		glamour.WithWordWrap(width),
-	)
-	if err != nil {
-		m.setStatus("Markdown renderer: "+err.Error(), true)
-		m.preview.SetContent(m.editor.Value())
-		return
+	// Glamour renderers are expensive to construct; reuse one until the wrap
+	// width (the only dynamic rendering input) changes.
+	if m.renderer == nil || m.rendererWidth != width {
+		renderer, err := glamour.NewTermRenderer(
+			glamour.WithStyles(markdownStyle()),
+			glamour.WithWordWrap(width),
+		)
+		if err != nil {
+			m.setStatus("Markdown renderer: "+err.Error(), true)
+			m.preview.SetContent(m.editor.Value())
+			return
+		}
+		m.renderer = renderer
+		m.rendererWidth = width
 	}
-	rendered, err := renderer.Render(m.editor.Value())
+	rendered, err := m.renderer.Render(m.editor.Value())
 	if err != nil {
 		m.setStatus("Markdown preview: "+err.Error(), true)
 		m.preview.SetContent(m.editor.Value())
 		return
 	}
-	m.preview.SetContent(strings.TrimSpace(rendered))
+	m.preview.SetContent(strings.TrimSpace(decorateCodeBlocks(rendered, width)))
 }
 
 func markdownStyle() glamansi.StyleConfig {
 	return glamansi.StyleConfig{
 		Document: glamansi.StyleBlock{
-			StylePrimitive: glamansi.StylePrimitive{Color: stringPtr("#E7E9ED")},
+			StylePrimitive: glamansi.StylePrimitive{Color: stringPtr(textColor)},
 			Margin:         uintPtr(1),
 		},
 		BlockQuote: glamansi.StyleBlock{
-			StylePrimitive: glamansi.StylePrimitive{Color: stringPtr("#A4ABB4")},
-			Indent:         uintPtr(1),
-			IndentToken:    stringPtr("│ "),
+			StylePrimitive: glamansi.StylePrimitive{
+				Color:  stringPtr(mutedColor),
+				Italic: boolPtr(true),
+			},
+			Indent:      uintPtr(1),
+			IndentToken: stringPtr("│ "),
 		},
 		List: glamansi.StyleList{LevelIndent: 2},
 		Heading: glamansi.StyleBlock{
-			StylePrimitive: glamansi.StylePrimitive{Color: stringPtr("#E7E9ED"), Bold: boolPtr(true), BlockSuffix: "\n"},
+			StylePrimitive: glamansi.StylePrimitive{
+				Color: stringPtr(accentColor), Bold: boolPtr(true), BlockSuffix: "\n",
+			},
 		},
 		H1: glamansi.StyleBlock{
-			StylePrimitive: glamansi.StylePrimitive{Color: stringPtr("#E7E9ED"), Bold: boolPtr(true), BlockSuffix: "\n"},
+			StylePrimitive: glamansi.StylePrimitive{
+				Color: stringPtr(accentColor), Bold: boolPtr(true), Upper: boolPtr(true),
+				BlockSuffix: "\n────────",
+			},
 		},
-		H2:     glamansi.StyleBlock{StylePrimitive: glamansi.StylePrimitive{Prefix: "## "}},
-		H3:     glamansi.StyleBlock{StylePrimitive: glamansi.StylePrimitive{Prefix: "### "}},
+		H2: glamansi.StyleBlock{
+			StylePrimitive: glamansi.StylePrimitive{
+				Color: stringPtr(accentColor), Bold: boolPtr(true), Prefix: "## ",
+			},
+		},
+		H3: glamansi.StyleBlock{
+			StylePrimitive: glamansi.StylePrimitive{
+				Color: stringPtr(textColor), Bold: boolPtr(true), Prefix: "### ",
+			},
+		},
+		H4: glamansi.StyleBlock{
+			StylePrimitive: glamansi.StylePrimitive{
+				Color: stringPtr(mutedColor), Bold: boolPtr(true), Prefix: "#### ",
+			},
+		},
+		H5: glamansi.StyleBlock{
+			StylePrimitive: glamansi.StylePrimitive{
+				Color: stringPtr(mutedColor), Bold: boolPtr(true), Prefix: "##### ",
+			},
+		},
+		H6: glamansi.StyleBlock{
+			StylePrimitive: glamansi.StylePrimitive{
+				Color: stringPtr(mutedColor), Bold: boolPtr(true), Prefix: "###### ",
+			},
+		},
 		Strong: glamansi.StylePrimitive{Bold: boolPtr(true)},
 		Emph:   glamansi.StylePrimitive{Italic: boolPtr(true)},
 		HorizontalRule: glamansi.StylePrimitive{
-			Color: stringPtr("#454B54"), Format: "\n────────\n",
+			Color: stringPtr(mutedColor), Format: "\n────────\n",
 		},
 		Item:        glamansi.StylePrimitive{BlockPrefix: "• "},
 		Enumeration: glamansi.StylePrimitive{BlockPrefix: ". "},
 		Task:        glamansi.StyleTask{Ticked: "[✓] ", Unticked: "[ ] "},
-		Link:        glamansi.StylePrimitive{Color: stringPtr("#73D7C4"), Underline: boolPtr(true)},
-		LinkText:    glamansi.StylePrimitive{Color: stringPtr("#73D7C4")},
+		Link:        glamansi.StylePrimitive{Color: stringPtr(accentColor), Underline: boolPtr(true)},
+		LinkText:    glamansi.StylePrimitive{Color: stringPtr(accentColor)},
 		Code: glamansi.StyleBlock{StylePrimitive: glamansi.StylePrimitive{
-			Prefix: " ", Suffix: " ", Color: stringPtr("#73D7C4"),
+			Prefix: " ", Suffix: " ", Color: stringPtr(textColor), BackgroundColor: stringPtr(surfaceColor),
 		}},
 		CodeBlock: glamansi.StyleCodeBlock{StyleBlock: glamansi.StyleBlock{
-			StylePrimitive: glamansi.StylePrimitive{Color: stringPtr("#A4ABB4")}, Margin: uintPtr(1),
+			StylePrimitive: glamansi.StylePrimitive{
+				Color: stringPtr(textColor), BackgroundColor: stringPtr(surfaceColor),
+				BlockPrefix: codeBlockStart + "\n", BlockSuffix: codeBlockEnd,
+			},
+			Margin: uintPtr(1),
+		}, Chroma: &glamansi.Chroma{
+			Text:              glamansi.StylePrimitive{Color: stringPtr(textColor)},
+			Background:        glamansi.StylePrimitive{BackgroundColor: stringPtr(surfaceColor)},
+			Comment:           glamansi.StylePrimitive{Color: stringPtr(mutedColor), Italic: boolPtr(true)},
+			CommentPreproc:    glamansi.StylePrimitive{Color: stringPtr(warningColor)},
+			Keyword:           glamansi.StylePrimitive{Color: stringPtr(accentColor)},
+			KeywordType:       glamansi.StylePrimitive{Color: stringPtr(accentColor)},
+			Name:              glamansi.StylePrimitive{Color: stringPtr(textColor)},
+			NameBuiltin:       glamansi.StylePrimitive{Color: stringPtr(accentColor)},
+			NameTag:           glamansi.StylePrimitive{Color: stringPtr(accentColor)},
+			NameAttribute:     glamansi.StylePrimitive{Color: stringPtr(greenColor)},
+			NameClass:         glamansi.StylePrimitive{Color: stringPtr(textColor), Bold: boolPtr(true)},
+			NameConstant:      glamansi.StylePrimitive{Color: stringPtr(textColor)},
+			NameFunction:      glamansi.StylePrimitive{Color: stringPtr(accentColor)},
+			Literal:           glamansi.StylePrimitive{Color: stringPtr(textColor)},
+			LiteralNumber:     glamansi.StylePrimitive{Color: stringPtr(warningColor)},
+			LiteralString:     glamansi.StylePrimitive{Color: stringPtr(greenColor)},
+			LiteralStringEscape: glamansi.StylePrimitive{Color: stringPtr(warningColor)},
+			Operator:          glamansi.StylePrimitive{Color: stringPtr(warningColor)},
+			Punctuation:       glamansi.StylePrimitive{Color: stringPtr(mutedColor)},
+			GenericDeleted:    glamansi.StylePrimitive{Color: stringPtr(dangerColor)},
+			GenericInserted:   glamansi.StylePrimitive{Color: stringPtr(greenColor)},
+			GenericEmph:       glamansi.StylePrimitive{Italic: boolPtr(true)},
+			GenericStrong:     glamansi.StylePrimitive{Bold: boolPtr(true)},
+			GenericSubheading: glamansi.StylePrimitive{Color: stringPtr(mutedColor)},
 		}},
+		Table: glamansi.StyleTable{
+			StyleBlock: glamansi.StyleBlock{
+				StylePrimitive: glamansi.StylePrimitive{
+					Color: stringPtr(accentColor),
+				},
+				Margin: uintPtr(1),
+			},
+			CenterSeparator: stringPtr("│"),
+			ColumnSeparator: stringPtr("│"),
+			RowSeparator:    stringPtr("─"),
+		},
 	}
+}
+
+const (
+	codeBlockStart = "\x01CKSTART\x01"
+	codeBlockEnd   = "\x01CKEND\x01"
+)
+
+var ansiRegexp = regexp.MustCompile("\x1b\\[[0-9;]*m")
+
+func stripANSI(s string) string { return ansiRegexp.ReplaceAllString(s, "") }
+
+// decorateCodeBlocks restores a solid surface background behind code blocks.
+// Glamour's chroma formatter intentionally strips the block background, so we
+// mark code block boundaries, then re-apply the background after every ANSI
+// reset inside each code line.
+func decorateCodeBlocks(rendered string, width int) string {
+	lines := strings.Split(rendered, "\n")
+	var out []string
+	inCode := false
+	codeBg := termansi.Style{}.BackgroundColor(termansi.TrueColor(0x1B1E2B)).String()
+	border := mutedSty.Render(strings.Repeat("─", width))
+	for _, line := range lines {
+		plain := stripANSI(line)
+		if !inCode {
+			if strings.Contains(plain, codeBlockStart) {
+				inCode = true
+				out = append(out, border)
+				continue
+			}
+			out = append(out, line)
+			continue
+		}
+		if strings.Contains(plain, codeBlockEnd) {
+			if i := strings.Index(line, codeBlockEnd); i >= 0 {
+				code := line[:i]
+				if strings.TrimSpace(stripANSI(code)) != "" {
+					out = append(out, styleCodeLine(code, codeBg, width))
+				}
+			}
+			inCode = false
+			continue
+		}
+		out = append(out, styleCodeLine(line, codeBg, width))
+	}
+	return strings.Join(out, "\n")
+}
+
+func styleCodeLine(line, bg string, width int) string {
+	line = strings.ReplaceAll(line, "\x1b[0m", "\x1b[0m"+bg)
+	line = strings.ReplaceAll(line, termansi.ResetStyle, termansi.ResetStyle+bg)
+	fill := width - lipgloss.Width(line)
+	if fill < 0 {
+		fill = 0
+	}
+	return bg + line + strings.Repeat(" ", fill) + termansi.ResetStyle
 }
 
 func stringPtr(value string) *string { return &value }

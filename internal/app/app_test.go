@@ -1,6 +1,8 @@
 package app
 
 import (
+	"regexp"
+	"strings"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -98,6 +100,48 @@ func TestCopyCurrentUsesMarkdownAndReportsResult(t *testing.T) {
 	}
 	if m.status != "Copied Markdown to clipboard" || m.statusErr {
 		t.Fatalf("unexpected copy status %q, error=%v", m.status, m.statusErr)
+	}
+}
+
+func TestRenderMarkdownCachesRendererAndStylesCodeBlocks(t *testing.T) {
+	store := storage.New(t.TempDir())
+	note, err := store.CreateNote("", "preview")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	m := New(store)
+	m.resize(100, 30)
+	m.selectPath(note)
+	m.openSelectedNote()
+	m.editor.SetValue("# Big Title\n\n```go\nfunc main() {}\n```\n")
+
+	m.renderMarkdown()
+	first := m.renderer
+	if first == nil {
+		t.Fatal("expected a cached renderer after first render")
+	}
+	content := m.preview.View()
+	if !strings.Contains(content, "48;2;27;30;43") {
+		t.Fatalf("expected code block background in preview, got: %q", content)
+	}
+	if stripped := stripANSI(content); strings.Contains(stripped, "CKSTART") || strings.Contains(stripped, "CKEND") {
+		t.Fatalf("code block markers leaked into preview: %q", stripped)
+	}
+
+	m.renderMarkdown()
+	if m.renderer != first {
+		t.Fatal("expected renderer to be reused when width is unchanged")
+	}
+
+	m.resize(70, 30)
+	if m.renderer == first {
+		t.Fatal("expected renderer to be rebuilt when width changes")
+	}
+
+	title := regexp.MustCompile(`(?m)^\s*BIG TITLE`).FindString(stripANSI(m.preview.View()))
+	if title == "" {
+		t.Fatalf("expected uppercased H1 title in preview: %q", stripANSI(m.preview.View()))
 	}
 }
 
