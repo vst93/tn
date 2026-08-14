@@ -89,26 +89,6 @@ type Model struct {
 	confirm   string
 }
 
-var (
-	// Hallmark · pre-emit critique: P5 H5 E5 S5 R5 V5
-	// Studied DNA: Túdo public reference · compact workbench · inset line labels.
-	bg        = lipgloss.Color("#141621")
-	surface   = lipgloss.Color("#1B1E2B")
-	selection = lipgloss.Color("#282D42")
-	text      = lipgloss.Color("#C4CBE3")
-	muted     = lipgloss.Color("#68708C")
-	rule      = lipgloss.Color("#3E4E78")
-	accent    = lipgloss.Color("#7FA9FF")
-	green     = lipgloss.Color("#9CCB65")
-	warning   = lipgloss.Color("#E5B76B")
-	danger    = lipgloss.Color("#EF7996")
-	headerSty = lipgloss.NewStyle().Foreground(text).Bold(true)
-	brandSty  = lipgloss.NewStyle().Foreground(text).Bold(true)
-	mutedSty  = lipgloss.NewStyle().Foreground(muted)
-	statusSty = lipgloss.NewStyle().Foreground(muted)
-	errorSty  = lipgloss.NewStyle().Foreground(danger).Bold(true)
-)
-
 func New(store *storage.Store) Model {
 	editor := textarea.New()
 	editor.Placeholder = "Write Markdown here…"
@@ -805,12 +785,22 @@ func (m *Model) treeRows() int { return max(1, m.bodyHeight-2) }
 func (m *Model) resize(width, height int) {
 	m.width, m.height = max(1, width), max(1, height)
 	m.bodyHeight = max(3, m.height-2)
-	m.compact = m.width < 72
-	if m.compact {
+
+	// Three-tier width response:
+	//   narrow (<=60)  → single panel, switch via Tab
+	//   medium (61-99) → narrow tree (~20-25)
+	//   wide (≥100)    → comfortable tree (~30-35)
+	if m.width <= 60 {
+		m.compact = true
 		m.treeWidth = m.width
+	} else if m.width < 100 {
+		m.compact = false
+		m.treeWidth = max(20, min(25, m.width/4))
 	} else {
-		m.treeWidth = max(24, min(36, m.width/3))
+		m.compact = false
+		m.treeWidth = max(28, min(36, m.width/3))
 	}
+
 	contentWidth := m.width
 	if !m.compact {
 		contentWidth = max(1, m.width-m.treeWidth-1)
@@ -1056,6 +1046,30 @@ func (m Model) contentView(width int) string {
 		title += " · " + filepath.Base(m.currentPath)
 	}
 
+	// Metadata line (replaces old Details panel)
+	var meta string
+	if m.currentPath != "" {
+		state := lipgloss.NewStyle().Foreground(green).Render("saved")
+		if m.dirty() {
+			state = lipgloss.NewStyle().Foreground(danger).Render("modified")
+		}
+		modeName := "preview"
+		if m.mode == modeEdit {
+			modeName = "edit"
+		}
+		content := m.editor.Value()
+		words := len(strings.Fields(content))
+		meta = mutedSty.Render("  "+m.currentPath) + "   " +
+			lipgloss.NewStyle().Foreground(accent).Bold(true).Render(state) + "   " +
+			mutedSty.Render(modeName) + "   " +
+			mutedSty.Render(fmt.Sprintf("%d words", words))
+		if m.mode != modeEdit {
+			meta = " " + meta + "\n"
+		} else {
+			meta = " " + meta + "\n"
+		}
+	}
+
 	var content string
 	if m.currentPath == "" {
 		content = "\n" + mutedSty.Render(" Select a note from Lists or press n to create one.")
@@ -1064,21 +1078,15 @@ func (m Model) contentView(width int) string {
 	} else {
 		content = m.preview.View()
 	}
-	mainHeight := m.contentHeight()
-	main := borderedPanel(title, content, width, mainHeight, focused)
-	detailsHeight := m.bodyHeight - mainHeight - 1
-	if detailsHeight < 3 {
-		return main
-	}
-	details := borderedPanel("Details", m.detailsView(width), width, detailsHeight, false)
-	return main + "\n" + details
+
+	return borderedPanel(title, meta+content, width, m.bodyHeight, focused)
 }
 
 func (m Model) contentHeight() int {
 	if m.compact || m.bodyHeight < 12 {
-		return m.bodyHeight
+		return max(1, m.bodyHeight-3)
 	}
-	return max(6, m.bodyHeight-6)
+	return max(6, m.bodyHeight-3)
 }
 
 func (m Model) detailsView(width int) string {
