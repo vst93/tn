@@ -1496,3 +1496,166 @@ func TestSearchHighlightCapped(t *testing.T) {
 		t.Fatalf("expected %d highlights, got %d", maxSearchHighlight, count)
 	}
 }
+
+func TestAutoSaveSilentOnSuccess(t *testing.T) {
+	m, store, note := openEditModel(t, "auto-save")
+	m.editor.SetValue("# Auto\n")
+	m.lastEditTime = time.Now().Add(-3 * time.Second)
+	if !m.dirty() {
+		t.Fatal("expected note to be dirty before auto-save")
+	}
+
+	updated, _ := m.Update(autoSaveMsg{})
+	m = updated.(Model)
+
+	content, err := store.Read(note)
+	if err != nil || content != "# Auto\n" {
+		t.Fatalf("auto-saved content = %q, %v", content, err)
+	}
+	if m.dirty() {
+		t.Fatal("expected note clean after auto-save")
+	}
+	if strings.Contains(m.status, "Saved") {
+		t.Fatalf("expected silent auto-save, got status %q", m.status)
+	}
+}
+
+func TestAutoSaveShowsErrorOnFailure(t *testing.T) {
+	m, _, _ := openEditModel(t, "auto-fail")
+	m.currentPath = "missing/auto.md"
+	m.editor.SetValue("content")
+	m.lastEditTime = time.Now().Add(-3 * time.Second)
+
+	updated, _ := m.Update(autoSaveMsg{})
+	m = updated.(Model)
+
+	if !m.statusErr {
+		t.Fatal("expected auto-save error status")
+	}
+	if !strings.Contains(m.status, "Save failed") {
+		t.Fatalf("expected Save failed status, got %q", m.status)
+	}
+}
+
+func TestAutoSaveNotBeforeTwoSeconds(t *testing.T) {
+	m, store, note := openEditModel(t, "auto-soon")
+	m.editor.SetValue("# Pending\n")
+	m.lastEditTime = time.Now().Add(-time.Second)
+
+	updated, _ := m.Update(autoSaveMsg{})
+	m = updated.(Model)
+
+	if !m.dirty() {
+		t.Fatal("expected note still dirty when under two seconds")
+	}
+	content, err := store.Read(note)
+	if err != nil || content == "# Pending\n" {
+		t.Fatalf("expected note not yet saved, content=%q err=%v", content, err)
+	}
+}
+
+func TestCommandPaletteOpensAndFilters(t *testing.T) {
+	m, _, _ := openEditModel(t, "palette")
+
+	if handled, _ := m.globalKey("ctrl+shift+p"); !handled {
+		t.Fatal("expected Ctrl+Shift+P to be handled")
+	}
+	if m.mode != modeCommand {
+		t.Fatalf("expected command mode, got %v", m.mode)
+	}
+	if view := stripANSI(m.commandView()); !strings.Contains(view, "Commands") {
+		t.Fatalf("unexpected command view %q", view)
+	}
+
+	m.input.SetValue("undo")
+	m.commandQuery = "undo"
+	cmds := m.filteredCommands()
+	if len(cmds) != 1 || cmds[0].name != "Undo" {
+		t.Fatalf("expected filter to match Undo, got %+v", cmds)
+	}
+
+	updated, _ := m.updateCommand(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+	if m.mode != modeEdit {
+		t.Fatalf("expected Esc to close command palette, got %v", m.mode)
+	}
+}
+
+func TestCommandPaletteExecutesAction(t *testing.T) {
+	m, _, _ := openEditModel(t, "palette-exec")
+	m.editor.SetValue("# Save me\n")
+
+	m.startCommand()
+	m.input.SetValue("save note")
+	m.commandQuery = "save note"
+	updated, _ := m.updateCommand(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+
+	if m.mode != modeEdit {
+		t.Fatalf("expected to stay in edit mode after command, got %v", m.mode)
+	}
+	if m.dirty() {
+		t.Fatal("expected save command to persist the note")
+	}
+}
+
+func TestCommandPaletteNewNote(t *testing.T) {
+	m := New(storage.New(t.TempDir()))
+	m.resize(100, 30)
+
+	m.startCommand()
+	m.input.SetValue("new note")
+	m.commandQuery = "new note"
+	updated, _ := m.updateCommand(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+
+	if m.mode != modeTemplate {
+		t.Fatalf("expected New note command to open template, got %v", m.mode)
+	}
+}
+
+func TestHelpOpensAndFilters(t *testing.T) {
+	m := New(storage.New(t.TempDir()))
+	m.resize(100, 30)
+
+	if handled, _ := m.globalKey("?"); !handled {
+		t.Fatal("expected ? to be handled")
+	}
+	if m.mode != modeHelp {
+		t.Fatalf("expected help mode, got %v", m.mode)
+	}
+	if view := stripANSI(m.helpView()); !strings.Contains(view, "Command palette") {
+		t.Fatalf("expected help to list command palette, got %q", view)
+	}
+
+	m.input.SetValue("command")
+	m.helpHintQ = "command"
+	m.renderHelpContent()
+	if view := stripANSI(m.helpView()); !strings.Contains(view, "Command palette") {
+		t.Fatalf("expected filtered help to include command, got %q", view)
+	}
+
+	updated, _ := m.updateHelp(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+	if m.mode != modeNormal {
+		t.Fatalf("expected Esc to close help, got %v", m.mode)
+	}
+}
+
+func TestHelpScrollsWithMouseWheel(t *testing.T) {
+	m := New(storage.New(t.TempDir()))
+	m.resize(100, 30)
+	m.startHelp()
+
+	y0 := m.helpHintView.YOffset
+	updated, _ := m.updateHelp(tea.MouseMsg{
+		Button: tea.MouseButtonWheelDown,
+		Action: tea.MouseActionPress,
+		X:      50,
+		Y:      15,
+	})
+	m = updated.(Model)
+	if m.helpHintView.YOffset <= y0 {
+		t.Fatalf("expected mouse wheel to scroll help, offset=%d before=%d", m.helpHintView.YOffset, y0)
+	}
+}

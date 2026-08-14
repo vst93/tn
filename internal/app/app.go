@@ -53,6 +53,7 @@ const (
 	modeTag
 	modeTagFilter
 	modeTemplate
+	modeCommand
 )
 
 type promptKind int
@@ -209,6 +210,74 @@ type statusClearMsg struct{ id uint64 }
 
 type cursorPos struct{ row, col int }
 
+type autoSaveMsg struct{}
+
+type command struct {
+	name   string
+	action func()
+}
+
+type helpRow struct {
+	keys string
+	desc string
+}
+
+type helpGroup struct {
+	title string
+	rows  []helpRow
+}
+
+var helpGroupsData = []helpGroup{
+	{
+		title: "Navigate",
+		rows: []helpRow{
+			{"↑/↓ or J/K", "Select item"},
+			{"←/→ or H/L", "Collapse / expand"},
+			{"Enter", "Open note"},
+			{"Tab", "Switch panel"},
+			{"Space", "Toggle select"},
+			{"Ctrl+A / Ctrl+Shift+A", "Select all / clear"},
+		},
+	},
+	{
+		title: "Notes",
+		rows: []helpRow{
+			{"Ctrl+N", "New note"},
+			{"Ctrl+D", "New folder"},
+			{"F2", "Rename"},
+			{"Delete", "Delete"},
+			{"Ctrl+E", "Edit / preview"},
+			{"Ctrl+S", "Save"},
+			{"Ctrl+Z", "Undo"},
+			{"Ctrl+Shift+Z / Ctrl+Y", "Redo"},
+			{"Ctrl+Shift+T", "Edit tags"},
+			{"Ctrl+Shift+P", "Command palette"},
+		},
+	},
+	{
+		title: "Search & share",
+		rows: []helpRow{
+			{"Ctrl+F", "Search preview"},
+			{"Ctrl+Shift+O", "Search everywhere"},
+			{"Alt+G", "Go to line"},
+			{"Ctrl+G", "Select terminal text"},
+			{"Ctrl+L", "Copy current line"},
+			{"Ctrl+C / Ctrl+Y", "Copy text"},
+			{"Ctrl+Shift+E", "Export"},
+		},
+	},
+	{
+		title: "App",
+		rows: []helpRow{
+			{"Ctrl+Shift+F", "Focus mode"},
+			{"Ctrl+R", "Refresh"},
+			{"Ctrl+Q", "Quit"},
+			{"?", "Help"},
+			{"Esc", "Close help"},
+		},
+	},
+}
+
 // SessionState is the persisted workspace state restored on startup.
 type SessionState struct {
 	CurrentPath string          `json:"currentPath"`
@@ -311,6 +380,16 @@ type Model struct {
 	batchExport   bool
 	batchTag      bool
 	sortMode      sortMode
+
+	lastEditTime time.Time
+
+	helpHintView viewport.Model
+	helpHintQ    string
+
+	commandBeforeMode  mode
+	commandBeforeActive pane
+	commandIndex       int
+	commandQuery       string
 }
 
 func New(store *storage.Store) Model {
@@ -347,9 +426,12 @@ func New(store *storage.Store) Model {
 		copier:        copyText,
 		status:        "Ready",
 		sessionPath:   defaultSessionPath(),
+		helpHintView:  viewport.New(60, 20),
 	}
 	m.preview.MouseWheelEnabled = true
 	m.preview.MouseWheelDelta = 3
+	m.helpHintView.MouseWheelEnabled = true
+	m.helpHintView.MouseWheelDelta = 3
 	m.refresh("")
 	m = m.restoreSession()
 	return m
@@ -401,6 +483,7 @@ func (m Model) restoreSession() Model {
 	if s.Mode == "edit" && m.currentPath != "" {
 		m.mode = modeEdit
 		m.active = contentPane
+		m.lastEditTime = time.Now()
 		m.setEditorBackground(surface)
 		m.editor.Focus()
 		m.setCursor(s.CursorRow, s.CursorCol)
@@ -447,7 +530,7 @@ func (m *Model) setCursor(row, col int) {
 	m.editor.SetCursor(col)
 }
 
-func (m Model) Init() tea.Cmd { return textarea.Blink }
+func (m Model) Init() tea.Cmd { return tea.Batch(textarea.Blink, autoSaveCmd()) }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
@@ -481,10 +564,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateConfirm(key)
 		}
 		if m.mode == modeHelp {
-			if key == "?" || key == "esc" || key == "enter" {
-				m.mode = m.beforeHelp
-			}
-			return m, nil
+			return m.updateHelp(msg)
 		}
 		if m.mode == modeSearch {
 			return m.updateSearch(msg)
@@ -504,6 +584,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.mode == modeTemplate {
 			return m.updateTemplate(msg)
 		}
+		if m.mode == modeCommand {
+			return m.updateCommand(msg)
+		}
 
 		if handled, quit := m.globalKey(key); handled {
 			if quit {
@@ -513,6 +596,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		if m.mode == modeEdit {
+			m.lastEditTime = time.Now()
 			before := m.editor.Value()
 			if plain, ok := editSelectionKey(msg); ok {
 				if m.editSel == nil {
@@ -566,6 +650,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.runGlobalSearch(msg.query)
 		}
 		return m, nil
+	case autoSaveMsg:
+		if m.mode == modeEdit && m.dirty() && time.Since(m.lastEditTime) >= 2*time.Second {
+			m.autoSave()
+		}
+		return m, tea.Batch(autoSaveCmd(), m.takePending())
 	}
 
 	if m.mode == modeEdit {
@@ -725,9 +814,11 @@ func (m *Model) globalKey(key string) (handled, quit bool) {
 			m.active = treePane
 		}
 		return true, false
+	case "ctrl+shift+p":
+		m.startCommand()
+		return true, false
 	case "?":
-		m.beforeHelp = m.mode
-		m.mode = modeHelp
+		m.startHelp()
 		return true, false
 	}
 	return false, false
@@ -886,8 +977,7 @@ func (m *Model) runAction(action string) {
 	case "pane":
 		m.togglePane()
 	case "help":
-		m.beforeHelp = m.mode
-		m.mode = modeHelp
+		m.startHelp()
 	}
 }
 
@@ -1786,6 +1876,7 @@ func (m *Model) toggleEdit() {
 	m.mode = modeEdit
 	m.active = contentPane
 	m.editSel = nil
+	m.lastEditTime = time.Now()
 	m.setEditorBackground(surface)
 	m.editor.Focus()
 	m.setStatus("Editing "+m.currentPath, false)
@@ -1833,6 +1924,31 @@ func (m *Model) save() bool {
 	}
 	m.renderMarkdown()
 	m.flashStatus("✓ Saved "+m.currentPath, false, 2*time.Second)
+	return true
+}
+
+func autoSaveCmd() tea.Cmd {
+	return tea.Tick(2*time.Second, func(time.Time) tea.Msg { return autoSaveMsg{} })
+}
+
+// autoSave writes changes silently on success and surfaces failures in red.
+func (m *Model) autoSave() bool {
+	if m.currentPath == "" || !m.dirty() {
+		return true
+	}
+	content := m.editor.Value()
+	if err := m.store.Write(m.currentPath, content); err != nil {
+		m.flashStatus("Save failed: "+err.Error(), true, 2*time.Second)
+		return false
+	}
+	m.original = content
+	m.redoStack = m.redoStack[:0]
+	meta, _ := parseFrontMatter(content)
+	m.nodeTags[m.currentPath] = meta.Tags
+	if m.tagFilter != "" {
+		m.rebuildFlat()
+	}
+	m.renderMarkdown()
 	return true
 }
 
@@ -2633,6 +2749,9 @@ func (m *Model) resize(width, height int) {
 	m.adjustPreviewHeight()
 	m.ensureSelectionVisible()
 	m.renderMarkdown()
+	if m.mode == modeHelp {
+		m.renderHelpContent()
+	}
 }
 
 func (m *Model) renderMarkdown() {
@@ -3060,6 +3179,9 @@ func (m Model) View() string {
 	}
 	if m.mode == modeHelp {
 		return m.helpView()
+	}
+	if m.mode == modeCommand {
+		return m.commandView()
 	}
 	if m.mode == modeExport {
 		return m.exportDialogView()
@@ -3546,14 +3668,244 @@ func (m Model) dialogView() string {
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, dialog, lipgloss.WithWhitespaceBackground(bg))
 }
 
+func (m *Model) startHelp() {
+	m.beforeHelp = m.mode
+	m.mode = modeHelp
+	m.helpHintQ = ""
+	m.input.Prompt = "Search: "
+	m.input.Placeholder = "filter shortcuts"
+	m.input.SetValue("")
+	m.input.Width = max(10, min(50, m.width-12))
+	m.input.Focus()
+	m.renderHelpContent()
+}
+
+func (m Model) updateHelp(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.MouseMsg:
+		evt := tea.MouseEvent(msg)
+		if evt.IsWheel() {
+			updated, _ := m.helpHintView.Update(tea.MouseMsg(msg))
+			m.helpHintView = updated
+		}
+		return m, nil
+	case tea.KeyMsg:
+		key := msg.String()
+		if key == "esc" || key == "?" || key == "enter" {
+			m.mode = m.beforeHelp
+			m.input.Blur()
+			m.input.Prompt = "› "
+			m.helpHintQ = ""
+			m.renderHelpContent()
+			m.restoreEditFocus()
+			return m, nil
+		}
+		switch msg.Type {
+		case tea.KeyUp, tea.KeyDown, tea.KeyPgUp, tea.KeyPgDown, tea.KeyHome, tea.KeyEnd:
+			updated, _ := m.helpHintView.Update(msg)
+			m.helpHintView = updated
+			return m, nil
+		}
+		var cmd tea.Cmd
+		m.input, cmd = m.input.Update(msg)
+		if q := m.input.Value(); q != m.helpHintQ {
+			m.helpHintQ = q
+			m.renderHelpContent()
+		}
+		return m, cmd
+	}
+	return m, nil
+}
+
+func (m *Model) renderHelpContent() {
+	w := m.helpBoxWidth()
+	m.helpHintView.Width = max(10, w-6)
+	m.helpHintView.Height = max(3, m.height-10)
+	m.helpHintView.SetContent(m.helpContent())
+}
+
+func (m Model) helpBoxWidth() int {
+	return min(82, max(28, m.width-4))
+}
+
+func (m Model) helpContent() string {
+	var b strings.Builder
+	q := strings.ToLower(strings.TrimSpace(m.helpHintQ))
+	total := 0
+	for _, g := range helpGroupsData {
+		var rows []helpRow
+		for _, r := range g.rows {
+			if q == "" || strings.Contains(strings.ToLower(r.keys), q) || strings.Contains(strings.ToLower(r.desc), q) {
+				rows = append(rows, r)
+			}
+		}
+		if len(rows) == 0 {
+			continue
+		}
+		b.WriteString(lipgloss.NewStyle().Foreground(accent).Bold(true).Render(g.title) + "\n")
+		for _, r := range rows {
+			total++
+			b.WriteString("  " + lipgloss.NewStyle().Foreground(accent).Render(r.keys) + "  " + mutedSty.Render(r.desc) + "\n")
+		}
+		b.WriteString("\n")
+	}
+	if q != "" && total == 0 {
+		b.WriteString(errorSty.Render("No matching shortcuts"))
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
 func (m Model) helpView() string {
-	help := brandSty.Render("Vnote shortcuts") + "\n\n" +
-		"Navigate\n" + mutedSty.Render("  ↑/↓ or J/K     Select item\n  ←/→ or H/L     Collapse / expand\n  Enter           Open note\n  Tab             Switch panel\n") +
-		"\nNotes\n" + mutedSty.Render("  Ctrl+N          New note (template)\n  Ctrl+D          New folder\n  F2              Rename\n  Delete          Delete\n  Ctrl+E          Edit / preview\n  Ctrl+S          Save\n  Ctrl+Z          Undo\n  Ctrl+Shift+Z / Ctrl+Y  Redo\n  Ctrl+Shift+E    Export\n  Ctrl+Shift+T    Edit tags\n  Ctrl+C / Ctrl+Y Copy text\n  Ctrl+L          Copy current line\n  Ctrl+F          Search preview\n  Ctrl+Shift+O    Search everywhere\n  Alt+G           Go to line\n  Ctrl+G          Select terminal text\n  Ctrl+R          Refresh\n  Ctrl+Shift+F    Focus mode\n") +
-		"\nApp\n" + mutedSty.Render("  Ctrl+Q          Quit\n  ? / Esc         Close help\n") +
-		"\n" + lipgloss.NewStyle().Foreground(accent).Render("Mouse and touch") + "\n" + mutedSty.Render("  Click rows and top actions. Scroll either panel.\n  In Select mode, drag over preview text; press any key to return.")
-	box := lipgloss.NewStyle().Background(surface).Foreground(text).Border(lipgloss.RoundedBorder()).BorderForeground(muted).Padding(1, 3).Width(min(70, max(32, m.width-4))).Render(help)
+	var b strings.Builder
+	b.WriteString(brandSty.Render("Vnote shortcuts") + "\n\n")
+	b.WriteString("  " + m.input.View() + "\n\n")
+	b.WriteString(m.helpHintView.View())
+	b.WriteString("\n\n" + mutedSty.Render("↑/↓ / mouse scroll · Esc close"))
+	box := lipgloss.NewStyle().Background(surface).Foreground(text).Border(lipgloss.RoundedBorder()).BorderForeground(muted).Padding(1, 2).Width(m.helpBoxWidth()).Render(b.String())
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box, lipgloss.WithWhitespaceBackground(bg))
+}
+
+func (m *Model) startCommand() {
+	m.commandBeforeMode = m.mode
+	m.commandBeforeActive = m.active
+	m.mode = modeCommand
+	m.commandIndex = 0
+	m.commandQuery = ""
+	m.input.Prompt = "Commands: "
+	m.input.Placeholder = "type to filter"
+	m.input.SetValue("")
+	m.input.Width = max(20, min(60, m.width-12))
+	m.input.Focus()
+	m.statusErr = false
+	m.status = ""
+}
+
+func (m *Model) updateCommand(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.exitCommand()
+		return *m, nil
+	case "enter":
+		cmds := m.filteredCommands()
+		if len(cmds) > 0 && m.commandIndex >= 0 && m.commandIndex < len(cmds) {
+			action := cmds[m.commandIndex].action
+			m.exitCommand()
+			action()
+			return *m, m.takePending()
+		}
+		return *m, nil
+	case "up":
+		m.moveCommand(-1)
+		return *m, nil
+	case "down":
+		m.moveCommand(1)
+		return *m, nil
+	}
+	var cmd tea.Cmd
+	m.input, cmd = m.input.Update(msg)
+	if q := m.input.Value(); q != m.commandQuery {
+		m.commandQuery = q
+		m.commandIndex = 0
+	}
+	return *m, cmd
+}
+
+func (m *Model) exitCommand() {
+	m.mode = m.commandBeforeMode
+	m.active = m.commandBeforeActive
+	m.input.Blur()
+	m.input.Prompt = "› "
+	m.commandQuery = ""
+	m.commandIndex = 0
+	m.restoreCommandFocus()
+}
+
+func (m *Model) restoreCommandFocus() {
+	if m.mode == modeEdit {
+		m.active = contentPane
+		m.setEditorBackground(surface)
+		m.editor.Focus()
+	} else {
+		m.active = m.commandBeforeActive
+		m.setEditorBackground(bg)
+	}
+}
+
+func (m *Model) commandList() []command {
+	return []command{
+		{"Save note", func() { m.save() }},
+		{"Undo", m.undo},
+		{"Redo", m.redo},
+		{"Toggle edit/preview", m.toggleEdit},
+		{"Find in note", m.findInNoteCommand},
+		{"Find everywhere", m.startGlobalSearch},
+		{"Go to line", m.startGotoLine},
+		{"Focus mode", m.toggleFocus},
+		{"Export note", m.exportNoteCommand},
+		{"New note", m.startTemplate},
+		{"New folder", func() { m.startPrompt(promptDir) }},
+		{"Rename", func() { m.startPrompt(promptRename) }},
+		{"Delete", m.startDelete},
+		{"Toggle tag filter", m.startTagFilter},
+	}
+}
+
+func (m *Model) filteredCommands() []command {
+	q := strings.ToLower(strings.TrimSpace(m.commandQuery))
+	var out []command
+	for _, c := range m.commandList() {
+		if q == "" || strings.Contains(strings.ToLower(c.name), q) {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+func (m *Model) moveCommand(delta int) {
+	n := len(m.filteredCommands())
+	if n == 0 {
+		return
+	}
+	m.commandIndex = ((m.commandIndex+delta)%n + n) % n
+}
+
+func (m *Model) findInNoteCommand() {
+	if m.currentPath == "" {
+		m.flashStatus("Open a note first", true, 2*time.Second)
+		return
+	}
+	m.startSearch()
+}
+
+func (m *Model) exportNoteCommand() {
+	if m.currentPath == "" {
+		m.flashStatus("Open a note first", true, 2*time.Second)
+		return
+	}
+	m.startExport()
+}
+
+func (m Model) commandView() string {
+	var b strings.Builder
+	b.WriteString(brandSty.Render("Commands") + "\n\n")
+	b.WriteString(m.input.View() + "\n")
+	cmds := m.filteredCommands()
+	if len(cmds) == 0 {
+		b.WriteString("\n" + mutedSty.Render("No matching commands"))
+	} else {
+		for i, c := range cmds {
+			if i >= 15 {
+				break
+			}
+			row := "  " + c.name
+			if i == m.commandIndex {
+				row = lipgloss.NewStyle().Background(selection).Foreground(text).Bold(true).Render("▸ " + c.name)
+			}
+			b.WriteString("\n" + row)
+		}
+	}
+	b.WriteString("\n\n" + mutedSty.Render("↑/↓ select · Enter run · Esc close"))
+	return m.bottomOverlay(b.String())
 }
 
 func truncate(s string, width int) string {
