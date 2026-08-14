@@ -82,6 +82,8 @@ func TestCopyCurrentUsesMarkdownAndReportsResult(t *testing.T) {
 	m.selectPath(note)
 	m.openSelectedNote()
 	m.editor.SetValue("# Unsaved selection\n")
+	m.renderMarkdown()
+	want := m.renderedPlain
 
 	var copied string
 	m.copier = func(content string) error {
@@ -95,11 +97,79 @@ func TestCopyCurrentUsesMarkdownAndReportsResult(t *testing.T) {
 	}
 	updated, _ = m.Update(cmd())
 	m = updated.(Model)
-	if copied != "# Unsaved selection\n" {
-		t.Fatalf("copied %q", copied)
+	if copied != want {
+		t.Fatalf("copied %q, want rendered plain %q", copied, want)
 	}
-	if m.status != "✓ Copied to clipboard" || m.statusErr || !m.statusOK {
+	if m.status != copyFeedback(copied) || m.statusErr || !m.statusOK {
 		t.Fatalf("unexpected copy status %q, error=%v, ok=%v", m.status, m.statusErr, m.statusOK)
+	}
+}
+
+func TestEditModeCopyCurrentLine(t *testing.T) {
+	store := storage.New(t.TempDir())
+	note, err := store.CreateNote("", "line-copy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := New(store)
+	m.resize(100, 30)
+	m.selectPath(note)
+	m.openSelectedNote()
+	m.toggleEdit()
+	m.editor.SetValue("line one\nline two")
+	m.editor.CursorUp()
+	m.editor.SetCursor(0)
+
+	var copied string
+	m.copier = func(content string) error {
+		copied = content
+		return nil
+	}
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlL})
+	m = updated.(Model)
+	if cmd == nil {
+		t.Fatal("expected asynchronous copy command for Ctrl+L")
+	}
+	updated, _ = m.Update(cmd())
+	m = updated.(Model)
+	if copied != "line one" {
+		t.Fatalf("copied %q, want current line", copied)
+	}
+}
+
+func TestEditModeCopySelection(t *testing.T) {
+	store := storage.New(t.TempDir())
+	note, err := store.CreateNote("", "select-copy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := New(store)
+	m.resize(100, 30)
+	m.selectPath(note)
+	m.openSelectedNote()
+	m.toggleEdit()
+	m.editor.SetValue("abcdef")
+	m.editor.SetCursor(0)
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyShiftRight})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyShiftRight})
+	m = updated.(Model)
+
+	var copied string
+	m.copier = func(content string) error {
+		copied = content
+		return nil
+	}
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	m = updated.(Model)
+	if cmd == nil {
+		t.Fatal("expected asynchronous copy command")
+	}
+	updated, _ = m.Update(cmd())
+	m = updated.(Model)
+	if copied != "ab" {
+		t.Fatalf("copied %q, want selection", copied)
 	}
 }
 

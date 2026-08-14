@@ -59,9 +59,19 @@ type flatNode struct {
 
 type toolbarItem struct{ label, action string }
 
-type copyResultMsg struct{ err error }
+type copyResultMsg struct {
+	err     error
+	content string
+}
 type selectionModeMsg struct{}
 type statusClearMsg struct{ id uint64 }
+
+type cursorPos struct{ row, col int }
+
+type editorSel struct {
+	anchor cursorPos
+	end    cursorPos
+}
 
 // Model is the Vnote Bubble Tea application.
 type Model struct {
@@ -76,12 +86,14 @@ type Model struct {
 	mode       mode
 	beforeHelp mode
 
-	currentPath string
-	original    string
-	editor      textarea.Model
-	preview     viewport.Model
-	input       textinput.Model
-	promptKind  promptKind
+	currentPath  string
+	original     string
+	editor       textarea.Model
+	preview      viewport.Model
+	renderedPlain string
+	editSel      *editorSel
+	input        textinput.Model
+	promptKind   promptKind
 
 	width, height int
 	treeWidth     int
@@ -189,7 +201,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		if m.mode == modeEdit {
-			m.editor, cmd = m.editor.Update(msg)
+			if plain, ok := editSelectionKey(msg); ok {
+				if m.editSel == nil {
+					pos := m.cursorPos()
+					m.editSel = &editorSel{anchor: pos, end: pos}
+				}
+				m.editor, cmd = m.editor.Update(plain)
+				if m.editSel != nil {
+					m.editSel.end = m.cursorPos()
+				}
+			} else {
+				m.editSel = nil
+				m.editor, cmd = m.editor.Update(msg)
+			}
 			return m, cmd
 		}
 		if m.active == treePane {
@@ -200,9 +224,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	case copyResultMsg:
 		if msg.err != nil {
-			m.flashStatus("Copy failed: "+msg.err.Error(), true, 2*time.Second)
+			m.flashStatus("Copy failed: "+msg.err.Error()+" · Select text manually and use terminal copy", true, 3*time.Second)
 		} else {
-			m.flashStatus("✓ Copied to clipboard", false, 1500*time.Millisecond)
+			m.flashStatus(copyFeedback(msg.content), false, 2*time.Second)
 		}
 		return m, m.takePending()
 	case statusClearMsg:
@@ -283,6 +307,12 @@ func (m *Model) globalKey(key string) (handled, quit bool) {
 	case "ctrl+y":
 		m.copyCurrent()
 		return true, false
+	case "ctrl+l":
+		if m.mode == modeEdit {
+			m.copyCurrentLine()
+			return true, false
+		}
+		return false, false
 	case "ctrl+g":
 		m.enterSelectionMode()
 		return true, false
@@ -436,7 +466,32 @@ func (m *Model) copyCurrent() {
 		m.flashStatus("Open a note first", true, 2*time.Second)
 		return
 	}
-	content := m.editor.Value()
+	var content string
+	if m.mode == modeEdit {
+		if m.editSel != nil {
+			content = m.selectionText()
+		} else {
+			content = m.currentLineText()
+		}
+	} else {
+		content = m.renderedPlain
+	}
+	m.startCopy(content)
+}
+
+func (m *Model) copyCurrentLine() {
+	if m.currentPath == "" {
+		m.flashStatus("Open a note first", true, 2*time.Second)
+		return
+	}
+	if m.mode != modeEdit {
+		m.flashStatus("Ctrl+L works in edit mode", true, 2*time.Second)
+		return
+	}
+	m.startCopy(m.currentLineText())
+}
+
+func (m *Model) startCopy(content string) {
 	copier := m.copier
 	if copier == nil {
 		copier = copyText
@@ -468,7 +523,89 @@ func copyText(content string) error {
 }
 
 func copyCmd(copier func(string) error, content string) tea.Cmd {
-	return func() tea.Msg { return copyResultMsg{err: copier(content)} }
+	return func() tea.Msg { return copyResultMsg{err: copier(content), content: content} }
+}
+
+func copyFeedback(content string) string {
+	if len([]rune(content)) == 0 {
+		return "✓ Copied empty note"
+	}
+	display := strings.Join(strings.Fields(content), " ")
+	n := len([]rune(content))
+	if n <= 40 {
+		return "✓ Copied: " + display
+	}
+	if n <= 120 {
+		return "✓ Copied: " + truncate(display, 40) + "..."
+	}
+	return fmt.Sprintf("✓ Copied %d chars", n)
+}
+
+func (m Model) cursorPos() cursorPos {
+	li := m.editor.LineInfo()
+	return cursorPos{row: m.editor.Line(), col: li.StartColumn + li.ColumnOffset}
+}
+
+func (m Model) currentLineText() string {
+	lines := strings.Split(m.editor.Value(), "\n")
+	row := m.editor.Line()
+	if row < 0 || row >= len(lines) {
+		return ""
+	}
+	return lines[row]
+}
+
+func (m Model) selectionText() string {
+	if m.editSel == nil {
+		return ""
+	}
+	start, end := m.editSel.anchor, m.editSel.end
+	if start.row > end.row || (start.row == end.row && start.col > end.col) {
+		start, end = end, start
+	}
+	lines := strings.Split(m.editor.Value(), "\n")
+	if start.row >= len(lines) {
+		return ""
+	}
+	if end.row >= len(lines) {
+		end.row = len(lines) - 1
+		end.col = len([]rune(lines[end.row]))
+	}
+	runeLines := make([][]rune, len(lines))
+	for i, l := range lines {
+		runeLines[i] = []rune(l)
+	}
+	if start.row == end.row {
+		line := runeLines[start.row]
+		return string(line[min(start.col, len(line)):min(end.col, len(line))])
+	}
+	var b strings.Builder
+	b.WriteString(string(runeLines[start.row][min(start.col, len(runeLines[start.row])):]))
+	for r := start.row + 1; r < end.row; r++ {
+		b.WriteByte('\n')
+		b.WriteString(string(runeLines[r]))
+	}
+	b.WriteByte('\n')
+	b.WriteString(string(runeLines[end.row][:min(end.col, len(runeLines[end.row]))]))
+	return b.String()
+}
+
+func editSelectionKey(msg tea.KeyMsg) (tea.KeyMsg, bool) {
+	switch msg.Type {
+	case tea.KeyShiftUp:
+		return tea.KeyMsg{Type: tea.KeyUp}, true
+	case tea.KeyShiftDown:
+		return tea.KeyMsg{Type: tea.KeyDown}, true
+	case tea.KeyShiftLeft:
+		return tea.KeyMsg{Type: tea.KeyLeft}, true
+	case tea.KeyShiftRight:
+		return tea.KeyMsg{Type: tea.KeyRight}, true
+	case tea.KeyShiftHome:
+		return tea.KeyMsg{Type: tea.KeyHome}, true
+	case tea.KeyShiftEnd:
+		return tea.KeyMsg{Type: tea.KeyEnd}, true
+	}
+	return tea.KeyMsg{}, false
 }
 
 func (m *Model) togglePane() {
@@ -530,6 +667,8 @@ func (m *Model) openSelectedNote() {
 	m.currentPath = path
 	m.original = content
 	m.editor.SetValue(content)
+	m.editSel = nil
+	m.setEditorBackground(bg)
 	m.preview.GotoTop()
 	m.renderMarkdown()
 	m.flashStatus("Opened "+path, false, 2*time.Second)
@@ -692,6 +831,8 @@ func (m *Model) toggleEdit() {
 	}
 	m.mode = modeEdit
 	m.active = contentPane
+	m.editSel = nil
+	m.setEditorBackground(surface)
 	m.editor.Focus()
 	m.setStatus("Editing "+m.currentPath, false)
 }
@@ -699,12 +840,24 @@ func (m *Model) toggleEdit() {
 func (m *Model) leaveEdit() {
 	m.editor.Blur()
 	m.mode = modeNormal
+	m.editSel = nil
+	m.setEditorBackground(bg)
 	m.renderMarkdown()
 	if m.dirty() {
 		m.setStatus("Unsaved changes · Ctrl+S to save", false)
 	} else {
 		m.setStatus("Preview mode", false)
 	}
+}
+
+func (m *Model) setEditorBackground(c lipgloss.Color) {
+	base := lipgloss.NewStyle().Foreground(text).Background(c)
+	m.editor.FocusedStyle.Base = base
+	m.editor.FocusedStyle.CursorLine = lipgloss.NewStyle().Background(selection)
+	m.editor.FocusedStyle.CursorLineNumber = lipgloss.NewStyle().Foreground(accent).Background(surface)
+	m.editor.FocusedStyle.LineNumber = lipgloss.NewStyle().Foreground(muted).Background(c)
+	m.editor.FocusedStyle.Text = base
+	m.editor.BlurredStyle = m.editor.FocusedStyle
 }
 
 func (m *Model) save() bool {
@@ -864,6 +1017,7 @@ func (m *Model) renderMarkdown() {
 		if err != nil {
 			m.setStatus("Markdown renderer: "+err.Error(), true)
 			m.preview.SetContent(m.editor.Value())
+			m.renderedPlain = m.editor.Value()
 			return
 		}
 		m.renderer = renderer
@@ -873,9 +1027,12 @@ func (m *Model) renderMarkdown() {
 	if err != nil {
 		m.setStatus("Markdown preview: "+err.Error(), true)
 		m.preview.SetContent(m.editor.Value())
+		m.renderedPlain = m.editor.Value()
 		return
 	}
-	m.preview.SetContent(strings.TrimSpace(decorateCodeBlocks(rendered, width)))
+	content := strings.TrimSpace(decorateCodeBlocks(rendered, width))
+	m.preview.SetContent(content)
+	m.renderedPlain = extractPlainText(content)
 }
 
 func markdownStyle() glamansi.StyleConfig {
@@ -997,6 +1154,27 @@ var ansiRegexp = regexp.MustCompile("\x1b\\[[0-9;]*m")
 
 func stripANSI(s string) string { return ansiRegexp.ReplaceAllString(s, "") }
 
+// extractPlainText converts a rendered ANSI string into clean copyable text:
+// ANSI escapes are removed along with code-block markers and other control
+// characters, and trailing padding added to code lines is trimmed.
+func extractPlainText(rendered string) string {
+	s := stripANSI(rendered)
+	s = strings.ReplaceAll(s, codeBlockStart, "")
+	s = strings.ReplaceAll(s, codeBlockEnd, "")
+	var b strings.Builder
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f {
+			continue
+		}
+		b.WriteRune(r)
+	}
+	lines := strings.Split(b.String(), "\n")
+	for i, line := range lines {
+		lines[i] = strings.TrimRight(line, " \t")
+	}
+	return strings.Join(lines, "\n")
+}
+
 // decorateCodeBlocks restores a solid surface background behind code blocks.
 // Glamour's chroma formatter intentionally strips the block background, so we
 // mark code block boundaries, then re-apply the background after every ANSI
@@ -1080,6 +1258,13 @@ func (m Model) View() string {
 		} else {
 			body = m.contentView(m.width)
 		}
+	} else if m.width >= 100 {
+		contentW := max(1, m.width-m.treeWidth-1)
+		body = lipgloss.JoinHorizontal(lipgloss.Top,
+			m.treeViewSides(m.treeWidth, true, false),
+			mutedSty.Render("│"),
+			m.contentViewSides(contentW, false, true),
+		)
 	} else {
 		body = lipgloss.JoinHorizontal(lipgloss.Top, m.treeView(m.treeWidth), m.contentView(m.width-m.treeWidth))
 	}
@@ -1167,53 +1352,62 @@ func (m Model) toolbarView() string {
 }
 
 func (m Model) treeView(width int) string {
+	return m.treeViewSides(width, true, true)
+}
+
+func (m Model) treeViewSides(width int, leftB, rightB bool) string {
 	focused := m.active == treePane
 	title := "Lists"
 	if len(m.flat) > 0 {
 		title += mutedSty.Render("  " + fmt.Sprintf("%d", len(m.flat)))
+	}
+	innerWidth := max(1, width)
+	if leftB {
+		innerWidth--
+	}
+	if rightB {
+		innerWidth--
 	}
 	var lines []string
 	rows := m.treeRows()
 	end := min(len(m.flat), m.treeOffset+rows)
 	for i := m.treeOffset; i < end; i++ {
 		item := m.flat[i]
-		marker := "  "
+		indent := strings.Repeat("  ", item.depth)
+		accentText := lipgloss.NewStyle().Foreground(accent)
+		textName := lipgloss.NewStyle().Foreground(text).Bold(true)
+		var label string
 		if item.node.IsDir {
+			marker := "▸ "
 			if m.expanded[item.node.RelPath] {
 				marker = "▾ "
-			} else {
-				marker = "▸ "
 			}
+			label = accentText.Render(marker) + textName.Render(item.node.Name)
 		} else {
-			marker = "○ "
+			name := strings.TrimSuffix(item.node.Name, filepath.Ext(item.node.Name))
+			label = mutedSty.Render(name)
 		}
-		name := item.node.Name
-		if !item.node.IsDir {
-			name = strings.TrimSuffix(name, filepath.Ext(name))
-		}
-		label := strings.Repeat("  ", item.depth) + marker + name
-		label = truncate(label, max(1, width-5))
-		line := " " + label
+		row := " " + indent + label
 		if i == m.selected {
-			fg := text
-			if focused {
-				fg = accent
-			}
-			line = lipgloss.NewStyle().Background(selection).Foreground(fg).Bold(focused).Width(max(1, width-2)).Render(line)
-		} else if item.node.IsDir {
-			line = lipgloss.NewStyle().Foreground(text).Render(line)
+			row = accentText.Render("▸") + indent + label
+			row = truncateANSI(row, innerWidth)
+			row = lipgloss.NewStyle().Background(selection).Foreground(text).Bold(true).Width(innerWidth).Render(row)
 		} else {
-			line = mutedSty.Render(line)
+			row = truncateANSI(row, innerWidth)
 		}
-		lines = append(lines, line)
+		lines = append(lines, row)
 	}
 	if len(m.flat) == 0 {
 		lines = append(lines, mutedSty.Render("  No notes"), mutedSty.Render("  Press n to create one"))
 	}
-	return borderedPanel(title, strings.Join(lines, "\n"), width, m.bodyHeight, focused)
+	return borderedPanelPart(title, strings.Join(lines, "\n"), width, m.bodyHeight, focused, leftB, rightB)
 }
 
 func (m Model) contentView(width int) string {
+	return m.contentViewSides(width, true, true)
+}
+
+func (m Model) contentViewSides(width int, leftB, rightB bool) string {
 	focused := m.active == contentPane || m.mode == modeEdit
 	title := "Note"
 	if m.mode == modeEdit {
@@ -1236,15 +1430,10 @@ func (m Model) contentView(width int) string {
 		}
 		content := m.editor.Value()
 		words := len(strings.Fields(content))
-		meta = mutedSty.Render("  "+m.currentPath) + "   " +
+		meta = " " + mutedSty.Render("  "+m.currentPath) + "   " +
 			lipgloss.NewStyle().Foreground(accent).Bold(true).Render(state) + "   " +
 			mutedSty.Render(modeName) + "   " +
-			mutedSty.Render(fmt.Sprintf("%d words", words))
-		if m.mode != modeEdit {
-			meta = " " + meta + "\n"
-		} else {
-			meta = " " + meta + "\n"
-		}
+			mutedSty.Render(fmt.Sprintf("%d words", words)) + "\n"
 	}
 
 	var content string
@@ -1256,7 +1445,7 @@ func (m Model) contentView(width int) string {
 		content = m.preview.View()
 	}
 
-	return borderedPanel(title, meta+content, width, m.bodyHeight, focused)
+	return borderedPanelPart(title, meta+content, width, m.bodyHeight, focused, leftB, rightB)
 }
 
 func (m Model) contentHeight() int {
@@ -1290,26 +1479,60 @@ func (m Model) detailsView(width int) string {
 }
 
 func borderedPanel(title, content string, width, height int, focused bool) string {
+	return borderedPanelPart(title, content, width, height, focused, true, true)
+}
+
+func borderedPanelPart(title, content string, width, height int, focused bool, leftB, rightB bool) string {
 	width, height = max(4, width), max(3, height)
-	borderColor := rule
+	borderColor := muted
 	titleColor := muted
 	if focused {
 		borderColor = accent
 		titleColor = accent
 	}
-	innerWidth := max(1, width-2)
+	leftOffset, rightOffset := 0, 0
+	if leftB {
+		leftOffset = 1
+	}
+	if rightB {
+		rightOffset = 1
+	}
+	innerWidth := max(1, width-leftOffset-rightOffset)
 	innerHeight := max(1, height-2)
 	title = truncate(title, max(1, innerWidth-2))
 	titleText := lipgloss.NewStyle().Foreground(titleColor).Bold(focused).Render(" " + title + " ")
-	topTail := max(0, innerWidth-lipgloss.Width(" "+title+" "))
-	top := lipgloss.NewStyle().Foreground(borderColor).Render("┌") + titleText + lipgloss.NewStyle().Foreground(borderColor).Render(strings.Repeat("─", topTail)+"┐")
+	topTail := max(0, innerWidth-lipgloss.Width(titleText))
+	top := ""
+	if leftB {
+		top += "┌"
+	}
+	top += titleText + strings.Repeat("─", topTail)
+	if rightB {
+		top += "┐"
+	}
 
 	content = fitBlock(content, innerWidth, innerHeight)
 	rows := strings.Split(content, "\n")
+	border := lipgloss.NewStyle().Foreground(borderColor)
 	for i, row := range rows {
-		rows[i] = lipgloss.NewStyle().Foreground(borderColor).Render("│") + truncateANSI(row, innerWidth) + strings.Repeat(" ", max(0, innerWidth-lipgloss.Width(row))) + lipgloss.NewStyle().Foreground(borderColor).Render("│")
+		line := ""
+		if leftB {
+			line += border.Render("│")
+		}
+		line += truncateANSI(row, innerWidth) + strings.Repeat(" ", max(0, innerWidth-lipgloss.Width(row)))
+		if rightB {
+			line += border.Render("│")
+		}
+		rows[i] = line
 	}
-	bottom := lipgloss.NewStyle().Foreground(borderColor).Render("└" + strings.Repeat("─", innerWidth) + "┘")
+	bottom := ""
+	if leftB {
+		bottom += "└"
+	}
+	bottom += strings.Repeat("─", innerWidth)
+	if rightB {
+		bottom += "┘"
+	}
 	return top + "\n" + strings.Join(rows, "\n") + "\n" + bottom
 }
 
@@ -1328,12 +1551,11 @@ func fitBlock(content string, width, height int) string {
 }
 
 func (m Model) statusView() string {
-	if m.statusErr {
-		message := errorSty.Render("! " + truncate(m.status, max(1, m.width-3)))
-		return lipgloss.NewStyle().Foreground(muted).Width(m.width).MaxHeight(1).Render(" " + message)
-	}
 	if m.selecting {
 		return lipgloss.NewStyle().Foreground(accent).Width(m.width).MaxHeight(1).Render(" Select text now · terminal may auto-copy · press any key to return")
+	}
+	if m.mode == modeEdit {
+		return m.editShortcutBar()
 	}
 	return m.shortcutBar()
 }
@@ -1350,8 +1572,8 @@ func (m Model) shortcutBar() string {
 		if lipgloss.Width(b.String())+lipgloss.Width(chunk) > m.width {
 			break
 		}
-		b.WriteString(lipgloss.NewStyle().Foreground(accent).Render("[" + key + "]"))
-		b.WriteString(" " + lipgloss.NewStyle().Foreground(muted).Render(label) + "  ")
+		b.WriteString(mutedSty.Render("[" + key + "]"))
+		b.WriteString(" " + mutedSty.Render(label) + "  ")
 	}
 	status := truncate(m.status, max(0, m.width-lipgloss.Width(b.String())-2))
 	if status != "" && m.width-lipgloss.Width(b.String()) > lipgloss.Width(status)+1 {
@@ -1362,7 +1584,7 @@ func (m Model) shortcutBar() string {
 }
 
 func (m Model) editShortcutBar() string {
-	hint := lipgloss.NewStyle().Foreground(accent).Bold(true).Render("Ctrl+S 保存") + " · " + mutedSty.Render("Esc 退出编辑")
+	hint := mutedSty.Render("Ctrl+S 保存 · Esc 退出 · Ctrl+L 复制行")
 	var b strings.Builder
 	b.WriteString(" " + hint)
 	status := truncate(m.status, max(0, m.width-lipgloss.Width(b.String())-2))
@@ -1374,6 +1596,9 @@ func (m Model) editShortcutBar() string {
 }
 
 func (m Model) statusText(status string) string {
+	if m.statusErr {
+		return errorSty.Render(status)
+	}
 	if m.statusOK {
 		return successSty.Render(status)
 	}
@@ -1405,17 +1630,17 @@ func (m Model) dialogView() string {
 			body += "\n" + errorSty.Render(m.status)
 		}
 	}
-	dialog := lipgloss.NewStyle().Background(surface).Foreground(text).Border(lipgloss.NormalBorder()).BorderForeground(rule).Padding(1, 2).Width(min(64, max(28, m.width-6))).Render(brandSty.Render(title) + "\n\n" + body)
+	dialog := lipgloss.NewStyle().Background(surface).Foreground(text).Border(lipgloss.RoundedBorder()).BorderForeground(muted).Padding(1, 3).Width(min(64, max(28, m.width-6))).Render(brandSty.Render(title) + "\n\n" + body)
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, dialog, lipgloss.WithWhitespaceBackground(bg))
 }
 
 func (m Model) helpView() string {
 	help := brandSty.Render("Vnote shortcuts") + "\n\n" +
 		"Navigate\n" + mutedSty.Render("  ↑/↓ or J/K     Select item\n  ←/→ or H/L     Collapse / expand\n  Enter           Open note\n  Tab             Switch panel\n") +
-		"\nNotes\n" + mutedSty.Render("  Ctrl+N          New note\n  Ctrl+D          New folder\n  F2              Rename\n  Delete          Delete\n  Ctrl+E          Edit / preview\n  Ctrl+S          Save\n  Ctrl+C / Ctrl+Y Copy Markdown\n  Ctrl+G          Select terminal text\n  Ctrl+R          Refresh\n") +
+		"\nNotes\n" + mutedSty.Render("  Ctrl+N          New note\n  Ctrl+D          New folder\n  F2              Rename\n  Delete          Delete\n  Ctrl+E          Edit / preview\n  Ctrl+S          Save\n  Ctrl+C / Ctrl+Y Copy text\n  Ctrl+L          Copy current line\n  Ctrl+G          Select terminal text\n  Ctrl+R          Refresh\n") +
 		"\nApp\n" + mutedSty.Render("  Ctrl+Q          Quit\n  ? / Esc         Close help\n") +
 		"\n" + lipgloss.NewStyle().Foreground(accent).Render("Mouse and touch") + "\n" + mutedSty.Render("  Click rows and top actions. Scroll either panel.\n  In Select mode, drag over preview text; press any key to return.")
-	box := lipgloss.NewStyle().Background(surface).Foreground(text).Border(lipgloss.NormalBorder()).BorderForeground(rule).Padding(1, 3).Width(min(70, max(32, m.width-4))).Render(help)
+	box := lipgloss.NewStyle().Background(surface).Foreground(text).Border(lipgloss.RoundedBorder()).BorderForeground(muted).Padding(1, 3).Width(min(70, max(32, m.width-4))).Render(help)
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box, lipgloss.WithWhitespaceBackground(bg))
 }
 
