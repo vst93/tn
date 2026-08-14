@@ -45,6 +45,7 @@ const (
 	modeConfirm
 	modeHelp
 	modeSearch
+	modeExport
 )
 
 type promptKind int
@@ -103,9 +104,13 @@ type Model struct {
 	renderedPlain   string
 	renderedContent string
 	editSel         *editorSel
+	undoStack       []string
+	redoStack       []string
 	input           textinput.Model
 	promptKind      promptKind
 	beforePrompt    mode
+	exportPath      bool
+	exportCopy      bool
 
 	searchQuery   string
 	searchMatches []matchPos
@@ -211,6 +216,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.mode == modeSearch {
 			return m.updateSearch(msg)
 		}
+		if m.mode == modeExport {
+			return m.updateExport(msg)
+		}
 
 		if handled, quit := m.globalKey(key); handled {
 			if quit {
@@ -220,6 +228,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		if m.mode == modeEdit {
+			before := m.editor.Value()
 			if plain, ok := editSelectionKey(msg); ok {
 				if m.editSel == nil {
 					pos := m.cursorPos()
@@ -234,12 +243,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					if indent := m.enterIndent(); indent != "" {
 						m.editor.InsertString("\n" + indent)
 						m.editSel = nil
+						m.recordEdit(before, m.editor.Value())
 						return m, nil
 					}
 				}
 				m.editSel = nil
 				m.editor, cmd = m.editor.Update(msg)
 			}
+			m.recordEdit(before, m.editor.Value())
 			return m, cmd
 		}
 		if m.active == treePane {
@@ -250,7 +261,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	case copyResultMsg:
 		if msg.err != nil {
+			m.exportCopy = false
 			m.flashStatus("Copy failed: "+msg.err.Error()+" · Select text manually and use terminal copy", true, 3*time.Second)
+		} else if m.exportCopy {
+			m.exportCopy = false
+			m.flashStatus("✓ Copied to clipboard", false, 2*time.Second)
 		} else {
 			m.flashStatus(copyFeedback(msg.content), false, 2*time.Second)
 		}
@@ -286,6 +301,35 @@ func (m *Model) globalKey(key string) (handled, quit bool) {
 		return true, true
 	case "ctrl+s":
 		m.save()
+		return true, false
+	case "ctrl+z":
+		if m.mode == modeEdit {
+			m.undo()
+			return true, false
+		}
+		return false, false
+	case "ctrl+shift+z":
+		if m.mode == modeEdit {
+			m.redo()
+			return true, false
+		}
+		return false, false
+	case "ctrl+y":
+		if m.mode == modeEdit {
+			m.redo()
+			return true, false
+		}
+		m.copyCurrent()
+		return true, false
+	case "ctrl+shift+e":
+		if m.mode == modeEdit {
+			return false, false
+		}
+		if m.currentPath == "" {
+			m.setStatus("Open a note first", true)
+			return true, false
+		}
+		m.startExport()
 		return true, false
 	case "ctrl+n":
 		m.startPrompt(promptNote)
@@ -329,9 +373,6 @@ func (m *Model) globalKey(key string) (handled, quit bool) {
 	case "ctrl+r":
 		m.refresh(m.selectedPath())
 		m.flashStatus("Notebook refreshed", false, 2*time.Second)
-		return true, false
-	case "ctrl+y":
-		m.copyCurrent()
 		return true, false
 	case "ctrl+f":
 		if m.mode == modeEdit {
@@ -580,6 +621,116 @@ func copyFeedback(content string) string {
 	return fmt.Sprintf("✓ Copied %d chars", n)
 }
 
+func (m *Model) startExport() {
+	m.mode = modeExport
+	m.exportPath = false
+	m.exportCopy = false
+	m.statusErr = false
+	m.status = ""
+	m.input.Prompt = "Export to: "
+	m.input.Placeholder = "filename or path"
+	m.input.SetValue(m.defaultExportPath())
+	m.input.Width = max(20, min(60, m.width-12))
+	m.input.Blur()
+}
+
+func (m Model) updateExport(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if !m.exportPath {
+		switch msg.String() {
+		case "esc":
+			m.mode = modeNormal
+			m.input.Blur()
+			return m, nil
+		case "1":
+			m.doExportCopy()
+			return m, m.takePending()
+		case "2":
+			m.exportPath = true
+			m.statusErr = false
+			m.status = ""
+			m.input.SetValue(m.defaultExportPath())
+			m.input.Focus()
+			return m, nil
+		}
+		return m, nil
+	}
+	switch msg.String() {
+	case "esc":
+		m.mode = modeNormal
+		m.exportPath = false
+		m.input.Blur()
+		return m, nil
+	case "enter":
+		m.performSaveAs()
+		if m.mode == modeExport {
+			return m, nil
+		}
+		return m, m.takePending()
+	}
+	var cmd tea.Cmd
+	m.input, cmd = m.input.Update(msg)
+	return m, cmd
+}
+
+func (m *Model) doExportCopy() {
+	m.mode = modeNormal
+	m.exportPath = false
+	m.input.Blur()
+	m.exportCopy = true
+	m.startCopy(m.renderedPlain)
+}
+
+func (m *Model) performSaveAs() {
+	raw := strings.TrimSpace(m.input.Value())
+	if raw == "" {
+		m.setStatus("Enter a path to export", true)
+		return
+	}
+	path := raw
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(m.exportDir(), path)
+	}
+	if err := os.WriteFile(path, []byte(m.editor.Value()), 0o644); err != nil {
+		m.setStatus("Export failed: "+err.Error(), true)
+		return
+	}
+	m.mode = modeNormal
+	m.exportPath = false
+	m.input.Blur()
+	m.flashStatus("✓ Exported to "+path, false, 2*time.Second)
+}
+
+func (m Model) exportDir() string {
+	if m.currentPath == "" {
+		return m.store.Root
+	}
+	return filepath.Join(m.store.Root, filepath.Dir(m.currentPath))
+}
+
+func (m Model) defaultExportPath() string {
+	if m.currentPath == "" {
+		return ""
+	}
+	base := filepath.Base(m.currentPath)
+	base = strings.TrimSuffix(base, filepath.Ext(base)) + ".md"
+	return filepath.Join(m.exportDir(), base)
+}
+
+func (m Model) exportDialogView() string {
+	title := "Export"
+	var body string
+	if m.exportPath {
+		body = m.input.View() + "\n\n" + mutedSty.Render("Enter 导出  ·  Esc 取消")
+		if m.statusErr {
+			body += "\n" + errorSty.Render(m.status)
+		}
+	} else {
+		body = "1  复制到剪贴板\n2  另存为\n\n" + mutedSty.Render("Esc 取消")
+	}
+	dialog := lipgloss.NewStyle().Background(surface).Foreground(text).Border(lipgloss.RoundedBorder()).BorderForeground(muted).Padding(1, 3).Width(min(64, max(28, m.width-6))).Render(brandSty.Render(title) + "\n\n" + body)
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, dialog, lipgloss.WithWhitespaceBackground(bg))
+}
+
 func (m Model) cursorPos() cursorPos {
 	li := m.editor.LineInfo()
 	return cursorPos{row: m.editor.Line(), col: li.StartColumn + li.ColumnOffset}
@@ -628,6 +779,41 @@ func (m Model) selectionText() string {
 	b.WriteString(string(runeLines[end.row][:min(end.col, len(runeLines[end.row]))]))
 	return b.String()
 }
+
+func (m *Model) recordEdit(before, after string) {
+	if before == after {
+		return
+	}
+	m.undoStack = append(m.undoStack, before)
+	m.redoStack = m.redoStack[:0]
+}
+
+func (m *Model) undo() {
+	if m.mode != modeEdit || len(m.undoStack) == 0 {
+		return
+	}
+	m.redoStack = append(m.redoStack, m.editor.Value())
+	prev := m.undoStack[len(m.undoStack)-1]
+	m.undoStack = m.undoStack[:len(m.undoStack)-1]
+	m.editor.SetValue(prev)
+	m.editSel = nil
+	m.editor.SetCursor(0)
+}
+
+func (m *Model) redo() {
+	if m.mode != modeEdit || len(m.redoStack) == 0 {
+		return
+	}
+	m.undoStack = append(m.undoStack, m.editor.Value())
+	next := m.redoStack[len(m.redoStack)-1]
+	m.redoStack = m.redoStack[:len(m.redoStack)-1]
+	m.editor.SetValue(next)
+	m.editSel = nil
+	m.editor.SetCursor(0)
+}
+
+func (m Model) undoable() bool { return len(m.undoStack) > 0 }
+func (m Model) redoable() bool { return len(m.redoStack) > 0 }
 
 func editSelectionKey(msg tea.KeyMsg) (tea.KeyMsg, bool) {
 	switch msg.Type {
@@ -706,6 +892,8 @@ func (m *Model) openSelectedNote() {
 	m.currentPath = path
 	m.original = content
 	m.editor.SetValue(content)
+	m.undoStack = nil
+	m.redoStack = nil
 	m.editSel = nil
 	m.setEditorBackground(bg)
 	m.preview.GotoTop()
@@ -846,6 +1034,8 @@ func (m Model) updateConfirm(key string) (tea.Model, tea.Cmd) {
 			m.currentPath = ""
 			m.original = ""
 			m.editor.SetValue("")
+			m.undoStack = nil
+			m.redoStack = nil
 			m.preview.SetContent("")
 		}
 		if err := m.store.Delete(path); err != nil {
@@ -913,6 +1103,7 @@ func (m *Model) save() bool {
 		return false
 	}
 	m.original = content
+	m.redoStack = m.redoStack[:0]
 	m.renderMarkdown()
 	m.flashStatus("✓ Saved "+m.currentPath, false, 2*time.Second)
 	return true
@@ -1677,6 +1868,9 @@ func (m Model) View() string {
 	if m.mode == modeHelp {
 		return m.helpView()
 	}
+	if m.mode == modeExport {
+		return m.exportDialogView()
+	}
 	if (m.mode == modePrompt && m.promptKind != promptGotoLine) || m.mode == modeConfirm {
 		return m.dialogView()
 	}
@@ -2036,7 +2230,19 @@ func (m Model) shortcutBar() string {
 }
 
 func (m Model) editShortcutBar() string {
-	left := mutedSty.Render("Ctrl+S 保存 · Esc 退出 · Ctrl+L 复制行")
+	undoSty := mutedSty
+	if m.undoable() {
+		undoSty = lipgloss.NewStyle().Foreground(accent)
+	}
+	redoSty := mutedSty
+	if m.redoable() {
+		redoSty = lipgloss.NewStyle().Foreground(accent)
+	}
+	left := mutedSty.Render("Ctrl+S 保存 · ") +
+		undoSty.Render("Ctrl+Z 撤销") +
+		mutedSty.Render(" · ") +
+		redoSty.Render("Ctrl+Shift+Z 重做") +
+		mutedSty.Render(" · Esc 退出 · Ctrl+L 复制行")
 	pos := m.cursorPos()
 	total := m.editor.LineCount()
 	right := fmt.Sprintf("Ln %d / %d · Col %d", pos.row+1, total, pos.col+1)
@@ -2126,7 +2332,7 @@ func (m Model) dialogView() string {
 func (m Model) helpView() string {
 	help := brandSty.Render("Vnote shortcuts") + "\n\n" +
 		"Navigate\n" + mutedSty.Render("  ↑/↓ or J/K     Select item\n  ←/→ or H/L     Collapse / expand\n  Enter           Open note\n  Tab             Switch panel\n") +
-		"\nNotes\n" + mutedSty.Render("  Ctrl+N          New note\n  Ctrl+D          New folder\n  F2              Rename\n  Delete          Delete\n  Ctrl+E          Edit / preview\n  Ctrl+S          Save\n  Ctrl+C / Ctrl+Y Copy text\n  Ctrl+L          Copy current line\n  Ctrl+F          Search preview\n  Alt+G           Go to line\n  Ctrl+G          Select terminal text\n  Ctrl+R          Refresh\n") +
+		"\nNotes\n" + mutedSty.Render("  Ctrl+N          New note\n  Ctrl+D          New folder\n  F2              Rename\n  Delete          Delete\n  Ctrl+E          Edit / preview\n  Ctrl+S          Save\n  Ctrl+Z          Undo\n  Ctrl+Shift+Z / Ctrl+Y  Redo\n  Ctrl+Shift+E    Export\n  Ctrl+C / Ctrl+Y Copy text\n  Ctrl+L          Copy current line\n  Ctrl+F          Search preview\n  Alt+G           Go to line\n  Ctrl+G          Select terminal text\n  Ctrl+R          Refresh\n") +
 		"\nApp\n" + mutedSty.Render("  Ctrl+Q          Quit\n  ? / Esc         Close help\n") +
 		"\n" + lipgloss.NewStyle().Foreground(accent).Render("Mouse and touch") + "\n" + mutedSty.Render("  Click rows and top actions. Scroll either panel.\n  In Select mode, drag over preview text; press any key to return.")
 	box := lipgloss.NewStyle().Background(surface).Foreground(text).Border(lipgloss.RoundedBorder()).BorderForeground(muted).Padding(1, 3).Width(min(70, max(32, m.width-4))).Render(help)

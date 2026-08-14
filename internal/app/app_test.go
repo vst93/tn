@@ -2,6 +2,8 @@ package app
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -515,3 +517,241 @@ func TestSelectionModeDisablesThenRestoresMouse(t *testing.T) {
 		t.Fatal("expected selection mode to restore mouse on key press")
 	}
 }
+
+func openEditModel(t *testing.T, name string) (Model, *storage.Store, string) {
+	t.Helper()
+	store := storage.New(t.TempDir())
+	note, err := store.CreateNote("", name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := New(store)
+	m.resize(100, 30)
+	m.selectPath(note)
+	m.openSelectedNote()
+	m.toggleEdit()
+	return m, store, note
+}
+
+func TestUndoRedoInEditMode(t *testing.T) {
+	m, _, _ := openEditModel(t, "undo-note")
+	m.editor.SetValue("hello")
+	m.editor.SetCursor(5)
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'!'}})
+	m = updated.(Model)
+	if m.editor.Value() != "hello!" {
+		t.Fatalf("expected hello!, got %q", m.editor.Value())
+	}
+	if !m.undoable() {
+		t.Fatal("expected undo to be available after an edit")
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlZ})
+	m = updated.(Model)
+	if m.editor.Value() != "hello" {
+		t.Fatalf("expected undo to restore hello, got %q", m.editor.Value())
+	}
+	if !m.redoable() {
+		t.Fatal("expected redo to be available after undo")
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlY})
+	m = updated.(Model)
+	if m.editor.Value() != "hello!" {
+		t.Fatalf("expected Ctrl+Y to redo, got %q", m.editor.Value())
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlZ})
+	m = updated.(Model)
+	if handled, _ := m.globalKey("ctrl+shift+z"); !handled {
+		t.Fatal("expected Ctrl+Shift+Z to be handled in edit mode")
+	}
+	if m.editor.Value() != "hello!" {
+		t.Fatalf("expected Ctrl+Shift+Z to redo, got %q", m.editor.Value())
+	}
+}
+
+func TestSaveClearsRedoStack(t *testing.T) {
+	m, store, note := openEditModel(t, "save-redo")
+	m.editor.SetValue("abc")
+	m.editor.SetCursor(3)
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlZ})
+	m = updated.(Model)
+	if m.editor.Value() != "abc" || !m.redoable() {
+		t.Fatalf("expected undo to abc with redo available, value=%q redo=%v", m.editor.Value(), m.redoable())
+	}
+
+	if !m.save() {
+		t.Fatal("save failed")
+	}
+	if m.redoable() || len(m.redoStack) != 0 {
+		t.Fatalf("expected redo stack cleared after save, redo=%v len=%d", m.redoable(), len(m.redoStack))
+	}
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlY})
+	m = updated.(Model)
+	if m.editor.Value() != "abc" {
+		t.Fatalf("expected redo to be a no-op after save, got %q", m.editor.Value())
+	}
+	if content, err := store.Read(note); err != nil || content != "abc" {
+		t.Fatalf("saved content = %q, %v", content, err)
+	}
+}
+
+func TestEditStatusBarShowsUndoRedo(t *testing.T) {
+	m, _, _ := openEditModel(t, "bar-undo")
+	m.editor.SetValue("a")
+	m.editor.SetCursor(1)
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'b'}})
+	m = updated.(Model)
+
+	bar := stripANSI(m.editShortcutBar())
+	if !strings.Contains(bar, "Ctrl+Z 撤销") || !strings.Contains(bar, "Ctrl+Shift+Z 重做") {
+		t.Fatalf("edit status bar missing undo/redo hints: %q", bar)
+	}
+	if !m.undoable() {
+		t.Fatal("expected undo hint to be active after an edit")
+	}
+}
+
+func TestExportShortcutTriggersDialog(t *testing.T) {
+	store := storage.New(t.TempDir())
+	note, err := store.CreateNote("", "export-trigger")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := New(store)
+	m.resize(100, 30)
+	m.selectPath(note)
+	m.openSelectedNote()
+
+	if handled, _ := m.globalKey("ctrl+shift+e"); !handled {
+		t.Fatal("expected Ctrl+Shift+E to be handled in preview mode")
+	}
+	if m.mode != modeExport {
+		t.Fatalf("expected export mode, got %v", m.mode)
+	}
+	if view := m.View(); view == "" {
+		t.Fatal("expected export dialog view to render")
+	}
+}
+
+func TestExportShortcutDisabledInEditMode(t *testing.T) {
+	m, _, _ := openEditModel(t, "export-edit")
+	if handled, _ := m.globalKey("ctrl+shift+e"); handled {
+		t.Fatal("expected Ctrl+Shift+E not to be handled in edit mode")
+	}
+	if m.mode != modeEdit {
+		t.Fatalf("expected to stay in edit mode, got %v", m.mode)
+	}
+}
+
+func TestExportCopyToClipboard(t *testing.T) {
+	store := storage.New(t.TempDir())
+	note, err := store.CreateNote("", "export-copy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := New(store)
+	m.resize(100, 30)
+	m.selectPath(note)
+	m.openSelectedNote()
+	m.editor.SetValue("# Export me\n")
+	m.renderMarkdown()
+	want := m.renderedPlain
+
+	m.startExport()
+	if m.mode != modeExport || m.exportPath {
+		t.Fatalf("expected export menu, mode=%v path=%v", m.mode, m.exportPath)
+	}
+	var copied string
+	m.copier = func(content string) error {
+		copied = content
+		return nil
+	}
+	updated, cmd := m.updateExport(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'1'}})
+	m = updated.(Model)
+	if cmd == nil {
+		t.Fatal("expected copy command from export")
+	}
+	updated, _ = m.Update(cmd())
+	m = updated.(Model)
+	if copied != want {
+		t.Fatalf("copied %q, want rendered plain %q", copied, want)
+	}
+	if m.status != "✓ Copied to clipboard" || !m.statusOK {
+		t.Fatalf("unexpected copy status %q, ok=%v", m.status, m.statusOK)
+	}
+}
+
+func TestExportSaveAs(t *testing.T) {
+	store := storage.New(t.TempDir())
+	note, err := store.CreateNote("", "export-save")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := New(store)
+	m.resize(100, 30)
+	m.selectPath(note)
+	m.openSelectedNote()
+	m.editor.SetValue("# Exported\n")
+
+	m.startExport()
+	updated, _ := m.updateExport(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'2'}})
+	m = updated.(Model)
+	if !m.exportPath {
+		t.Fatal("expected save-as path input after choosing option 2")
+	}
+	defaultPath := filepath.Join(store.Root, "export-save.md")
+	if m.input.Value() != defaultPath {
+		t.Fatalf("default export path = %q, want %q", m.input.Value(), defaultPath)
+	}
+
+	m.input.SetValue("copy.md")
+	updated, _ = m.updateExport(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	if m.mode != modeNormal {
+		t.Fatalf("expected export to finish, mode=%v", m.mode)
+	}
+	wantPath := filepath.Join(store.Root, "copy.md")
+	data, err := os.ReadFile(wantPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "# Exported\n" {
+		t.Fatalf("exported content = %q", string(data))
+	}
+	if m.status != "✓ Exported to "+wantPath || !m.statusOK {
+		t.Fatalf("unexpected export status %q, ok=%v", m.status, m.statusOK)
+	}
+}
+
+func TestExportInvalidPathStaysInDialog(t *testing.T) {
+	m, _, _ := openEditModel(t, "export-bad")
+	m.startExport()
+	updated, _ := m.updateExport(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'2'}})
+	m = updated.(Model)
+	m.input.SetValue("")
+	updated, _ = m.updateExport(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	if m.mode != modeExport || !m.exportPath {
+		t.Fatalf("expected to stay in export path input, mode=%v path=%v", m.mode, m.exportPath)
+	}
+	if !m.statusErr {
+		t.Fatal("expected error status for empty export path")
+	}
+}
+
+func TestExportEscCancels(t *testing.T) {
+	m, _, _ := openEditModel(t, "export-esc")
+	m.startExport()
+	updated, _ := m.updateExport(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+	if m.mode != modeNormal {
+		t.Fatalf("expected Esc to cancel export, mode=%v", m.mode)
+	}
+}
+
