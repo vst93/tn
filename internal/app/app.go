@@ -1157,20 +1157,22 @@ func stripANSI(s string) string { return ansiRegexp.ReplaceAllString(s, "") }
 // extractPlainText converts a rendered ANSI string into clean copyable text:
 // ANSI escapes are removed along with code-block markers and other control
 // characters, and trailing padding added to code lines is trimmed.
+// Whitespace control characters (\n, 	, \r) are preserved so multi-line text
+// stays readable when pasted.
 func extractPlainText(rendered string) string {
 	s := stripANSI(rendered)
 	s = strings.ReplaceAll(s, codeBlockStart, "")
 	s = strings.ReplaceAll(s, codeBlockEnd, "")
 	var b strings.Builder
 	for _, r := range s {
-		if r < 0x20 || r == 0x7f {
+		if (r < 0x20 && r != '\n' && r != '	' && r != '\r') || r == 0x7f {
 			continue
 		}
 		b.WriteRune(r)
 	}
 	lines := strings.Split(b.String(), "\n")
 	for i, line := range lines {
-		lines[i] = strings.TrimRight(line, " \t")
+		lines[i] = strings.TrimRight(line, " 	")
 	}
 	return strings.Join(lines, "\n")
 }
