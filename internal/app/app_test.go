@@ -1659,3 +1659,116 @@ func TestHelpScrollsWithMouseWheel(t *testing.T) {
 		t.Fatalf("expected mouse wheel to scroll help, offset=%d before=%d", m.helpHintView.YOffset, y0)
 	}
 }
+
+func TestTagFilterNewNoteInheritsFilterTag(t *testing.T) {
+	store := storage.New(t.TempDir())
+	m := New(store)
+	m.resize(100, 30)
+
+	m.startTagFilter()
+	m.input.SetValue("work")
+	updated, _ := m.updateTagFilter(tea.KeyMsg{Type: tea.KeyRight})
+	m = updated.(Model)
+	if m.tagFilter != "work" || len(m.flat) != 0 {
+		t.Fatalf("expected empty work-filtered list, filter=%q rows=%d", m.tagFilter, len(m.flat))
+	}
+	updated, _ = m.updateTagFilter(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	if m.mode != modeNormal || m.tagFilter != "work" {
+		t.Fatalf("expected filter active after confirm, mode=%v filter=%q", m.mode, m.tagFilter)
+	}
+
+	m.startTemplate()
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	m.input.SetValue("task")
+	updated, _ = m.updatePrompt(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	path := m.currentPath
+	if path == "" {
+		t.Fatal("expected a new note to be created")
+	}
+	if len(m.flat) != 1 || m.flat[0].node.RelPath != path {
+		t.Fatalf("expected new note visible in filtered list, got %d rows", len(m.flat))
+	}
+	content, err := store.Read(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta, _ := parseFrontMatter(content)
+	if !containsTag(meta.Tags, "work") {
+		t.Fatalf("expected new note tagged work, got %v", meta.Tags)
+	}
+}
+
+func TestFocusModeCanOpenOtherNoteViaGlobalSearch(t *testing.T) {
+	store := storage.New(t.TempDir())
+	noteA, err := store.CreateNote("", "alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Write(noteA, "alpha body"); err != nil {
+		t.Fatal(err)
+	}
+	noteB, err := store.CreateNote("", "beta")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Write(noteB, "beta body"); err != nil {
+		t.Fatal(err)
+	}
+
+	m := New(store)
+	m.resize(100, 30)
+	m.selectPath(noteA)
+	m.openSelectedNote()
+	m.toggleFocus()
+	if !m.focusing {
+		t.Fatal("expected focus mode")
+	}
+
+	m.startGlobalSearch()
+	m.input.SetValue("beta")
+	m.runGlobalSearch("beta")
+	if len(m.globalSearchResults) == 0 {
+		t.Fatal("expected beta in global search results")
+	}
+	m.globalSearchIndex = 0
+	updated, _ := m.updateGlobalSearch(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	if m.currentPath != noteB {
+		t.Fatalf("expected beta to open, got %q", m.currentPath)
+	}
+	if !m.focusing {
+		t.Fatal("expected focus mode to persist after opening another note")
+	}
+	if view := m.View(); !strings.Contains(view, "Esc 退出专注") {
+		t.Fatalf("expected focus view after opening another note, got %q", view)
+	}
+}
+
+func TestUndoRedoRestoresCursorPosition(t *testing.T) {
+	m, _, _ := openEditModel(t, "cursor-undo")
+	m.editor.SetValue("hello")
+	m.editor.SetCursor(5)
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'!'}})
+	m = updated.(Model)
+	if m.editor.Value() != "hello!" {
+		t.Fatalf("expected hello!, got %q", m.editor.Value())
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlZ})
+	m = updated.(Model)
+	pos := m.cursorPos()
+	if m.editor.Value() != "hello" || pos.row != 0 || pos.col != 5 {
+		t.Fatalf("expected undo cursor at end of hello, value=%q pos=%+v", m.editor.Value(), pos)
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlY})
+	m = updated.(Model)
+	pos = m.cursorPos()
+	if m.editor.Value() != "hello!" || pos.row != 0 || pos.col != 6 {
+		t.Fatalf("expected redo cursor at end of hello!, value=%q pos=%+v", m.editor.Value(), pos)
+	}
+}

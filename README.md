@@ -4,13 +4,16 @@ A quiet, keyboard-first terminal notebook. Vnote stores every note as a normal M
 
 ## Features
 
-- Compact, bordered workbench layout inspired by high-density terminal tools
-- Multi-level folder tree
-- Markdown editing and rendered preview
-- Mouse clicks and wheel scrolling
+- Compact, bordered workbench layout with unified focus styling: active panels use the accent border, inactive panels and dialogs use muted borders
+- Multi-level folder tree with mouse clicks, wheel scrolling, and touch-friendly targets
+- Live Markdown editing with rendered preview, smart list continuation, and auto-indent
+- Undo/redo with cursor preservation, plus auto-save after two seconds of idle typing
 - One-key clipboard copy plus native terminal text selection mode
-- Touch-friendly top action bar in terminals that translate touch to mouse events
-- Create, rename, delete, refresh, and save without leaving the TUI
+- In-note search with highlighted matches, global search across all notes, and jump-to-line
+- Front-matter tags, tag filtering, and note templates for blank, daily, meeting, and book notes
+- Focus mode for distraction-free writing and session persistence across restarts
+- Export a note or a batch to the clipboard or a file, plus batch delete and batch tag editing
+- Command palette and a searchable, scrollable help overlay
 - No database or lock-in: data is ordinary `.md` files
 - Windows, Linux, macOS, and Termux support
 
@@ -38,23 +41,37 @@ vnote -dir /path/to/notes
 
 ## Controls
 
-| Action | Keyboard | Mouse / touch |
-|---|---|---|
-| Select note | `↑` / `↓`, `J` / `K` | Tap/click row |
-| Expand folder | `→`, `L`, `Enter` | Tap/click selected folder |
-| Collapse folder | `←`, `H` | Tap/click selected folder |
-| Switch panel | `Tab` | Tap/click either panel |
-| Edit / preview | `Ctrl+E` or `E` | Edit action |
-| Save | `Ctrl+S` or `S` | Save action |
-| Copy current Markdown | `Ctrl+C`, `Ctrl+Y`, or `Y` | Copy action |
-| Select preview text | `Ctrl+G` or `G` | Select action, then drag |
-| New note | `Ctrl+N` or `N` | New note action |
-| New folder | `Ctrl+D` or `D` | Folder action |
-| Rename | `F2` or `R` | Rename action |
-| Delete | `Delete` or `X` | Delete action |
-| Refresh | `Ctrl+R` | — |
-| Help | `?` | ? action |
-| Quit | `Ctrl+Q` or `Q` | Quit action |
+| Action | Keyboard |
+|---|---|
+| Select note | `↑` / `↓`, `J` / `K` |
+| Expand / collapse folder | `→` / `←`, `L` / `H`, `Enter` |
+| Switch panel | `Tab` |
+| New note (with template) | `Ctrl+N` |
+| New folder | `Ctrl+D` |
+| Rename | `F2`, `R` |
+| Delete | `Delete`, `X` |
+| Edit / preview | `Ctrl+E` |
+| Save | `Ctrl+S` |
+| Undo | `Ctrl+Z` |
+| Redo | `Ctrl+Shift+Z`, `Ctrl+Y` |
+| Copy current Markdown | `Ctrl+C`, `Ctrl+Y` |
+| Copy current line | `Ctrl+L` (edit mode) |
+| Select preview text | `Ctrl+G` |
+| Search note | `Ctrl+F` |
+| Search everywhere | `Ctrl+Shift+O` |
+| Go to line | `Alt+G` |
+| Edit tags | `Ctrl+Shift+T` |
+| Filter by tag | `#` |
+| Focus mode | `Ctrl+Shift+F` |
+| Command palette | `Ctrl+Shift+P` |
+| Toggle multi-select | `Space` |
+| Select all | `Ctrl+A` |
+| Clear selection | `Ctrl+Shift+A` |
+| Export | `Ctrl+Shift+E` |
+| Refresh | `Ctrl+R` |
+| Help | `?` |
+| Quit | `Ctrl+Q` |
+| Cancel / close | `Esc` |
 
 While editing, standard terminal text editing keys and `Ctrl+V` paste are available. Press `Esc` to return to preview.
 
@@ -65,6 +82,14 @@ While editing, standard terminal text editing keys and `Ctrl+V` paste are availa
 - Termux clipboard copy requires the Termux:API add-on and `termux-api` package when OSC 52 is unavailable.
 
 Terminal applications cannot receive the exact range selected by the terminal, so automatic copy-on-release is controlled by the terminal rather than Vnote.
+
+## Screenshots / Demo
+
+Vnote is a TUI, so the rendered interface is only visible inside a terminal emulator. To capture a demo, run the app with `./vnote` in a terminal that supports mouse events, then record the session with a tool such as `asciinema` or your terminal's screen recorder.
+
+The default workbench shows a `Lists` tree panel on the left and a `Note` preview/edit panel on the right. The top bar shows the active note and dirty state, and the bottom bar shows contextual shortcuts, status messages, edit position, or search results depending on the current mode. The searchable help overlay (`?`) documents every shortcut by category.
+
+Place captured screenshots or recordings in the repository and link them here to keep the README visual.
 
 ## Touch support
 

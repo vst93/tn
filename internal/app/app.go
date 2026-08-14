@@ -199,6 +199,21 @@ func containsTag(tags []string, query string) bool {
 	return false
 }
 
+func ensureTag(content, tag string) string {
+	tag = strings.TrimSpace(tag)
+	if tag == "" {
+		return content
+	}
+	meta, body := parseFrontMatter(content)
+	for _, existing := range meta.Tags {
+		if strings.EqualFold(existing, tag) {
+			return content
+		}
+	}
+	meta.Tags = append(meta.Tags, tag)
+	return writeFrontMatter(body, meta)
+}
+
 type toolbarItem struct{ label, action string }
 
 type copyResultMsg struct {
@@ -235,34 +250,48 @@ var helpGroupsData = []helpGroup{
 			{"←/→ or H/L", "Collapse / expand"},
 			{"Enter", "Open note"},
 			{"Tab", "Switch panel"},
-			{"Space", "Toggle select"},
+			{"Space", "Toggle multi-select"},
 			{"Ctrl+A / Ctrl+Shift+A", "Select all / clear"},
 		},
 	},
 	{
 		title: "Notes",
 		rows: []helpRow{
-			{"Ctrl+N", "New note"},
+			{"Ctrl+N", "New note + template"},
 			{"Ctrl+D", "New folder"},
-			{"F2", "Rename"},
-			{"Delete", "Delete"},
+			{"F2 or R", "Rename"},
+			{"Delete or X", "Delete"},
 			{"Ctrl+E", "Edit / preview"},
 			{"Ctrl+S", "Save"},
 			{"Ctrl+Z", "Undo"},
 			{"Ctrl+Shift+Z / Ctrl+Y", "Redo"},
 			{"Ctrl+Shift+T", "Edit tags"},
+			{"#", "Filter by tag"},
 			{"Ctrl+Shift+P", "Command palette"},
 		},
 	},
 	{
-		title: "Search & share",
+		title: "Copy",
 		rows: []helpRow{
-			{"Ctrl+F", "Search preview"},
+			{"Ctrl+C / Ctrl+Y", "Copy text"},
+			{"Ctrl+L", "Copy current line"},
+			{"Ctrl+G", "Select terminal text"},
+		},
+	},
+	{
+		title: "Search",
+		rows: []helpRow{
+			{"Ctrl+F", "Search note"},
 			{"Ctrl+Shift+O", "Search everywhere"},
 			{"Alt+G", "Go to line"},
-			{"Ctrl+G", "Select terminal text"},
-			{"Ctrl+L", "Copy current line"},
-			{"Ctrl+C / Ctrl+Y", "Copy text"},
+		},
+	},
+	{
+		title: "Batch & export",
+		rows: []helpRow{
+			{"Space", "Toggle multi-select"},
+			{"Ctrl+A", "Select all"},
+			{"Ctrl+Shift+A", "Clear selection"},
 			{"Ctrl+Shift+E", "Export"},
 		},
 	},
@@ -273,7 +302,7 @@ var helpGroupsData = []helpGroup{
 			{"Ctrl+R", "Refresh"},
 			{"Ctrl+Q", "Quit"},
 			{"?", "Help"},
-			{"Esc", "Close help"},
+			{"Esc", "Close / cancel"},
 		},
 	},
 }
@@ -312,6 +341,17 @@ type editorSel struct {
 	end    cursorPos
 }
 
+type editSnapshot struct {
+	content string
+	row     int
+	col     int
+}
+
+type editRecord struct {
+	before editSnapshot
+	after  editSnapshot
+}
+
 // Model is the Vnote Bubble Tea application.
 type Model struct {
 	store *storage.Store
@@ -332,8 +372,8 @@ type Model struct {
 	renderedPlain   string
 	renderedContent string
 	editSel         *editorSel
-	undoStack       []string
-	redoStack       []string
+	undoStack       []editRecord
+	redoStack       []editRecord
 	input           textinput.Model
 	promptKind      promptKind
 	beforePrompt    mode
@@ -386,10 +426,10 @@ type Model struct {
 	helpHintView viewport.Model
 	helpHintQ    string
 
-	commandBeforeMode  mode
+	commandBeforeMode   mode
 	commandBeforeActive pane
-	commandIndex       int
-	commandQuery       string
+	commandIndex        int
+	commandQuery        string
 }
 
 func New(store *storage.Store) Model {
@@ -598,6 +638,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.mode == modeEdit {
 			m.lastEditTime = time.Now()
 			before := m.editor.Value()
+			beforePos := m.cursorPos()
 			if plain, ok := editSelectionKey(msg); ok {
 				if m.editSel == nil {
 					pos := m.cursorPos()
@@ -609,7 +650,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			} else {
 				if msg.Type == tea.KeyEnter {
-					if m.handleEditEnter(before) {
+					if m.handleEditEnter(before, beforePos) {
 						m.editSel = nil
 						return m, nil
 					}
@@ -617,7 +658,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.editSel = nil
 				m.editor, cmd = m.editor.Update(msg)
 			}
-			m.recordEdit(before, m.editor.Value())
+			m.recordEdit(before, m.editor.Value(), beforePos, m.cursorPos())
 			return m, cmd
 		}
 		if m.active == treePane {
@@ -1299,36 +1340,41 @@ func (m Model) selectionText() string {
 	return b.String()
 }
 
-func (m *Model) recordEdit(before, after string) {
+func (m *Model) recordEdit(before, after string, beforePos, afterPos cursorPos) {
 	if before == after {
 		return
 	}
-	m.undoStack = append(m.undoStack, before)
+	m.undoStack = append(m.undoStack, editRecord{
+		before: editSnapshot{content: before, row: beforePos.row, col: beforePos.col},
+		after:  editSnapshot{content: after, row: afterPos.row, col: afterPos.col},
+	})
 	m.redoStack = m.redoStack[:0]
+}
+
+func (m *Model) applySnapshot(s editSnapshot) {
+	m.editor.SetValue(s.content)
+	m.editSel = nil
+	m.setCursor(s.row, s.col)
 }
 
 func (m *Model) undo() {
 	if m.mode != modeEdit || len(m.undoStack) == 0 {
 		return
 	}
-	m.redoStack = append(m.redoStack, m.editor.Value())
-	prev := m.undoStack[len(m.undoStack)-1]
+	rec := m.undoStack[len(m.undoStack)-1]
 	m.undoStack = m.undoStack[:len(m.undoStack)-1]
-	m.editor.SetValue(prev)
-	m.editSel = nil
-	m.editor.SetCursor(0)
+	m.redoStack = append(m.redoStack, rec)
+	m.applySnapshot(rec.before)
 }
 
 func (m *Model) redo() {
 	if m.mode != modeEdit || len(m.redoStack) == 0 {
 		return
 	}
-	m.undoStack = append(m.undoStack, m.editor.Value())
-	next := m.redoStack[len(m.redoStack)-1]
+	rec := m.redoStack[len(m.redoStack)-1]
 	m.redoStack = m.redoStack[:len(m.redoStack)-1]
-	m.editor.SetValue(next)
-	m.editSel = nil
-	m.editor.SetCursor(0)
+	m.undoStack = append(m.undoStack, rec)
+	m.applySnapshot(rec.after)
 }
 
 func (m Model) undoable() bool { return len(m.undoStack) > 0 }
@@ -1499,6 +1545,11 @@ func (m Model) updatePrompt(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if err != nil {
 			m.setStatus(err.Error(), true)
 			return m, nil
+		}
+		if m.promptKind == promptNote && m.tagFilter != "" {
+			if content, rerr := m.store.Read(path); rerr == nil {
+				_ = m.store.Write(path, ensureTag(content, m.tagFilter))
+			}
 		}
 		m.mode = modeNormal
 		m.input.Blur()
@@ -2476,19 +2527,19 @@ func (m *Model) restoreEditFocus() {
 	}
 }
 
-func (m *Model) handleEditEnter(before string) bool {
+func (m *Model) handleEditEnter(before string, beforePos cursorPos) bool {
 	pos := m.cursorPos()
 	line := m.currentLineText()
 	if pos.col < len([]rune(line)) {
 		return false
 	}
 	if m.handleListEnter() {
-		m.recordEdit(before, m.editor.Value())
+		m.recordEdit(before, m.editor.Value(), beforePos, m.cursorPos())
 		return true
 	}
 	if indent := leadingIndent(line); indent != "" {
 		m.editor.InsertString("\n" + indent)
-		m.recordEdit(before, m.editor.Value())
+		m.recordEdit(before, m.editor.Value(), beforePos, m.cursorPos())
 		return true
 	}
 	return false
@@ -3213,15 +3264,13 @@ func (m Model) View() string {
 		} else {
 			body = m.contentView(m.width)
 		}
-	} else if m.width >= 100 {
+	} else {
 		contentW := max(1, m.width-m.treeWidth-1)
 		body = lipgloss.JoinHorizontal(lipgloss.Top,
 			m.treeViewSides(m.treeWidth, true, false),
 			mutedSty.Render("│"),
 			m.contentViewSides(contentW, false, true),
 		)
-	} else {
-		body = lipgloss.JoinHorizontal(lipgloss.Top, m.treeView(m.treeWidth), m.contentView(m.width-m.treeWidth))
 	}
 	var bottom string
 	switch {
@@ -3617,7 +3666,7 @@ func (m Model) searchStatusView() string {
 	if len(m.searchMatches) == 0 {
 		right = errorSty.Render("No matches")
 	} else {
-		right = statusSty.Render(fmt.Sprintf("%d / %d matches", m.searchIndex+1, len(m.searchMatches)))
+		right = statusSty.Render(fmt.Sprintf("%d/%d matches", m.searchIndex+1, len(m.searchMatches)))
 	}
 	return m.composeBar(left, right)
 }
@@ -3742,10 +3791,17 @@ func (m Model) helpContent() string {
 		if len(rows) == 0 {
 			continue
 		}
+		maxKey := 0
+		for _, r := range rows {
+			if w := lipgloss.Width(r.keys); w > maxKey {
+				maxKey = w
+			}
+		}
 		b.WriteString(lipgloss.NewStyle().Foreground(accent).Bold(true).Render(g.title) + "\n")
 		for _, r := range rows {
 			total++
-			b.WriteString("  " + lipgloss.NewStyle().Foreground(accent).Render(r.keys) + "  " + mutedSty.Render(r.desc) + "\n")
+			pad := maxKey - lipgloss.Width(r.keys) + 2
+			b.WriteString("  " + lipgloss.NewStyle().Foreground(accent).Render(r.keys) + strings.Repeat(" ", pad) + mutedSty.Render(r.desc) + "\n")
 		}
 		b.WriteString("\n")
 	}
