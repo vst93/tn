@@ -83,6 +83,7 @@ type FrontMatter struct {
 	Title   string
 	Tags    []string
 	Created string
+	Pinned  bool
 }
 
 var noteTemplates = map[string]string{
@@ -131,6 +132,8 @@ func parseFrontMatter(content string) (FrontMatter, string) {
 			meta.Created = unquote(value)
 		case "tags":
 			meta.Tags = parseFrontTags(value)
+		case "pinned":
+			meta.Pinned = strings.EqualFold(strings.TrimSpace(value), "true")
 		}
 	}
 	return meta, strings.Join(lines[end+1:], "\n")
@@ -180,6 +183,9 @@ func writeFrontMatter(body string, meta FrontMatter) string {
 	}
 	if meta.Created != "" {
 		b.WriteString("created: " + meta.Created + "\n")
+	}
+	if meta.Pinned {
+		b.WriteString("pinned: true\n")
 	}
 	b.WriteString("---\n\n")
 	body = strings.TrimLeft(body, "\n")
@@ -250,6 +256,7 @@ var helpGroupsData = []helpGroup{
 			{"←/→ or H/L", "Collapse / expand"},
 			{"Enter", "Open note"},
 			{"Tab", "Switch panel"},
+			{"Alt+← / Alt+→", "Back / forward history"},
 			{"Space", "Toggle multi-select"},
 			{"Ctrl+A / Ctrl+Shift+A", "Select all / clear"},
 		},
@@ -261,6 +268,7 @@ var helpGroupsData = []helpGroup{
 			{"Ctrl+D", "New folder"},
 			{"F2 or R", "Rename"},
 			{"Delete or X", "Delete"},
+			{"*", "Pin / unpin note"},
 			{"Ctrl+E", "Edit / preview"},
 			{"Ctrl+S", "Save"},
 			{"Ctrl+Z", "Undo"},
@@ -401,6 +409,7 @@ type Model struct {
 
 	tagFilter       string
 	nodeTags        map[string][]string
+	nodePinned      map[string]bool
 	templateIndex   int
 	pendingTemplate string
 
@@ -430,6 +439,9 @@ type Model struct {
 	commandBeforeActive pane
 	commandIndex        int
 	commandQuery        string
+
+	history      []string
+	historyIndex int
 }
 
 func New(store *storage.Store) Model {
@@ -457,6 +469,7 @@ func New(store *storage.Store) Model {
 		store:         store,
 		expanded:      make(map[string]bool),
 		nodeTags:      make(map[string][]string),
+		nodePinned:    make(map[string]bool),
 		selectedItems: make(map[string]bool),
 		active:        treePane,
 		mode:          modeNormal,
@@ -784,9 +797,6 @@ func (m *Model) globalKey(key string) (handled, quit bool) {
 	case "y":
 		m.copyCurrent()
 		return true, false
-	case "g":
-		m.enterSelectionMode()
-		return true, false
 	case "q":
 		if m.dirty() {
 			m.setStatus("Save or discard changes before quitting", true)
@@ -794,6 +804,21 @@ func (m *Model) globalKey(key string) (handled, quit bool) {
 		}
 		m.saveSession()
 		return true, true
+	case "alt+left":
+		if m.mode == modeEdit {
+			return false, false
+		}
+		m.goBack()
+		return true, false
+	case "alt+right":
+		if m.mode == modeEdit {
+			return false, false
+		}
+		m.goForward()
+		return true, false
+	case "*":
+		m.togglePinned()
+		return true, false
 	case "ctrl+shift+o":
 		m.startGlobalSearch()
 		return true, false
@@ -1097,18 +1122,20 @@ func copyCmd(copier func(string) error, content string) tea.Cmd {
 }
 
 func copyFeedback(content string) string {
-	if len([]rune(content)) == 0 {
+	chars := len([]rune(content))
+	if chars == 0 {
 		return "✓ Copied empty note"
 	}
 	display := strings.Join(strings.Fields(content), " ")
-	n := len([]rune(content))
-	if n <= 40 {
-		return "✓ Copied: " + display
+	words := len(strings.Fields(content))
+	switch {
+	case chars <= 40:
+		return "✓ Copied " + display
+	case chars <= 120:
+		return fmt.Sprintf("✓ Copied %d chars: %s…", chars, truncate(display, 36))
+	default:
+		return fmt.Sprintf("✓ Copied %d chars · %d words", chars, words)
 	}
-	if n <= 120 {
-		return "✓ Copied: " + truncate(display, 40) + "..."
-	}
-	return fmt.Sprintf("✓ Copied %d chars", n)
 }
 
 func (m *Model) startExport() {
@@ -1446,13 +1473,26 @@ func (m *Model) openSelectedNote() {
 	if path == m.currentPath {
 		return
 	}
-	if m.dirty() && !m.save() {
+	if !m.openPath(path) {
 		return
+	}
+	m.pushHistory(path)
+	m.flashStatus("Opened "+path, false, 2*time.Second)
+}
+
+// openPath loads a note into the editor and preview without recording history.
+// It returns false when the note cannot be opened or an active save fails.
+func (m *Model) openPath(path string) bool {
+	if path == "" {
+		return false
+	}
+	if m.dirty() && !m.save() {
+		return false
 	}
 	content, err := m.store.Read(path)
 	if err != nil {
 		m.setStatus(err.Error(), true)
-		return
+		return false
 	}
 	m.currentPath = path
 	m.original = content
@@ -1460,10 +1500,102 @@ func (m *Model) openSelectedNote() {
 	m.undoStack = nil
 	m.redoStack = nil
 	m.editSel = nil
+	m.expandParents(path)
+	m.rebuildFlat()
+	m.selectPath(path)
 	m.setEditorBackground(bg)
 	m.preview.GotoTop()
 	m.renderMarkdown()
-	m.flashStatus("Opened "+path, false, 2*time.Second)
+	return true
+}
+
+func (m *Model) pushHistory(path string) {
+	if len(m.history) > 0 && m.history[m.historyIndex] == path {
+		return
+	}
+	if m.historyIndex < len(m.history)-1 {
+		m.history = m.history[:m.historyIndex+1]
+	}
+	m.history = append(m.history, path)
+	m.historyIndex = len(m.history) - 1
+	if len(m.history) > 100 {
+		m.history = m.history[1:]
+		m.historyIndex--
+	}
+}
+
+func (m *Model) goBack() {
+	if m.historyIndex <= 0 {
+		m.flashStatus("No earlier note", true, 2*time.Second)
+		return
+	}
+	m.historyIndex--
+	if m.dirty() && !m.save() {
+		m.historyIndex++
+		return
+	}
+	if !m.openPath(m.history[m.historyIndex]) {
+		m.historyIndex++
+	}
+}
+
+func (m *Model) goForward() {
+	if m.historyIndex >= len(m.history)-1 {
+		m.flashStatus("No newer note", true, 2*time.Second)
+		return
+	}
+	m.historyIndex++
+	if m.dirty() && !m.save() {
+		m.historyIndex--
+		return
+	}
+	if !m.openPath(m.history[m.historyIndex]) {
+		m.historyIndex--
+	}
+}
+
+func (m *Model) togglePinned() {
+	if len(m.flat) == 0 {
+		m.flashStatus("Select a note to pin", true, 2*time.Second)
+		return
+	}
+	n := m.flat[m.selected].node
+	if n.IsDir {
+		m.flashStatus("Only notes can be pinned", true, 2*time.Second)
+		return
+	}
+	path := n.RelPath
+	content := ""
+	if path == m.currentPath {
+		content = m.editor.Value()
+	} else {
+		var err error
+		content, err = m.store.Read(path)
+		if err != nil {
+			m.setStatus(err.Error(), true)
+			return
+		}
+	}
+	meta, body := parseFrontMatter(content)
+	meta.Pinned = !meta.Pinned
+	newContent := writeFrontMatter(body, meta)
+	if err := m.store.Write(path, newContent); err != nil {
+		m.setStatus(err.Error(), true)
+		return
+	}
+	if path == m.currentPath {
+		m.editor.SetValue(newContent)
+		m.original = newContent
+		m.renderMarkdown()
+	}
+	m.nodePinned[path] = meta.Pinned
+	m.rebuildFlat()
+	m.selectPath(path)
+	state := "unpinned"
+	if meta.Pinned {
+		state = "pinned"
+	}
+	m.flashStatus(state+" "+path, false, 2*time.Second)
 }
 
 func (m *Model) collapseOrParent() {
@@ -1703,6 +1835,7 @@ func (m *Model) saveBatchTags(raw string) {
 			continue
 		}
 		m.nodeTags[path] = tags
+		m.nodePinned[path] = meta.Pinned
 		count++
 	}
 	if count == 0 {
@@ -1747,6 +1880,7 @@ func (m *Model) saveTags(raw string) {
 	m.mode = modeEdit
 	m.renderMarkdown()
 	m.nodeTags[m.currentPath] = meta.Tags
+	m.nodePinned[m.currentPath] = meta.Pinned
 	m.rebuildFlat()
 	m.flashStatus("Tags saved", false, 2*time.Second)
 }
@@ -1970,6 +2104,7 @@ func (m *Model) save() bool {
 	m.redoStack = m.redoStack[:0]
 	meta, _ := parseFrontMatter(content)
 	m.nodeTags[m.currentPath] = meta.Tags
+	m.nodePinned[m.currentPath] = meta.Pinned
 	if m.tagFilter != "" {
 		m.rebuildFlat()
 	}
@@ -1996,6 +2131,7 @@ func (m *Model) autoSave() bool {
 	m.redoStack = m.redoStack[:0]
 	meta, _ := parseFrontMatter(content)
 	m.nodeTags[m.currentPath] = meta.Tags
+	m.nodePinned[m.currentPath] = meta.Pinned
 	if m.tagFilter != "" {
 		m.rebuildFlat()
 	}
@@ -2162,7 +2298,7 @@ func (m *Model) runGlobalSearch(query string) {
 			}
 			for li, line := range strings.Split(content, "\n") {
 				if strings.Contains(strings.ToLower(line), q) {
-					results = append(results, globalSearchResult{path: n.RelPath, title: title, snippet: strings.TrimSpace(line), lineNum: li + 1})
+					results = append(results, globalSearchResult{path: n.RelPath, title: title, snippet: searchSnippet(line, q, 56), lineNum: li + 1})
 				}
 				if len(results) >= 20 {
 					break
@@ -2190,23 +2326,10 @@ func (m *Model) openGlobalSearchResult() {
 		return
 	}
 	r := m.globalSearchResults[m.globalSearchIndex]
-	if m.dirty() && !m.save() {
+	if !m.openPath(r.path) {
 		return
 	}
-	content, err := m.store.Read(r.path)
-	if err != nil {
-		m.setStatus(err.Error(), true)
-		return
-	}
-	m.currentPath = r.path
-	m.original = content
-	m.editor.SetValue(content)
-	m.undoStack = nil
-	m.redoStack = nil
-	m.editSel = nil
-	m.expandParents(r.path)
-	m.rebuildFlat()
-	m.selectPath(r.path)
+	m.pushHistory(r.path)
 	mode := m.beforeGlobalSearch
 	m.mode = mode
 	m.active = contentPane
@@ -2258,12 +2381,44 @@ func (m Model) globalSearchResultRow(r globalSearchResult, selected bool) string
 	} else {
 		title = lipgloss.NewStyle().Foreground(text).Bold(true).Render(r.title)
 	}
+	line := ""
+	if r.lineNum > 0 {
+		line = mutedSty.Render(" · " + fmt.Sprintf("%d", r.lineNum))
+	}
 	snippet := highlightKeyword(r.snippet, m.globalSearchQuery)
-	row := title + "   " + snippet
+	row := title + line + "   " + snippet
 	if selected {
 		row = lipgloss.NewStyle().Background(selection).Foreground(text).Render(row)
 	}
 	return row
+}
+
+func searchSnippet(line, query string, max int) string {
+	line = strings.TrimSpace(line)
+	q := strings.ToLower(query)
+	if q == "" {
+		return truncate(line, max)
+	}
+	idx := strings.Index(strings.ToLower(line), q)
+	if idx < 0 {
+		return truncate(line, max)
+	}
+	start := idx - max/3
+	if start < 0 {
+		start = 0
+	}
+	end := idx + len(q) + max*2/3
+	if end > len(line) {
+		end = len(line)
+	}
+	snippet := strings.TrimSpace(line[start:end])
+	if start > 0 {
+		snippet = "…" + snippet
+	}
+	if end < len(line) {
+		snippet = snippet + "…"
+	}
+	return snippet
 }
 
 func (m Model) bottomOverlay(content string) string {
@@ -2608,8 +2763,10 @@ func (m *Model) rebuildFlat() {
 				}
 				continue
 			}
-			tags := m.tagsForNode(n)
+			meta := m.nodeMeta(n)
+			tags := meta.Tags
 			m.nodeTags[n.RelPath] = tags
+			m.nodePinned[n.RelPath] = meta.Pinned
 			if filter != "" && !containsTag(tags, filter) {
 				continue
 			}
@@ -2628,6 +2785,9 @@ func (m *Model) sortedNodes(nodes []*storage.Node) []*storage.Node {
 			if sorted[i].IsDir != sorted[j].IsDir {
 				return sorted[i].IsDir
 			}
+			if m.nodePinned[sorted[i].RelPath] != m.nodePinned[sorted[j].RelPath] {
+				return m.nodePinned[sorted[i].RelPath]
+			}
 			return m.nodeModTime(sorted[i]).After(m.nodeModTime(sorted[j]))
 		})
 	case sortByCreated:
@@ -2635,12 +2795,18 @@ func (m *Model) sortedNodes(nodes []*storage.Node) []*storage.Node {
 			if sorted[i].IsDir != sorted[j].IsDir {
 				return sorted[i].IsDir
 			}
+			if m.nodePinned[sorted[i].RelPath] != m.nodePinned[sorted[j].RelPath] {
+				return m.nodePinned[sorted[i].RelPath]
+			}
 			return m.nodeCreatedTime(sorted[i]).After(m.nodeCreatedTime(sorted[j]))
 		})
 	default:
 		sort.SliceStable(sorted, func(i, j int) bool {
 			if sorted[i].IsDir != sorted[j].IsDir {
 				return sorted[i].IsDir
+			}
+			if m.nodePinned[sorted[i].RelPath] != m.nodePinned[sorted[j].RelPath] {
+				return m.nodePinned[sorted[i].RelPath]
 			}
 			return strings.ToLower(sorted[i].Name) < strings.ToLower(sorted[j].Name)
 		})
@@ -2669,13 +2835,13 @@ func (m *Model) nodeCreatedTime(n *storage.Node) time.Time {
 	return m.nodeModTime(n)
 }
 
-func (m *Model) tagsForNode(n *storage.Node) []string {
+func (m *Model) nodeMeta(n *storage.Node) FrontMatter {
 	content, err := m.store.Read(n.RelPath)
 	if err != nil {
-		return nil
+		return FrontMatter{}
 	}
 	meta, _ := parseFrontMatter(content)
-	return meta.Tags
+	return meta
 }
 
 func (m Model) tagsRow(tags []string, width int) string {
@@ -3295,7 +3461,7 @@ func (m Model) bodyRenderHeight() int {
 }
 
 func (m Model) headerView() string {
-	brand := brandSty.Render("◆ vnote")
+	brand := lipgloss.NewStyle().Foreground(accent).Bold(true).Render("◆ vnote")
 	tabs := m.headerTabs()
 	left := brand + "  " + tabs
 
@@ -3333,7 +3499,7 @@ func (m Model) headerTabs() string {
 
 func (m Model) toolbarItems() []toolbarItem {
 	items := []toolbarItem{
-		{"? help", "help"}, {"# tag", "tagfilter"}, {"n note", "note"}, {"d folder", "folder"}, {"e edit", "edit"}, {"s save", "save"}, {"y copy", "copy"}, {"g select", "select"}, {"r rename", "rename"}, {"x delete", "delete"}, {"q quit", "quit"},
+		{"? help", "help"}, {"# tag", "tagfilter"}, {"n note", "note"}, {"d folder", "folder"}, {"e edit", "edit"}, {"s save", "save"}, {"y copy", "copy"}, {"^G select", "select"}, {"r rename", "rename"}, {"x delete", "delete"}, {"q quit", "quit"},
 	}
 	if m.compact {
 		label := "→ note"
@@ -3398,10 +3564,10 @@ func (m Model) treeViewSides(width int, leftB, rightB bool) string {
 	var lines []string
 	rows := m.treeRows()
 	end := min(len(m.flat), m.treeOffset+rows)
+	accentText := lipgloss.NewStyle().Foreground(accent)
 	for i := m.treeOffset; i < end; i++ {
 		item := m.flat[i]
 		indent := strings.Repeat("  ", item.depth)
-		accentText := lipgloss.NewStyle().Foreground(accent)
 		textName := lipgloss.NewStyle().Foreground(text).Bold(true)
 		var label string
 		if item.node.IsDir {
@@ -3417,13 +3583,16 @@ func (m Model) treeViewSides(width int, leftB, rightB bool) string {
 			}
 			name := strings.TrimSuffix(item.node.Name, filepath.Ext(item.node.Name))
 			label = mark + mutedSty.Render(name)
+			if m.nodePinned[item.node.RelPath] {
+				label = mark + accentText.Render("★ ") + mutedSty.Render(name)
+			}
 			if count := len(m.nodeTags[item.node.RelPath]); count > 0 {
 				label = label + " " + lipgloss.NewStyle().Foreground(accent).Bold(true).Render(fmt.Sprintf("#%d", count))
 			}
 		}
 		row := " " + indent + label
 		if i == m.selected {
-			row = accentText.Render("▸") + indent + label
+			row = accentText.Render("▸ ") + indent + label
 			row = truncateANSI(row, innerWidth)
 			row = lipgloss.NewStyle().Background(selection).Foreground(text).Bold(true).Width(innerWidth).Render(row)
 		} else {
@@ -3432,7 +3601,11 @@ func (m Model) treeViewSides(width int, leftB, rightB bool) string {
 		lines = append(lines, row)
 	}
 	if len(m.flat) == 0 {
-		lines = append(lines, mutedSty.Render("  No notes"), mutedSty.Render("  Press n to create one"))
+		lines = append(lines,
+			mutedSty.Render("  No notes here yet"),
+			accentText.Render("  n  create note"),
+			accentText.Render("  d  create folder"),
+		)
 	}
 	return borderedPanelPart(title, strings.Join(lines, "\n"), width, m.bodyRenderHeight(), focused, leftB, rightB)
 }
@@ -3449,6 +3622,9 @@ func (m Model) contentViewSides(width int, leftB, rightB bool) string {
 	}
 	if m.currentPath != "" {
 		title += " · " + filepath.Base(m.currentPath)
+		if m.nodePinned[m.currentPath] {
+			title += " ★"
+		}
 	}
 
 	// Metadata line (replaces old Details panel)
@@ -3463,11 +3639,11 @@ func (m Model) contentViewSides(width int, leftB, rightB bool) string {
 			modeName = "edit"
 		}
 		content := m.editor.Value()
-		words := len(strings.Fields(content))
+		words := wordCount(content)
 		meta = " " + mutedSty.Render("  "+m.currentPath) + "   " +
 			lipgloss.NewStyle().Foreground(accent).Bold(true).Render(state) + "   " +
 			mutedSty.Render(modeName) + "   " +
-			mutedSty.Render(fmt.Sprintf("%d words", words)) + "\n"
+			mutedSty.Render(fmt.Sprintf("%d words · ~%s read", words, readingTimeEstimate(content))) + "\n"
 		if tags := m.nodeTags[m.currentPath]; len(tags) > 0 {
 			inner := max(1, width)
 			if leftB {
@@ -3482,7 +3658,8 @@ func (m Model) contentViewSides(width int, leftB, rightB bool) string {
 
 	var content string
 	if m.currentPath == "" {
-		content = "\n" + mutedSty.Render(" Select a note from Lists or press n to create one.")
+		content = "\n" + mutedSty.Render("  No note open")
+		content += "\n" + lipgloss.NewStyle().Foreground(accent).Render("  ↑/↓ choose a note · n create one")
 	} else if m.mode == modeEdit {
 		content = m.editor.View()
 	} else {
@@ -3623,6 +3800,9 @@ func (m Model) shortcutBar() string {
 		return m.editShortcutBar()
 	}
 	right := m.statusText(m.status)
+	if right == "" && m.currentPath != "" && m.nodePinned[m.currentPath] {
+		right = lipgloss.NewStyle().Foreground(accent).Render("★ pinned")
+	}
 	return m.composeBar(m.toolbarShortcut(m.width-lipgloss.Width(right)-2), right)
 }
 
@@ -3769,7 +3949,7 @@ func (m Model) updateHelp(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m *Model) renderHelpContent() {
 	w := m.helpBoxWidth()
 	m.helpHintView.Width = max(10, w-6)
-	m.helpHintView.Height = max(3, m.height-10)
+	m.helpHintView.Height = max(3, m.height-8)
 	m.helpHintView.SetContent(m.helpContent())
 }
 
@@ -3962,6 +4142,30 @@ func (m Model) commandView() string {
 	}
 	b.WriteString("\n\n" + mutedSty.Render("↑/↓ select · Enter run · Esc close"))
 	return m.bottomOverlay(b.String())
+}
+
+func wordCount(s string) int {
+	count := len(strings.Fields(s))
+	for _, r := range s {
+		if isCJK(r) {
+			count++
+		}
+	}
+	return count
+}
+
+func isCJK(r rune) bool {
+	return (r >= 0x4E00 && r <= 0x9FFF) ||
+		(r >= 0x3400 && r <= 0x4DBF) ||
+		(r >= 0x3040 && r <= 0x30FF)
+}
+
+func readingTimeEstimate(s string) string {
+	words := wordCount(s)
+	if words < 200 {
+		return "<1 min"
+	}
+	return fmt.Sprintf("%d min", (words+199)/200)
 }
 
 func truncate(s string, width int) string {

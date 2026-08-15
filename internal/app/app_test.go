@@ -1772,3 +1772,157 @@ func TestUndoRedoRestoresCursorPosition(t *testing.T) {
 		t.Fatalf("expected redo cursor at end of hello!, value=%q pos=%+v", m.editor.Value(), pos)
 	}
 }
+
+func TestPinTogglePersistsAndSorts(t *testing.T) {
+	store := storage.New(t.TempDir())
+	alpha, err := store.CreateNote("", "alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	beta, err := store.CreateNote("", "beta")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	m := New(store)
+	m.resize(100, 30)
+	m.selectPath(beta)
+	m.togglePinned()
+
+	content, err := store.Read(beta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(content, "pinned: true") {
+		t.Fatalf("expected pinned front matter, got %q", content)
+	}
+	if !m.nodePinned[beta] {
+		t.Fatal("expected beta recorded as pinned")
+	}
+	if m.flat[0].node.RelPath != beta {
+		t.Fatalf("expected pinned note first, got %q", m.flat[0].node.RelPath)
+	}
+	if view := stripANSI(m.treeView(100)); !strings.Contains(view, "★ beta") {
+		t.Fatalf("expected pin marker in tree, got %q", view)
+	}
+
+	m.togglePinned()
+	content, err = store.Read(beta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(content, "pinned: true") {
+		t.Fatalf("expected unpinned content, got %q", content)
+	}
+	if m.flat[0].node.RelPath != alpha {
+		t.Fatalf("expected name order after unpin, got %q", m.flat[0].node.RelPath)
+	}
+}
+
+func TestPinShortcutHandledOutsideEditMode(t *testing.T) {
+	store := storage.New(t.TempDir())
+	note, err := store.CreateNote("", "pin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := New(store)
+	m.resize(100, 30)
+	m.selectPath(note)
+	m.openSelectedNote()
+	if handled, _ := m.globalKey("*"); !handled {
+		t.Fatal("expected * to be handled in preview mode")
+	}
+	m.toggleEdit()
+	if handled, _ := m.globalKey("*"); handled {
+		t.Fatal("expected * to remain a literal character in edit mode")
+	}
+}
+
+func TestBackForwardHistory(t *testing.T) {
+	store := storage.New(t.TempDir())
+	alpha, err := store.CreateNote("", "alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	beta, err := store.CreateNote("", "beta")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	m := New(store)
+	m.resize(100, 30)
+	m.selectPath(alpha)
+	m.openSelectedNote()
+	m.selectPath(beta)
+	m.openSelectedNote()
+	if m.currentPath != beta || len(m.history) != 2 || m.historyIndex != 1 {
+		t.Fatalf("unexpected history after opening two notes: current=%q history=%v index=%d", m.currentPath, m.history, m.historyIndex)
+	}
+
+	if handled, _ := m.globalKey("alt+left"); !handled {
+		t.Fatal("expected Alt+Left to be handled")
+	}
+	if m.currentPath != alpha || m.historyIndex != 0 {
+		t.Fatalf("expected back to alpha, got current=%q index=%d", m.currentPath, m.historyIndex)
+	}
+	if handled, _ := m.globalKey("alt+right"); !handled {
+		t.Fatal("expected Alt+Right to be handled")
+	}
+	if m.currentPath != beta || m.historyIndex != 1 {
+		t.Fatalf("expected forward to beta, got current=%q index=%d", m.currentPath, m.historyIndex)
+	}
+}
+
+func TestGKeyMovesToTreeTopWithoutSelectionMode(t *testing.T) {
+	store := storage.New(t.TempDir())
+	if _, err := store.CreateNote("", "alpha"); err != nil {
+		t.Fatal(err)
+	}
+	beta, err := store.CreateNote("", "beta")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := New(store)
+	m.resize(100, 30)
+	m.selectPath(beta)
+	if m.selected == 0 {
+		t.Fatal("expected beta to be selected")
+	}
+	if handled, _ := m.globalKey("g"); handled {
+		t.Fatal("expected g not to be a global selection shortcut")
+	}
+	m.active = treePane
+	m.treeKey("g")
+	if m.selected != 0 {
+		t.Fatalf("expected g to jump to tree top, got index %d", m.selected)
+	}
+}
+
+func TestReadingTimeEstimate(t *testing.T) {
+	if got := readingTimeEstimate(""); got != "<1 min" {
+		t.Fatalf("expected <1 min for empty note, got %q", got)
+	}
+	if got := readingTimeEstimate("one two three"); got != "<1 min" {
+		t.Fatalf("expected <1 min for short note, got %q", got)
+	}
+	var b strings.Builder
+	for i := 0; i < 400; i++ {
+		b.WriteString("word ")
+	}
+	if got := readingTimeEstimate(b.String()); got != "2 min" {
+		t.Fatalf("expected 2 min for 400 words, got %q", got)
+	}
+	if wordCount("你好 world") <= len(strings.Fields("你好 world")) {
+		t.Fatalf("expected CJK characters to count toward words, got %d", wordCount("你好 world"))
+	}
+}
+
+func TestSearchSnippetShowsMatchWindow(t *testing.T) {
+	s := searchSnippet("prefix filler needle tail after", "needle", 20)
+	if !strings.Contains(s, "needle") {
+		t.Fatalf("expected match in snippet, got %q", s)
+	}
+	if !strings.HasPrefix(s, "…") {
+		t.Fatalf("expected leading context marker, got %q", s)
+	}
+}
