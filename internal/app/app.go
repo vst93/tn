@@ -489,6 +489,10 @@ func New(store *storage.Store) Model {
 	}
 	m.preview.MouseWheelEnabled = true
 	m.preview.MouseWheelDelta = 2
+	// Preview paging: Space page down, B page up (Shift+F / Shift+B also work).
+	// Lowercase f stays bound to find-in-note via globalKey.
+	m.preview.KeyMap.PageDown.SetKeys("pgdown", " ", "F")
+	m.preview.KeyMap.PageUp.SetKeys("pgup", "B", "b")
 	m.helpHintView.MouseWheelEnabled = true
 	m.helpHintView.MouseWheelDelta = 2
 	m.refresh("")
@@ -1050,7 +1054,7 @@ func (m *Model) handleMouse(msg tea.MouseEvent) {
 		}
 		if msg.Button == tea.MouseButtonLeft {
 			row := msg.Y - 2 + m.treeOffset
-			if row >= 0 && row < len(m.flat) {
+			if row >= m.treeOffset && row < min(len(m.flat), m.treeOffset+m.treeRows()) {
 				m.selected = row
 				if m.flat[row].node.IsDir {
 					m.activateSelected()
@@ -1187,14 +1191,27 @@ func copyFeedback(content string) string {
 	if chars == 0 {
 		return "✓ Copied empty note"
 	}
+	lines := strings.Count(content, "\n") + 1
+	if strings.HasSuffix(content, "\n") {
+		lines--
+	}
 	display := strings.Join(strings.Fields(content), " ")
 	words := len(strings.Fields(content))
 	switch {
 	case chars <= 40:
+		if lines > 1 {
+			return fmt.Sprintf("✓ Copied %d lines: %s…", lines, truncate(display, 36))
+		}
 		return "✓ Copied " + display
 	case chars <= 120:
+		if lines > 1 {
+			return fmt.Sprintf("✓ Copied %d lines · %d chars: %s…", lines, chars, truncate(display, 36))
+		}
 		return fmt.Sprintf("✓ Copied %d chars: %s…", chars, truncate(display, 36))
 	default:
+		if lines > 1 {
+			return fmt.Sprintf("✓ Copied %d lines · %d chars · %d words", lines, chars, words)
+		}
 		return fmt.Sprintf("✓ Copied %d chars · %d words", chars, words)
 	}
 }
@@ -2898,7 +2915,7 @@ func (m Model) globalSearchView() string {
 			b.WriteString("\n" + m.globalSearchResultRow(r, i == m.globalSearchIndex))
 		}
 	}
-	b.WriteString("\n\n" + mutedSty.Render("↑/↓ select · Enter open · Esc cancel"))
+	b.WriteString("\n\n" + mutedSty.Render("Type to search · ↑/↓ select · Enter to go to line · Esc to close"))
 	return m.bottomOverlay(b.String())
 }
 
@@ -3114,7 +3131,7 @@ func (m *Model) startGotoLine() {
 	m.mode = modePrompt
 	m.statusErr = false
 	m.input.SetValue("")
-	m.input.Placeholder = "line number"
+	m.input.Placeholder = "Line number:"
 	m.input.Prompt = "Go to line: "
 	m.input.Width = max(8, min(20, m.width-14))
 	m.input.Focus()

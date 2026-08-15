@@ -2331,3 +2331,90 @@ func TestResultListHomeEndNavigation(t *testing.T) {
 		t.Fatalf("expected End to jump to last command, got %d", m.commandIndex)
 	}
 }
+
+func TestPreviewPageKeysAndFeedback(t *testing.T) {
+	store := storage.New(t.TempDir())
+	note, err := store.CreateNote("", "page-keys")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var lines []string
+	for i := 0; i < 200; i++ {
+		lines = append(lines, fmt.Sprintf("line %d of the note body", i))
+	}
+
+	m := New(store)
+	m.resize(100, 30)
+	m.selectPath(note)
+	m.openSelectedNote()
+	m.editor.SetValue(strings.Join(lines, "\n"))
+	m.renderMarkdown()
+	m.switchToContent()
+
+	if m.preview.YOffset != 0 {
+		t.Fatalf("expected preview to start at top, got offset %d", m.preview.YOffset)
+	}
+
+	// Visual feedback: progress bar must be present for a long note.
+	status := m.readingStatus()
+	if !strings.Contains(status, "▱") || !strings.Contains(status, "%") {
+		t.Fatalf("expected progress bar in reading status, got %q", status)
+	}
+
+	// Space -> page down.
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{' '}})
+	m = updated.(Model)
+	if m.preview.YOffset == 0 {
+		t.Fatal("Space should page down in preview")
+	}
+	afterSpace := m.preview.YOffset
+
+	// The percent-read feedback must change after paging.
+	pctOriginal := m.previewPercent()
+	if pctOriginal == 0 {
+		t.Fatal("expected non-zero read percentage after paging down")
+	}
+	if !strings.Contains(m.readingStatus(), "▰") {
+		t.Fatalf("expected filled progress bar after paging down, got %q", m.readingStatus())
+	}
+
+	// B (shift+b) -> page up.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'B'}})
+	m = updated.(Model)
+	if m.preview.YOffset >= afterSpace {
+		t.Fatalf("B should page up, offset %d -> %d", afterSpace, m.preview.YOffset)
+	}
+
+	// b (lowercase) -> page up as well.
+	// Page back down first so we're not already at the top.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{' '}})
+	m = updated.(Model)
+	if m.preview.YOffset == 0 {
+		t.Fatal("Space should page down before testing b")
+	}
+	beforeB := m.preview.YOffset
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'b'}})
+	m = updated.(Model)
+	if m.preview.YOffset >= beforeB {
+		t.Fatalf("b should page up, offset %d -> %d", beforeB, m.preview.YOffset)
+	}
+
+	// F (shift+f) -> page down, and must NOT open search.
+	beforeF := m.preview.YOffset
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'F'}})
+	m = updated.(Model)
+	if m.preview.YOffset <= beforeF {
+		t.Fatalf("F should page down, offset %d -> %d", beforeF, m.preview.YOffset)
+	}
+	if m.mode != modeNormal {
+		t.Fatalf("F must not start search, mode=%v", m.mode)
+	}
+
+	// Lowercase f keeps its find-in-note meaning (regression).
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'f'}})
+	m = updated.(Model)
+	if m.mode != modeSearch {
+		t.Fatalf("f should start search, mode=%v", m.mode)
+	}
+}
