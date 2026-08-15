@@ -78,6 +78,32 @@ func TestCompactToolbarHitTargets(t *testing.T) {
 	}
 }
 
+func TestHeaderTabClickTargets(t *testing.T) {
+	m := New(storage.New(t.TempDir()))
+	m.resize(100, 30)
+
+	if p, ok := m.headerTabAt(13); !ok || p != treePane {
+		t.Fatalf("expected Notes tab at x=13, got pane=%v ok=%v", p, ok)
+	}
+	if p, ok := m.headerTabAt(23); !ok || p != contentPane {
+		t.Fatalf("expected Preview tab at x=23, got pane=%v ok=%v", p, ok)
+	}
+	if _, ok := m.headerTabAt(0); ok {
+		t.Fatal("expected no tab at x=0")
+	}
+	if _, ok := m.headerTabAt(60); ok {
+		t.Fatal("expected no tab at x=60")
+	}
+
+	m.mode = modeEdit
+	if p, ok := m.headerTabAt(28); !ok || p != contentPane {
+		t.Fatalf("expected Edit tab at x=28, got pane=%v ok=%v", p, ok)
+	}
+	if _, ok := m.headerTabAt(31); ok {
+		t.Fatal("expected x=31 outside the Edit tab in edit mode")
+	}
+}
+
 func TestCopyCurrentUsesMarkdownAndReportsResult(t *testing.T) {
 	store := storage.New(t.TempDir())
 	note, err := store.CreateNote("", "copy-me")
@@ -1173,7 +1199,7 @@ func TestTreeShowsTagCount(t *testing.T) {
 	}
 }
 
-func TestNewNoteTemplateFlow(t *testing.T) {
+func TestCtrlNStartsBlankNote(t *testing.T) {
 	store := storage.New(t.TempDir())
 	m := New(store)
 	m.resize(100, 30)
@@ -1181,57 +1207,22 @@ func TestNewNoteTemplateFlow(t *testing.T) {
 	if handled, _ := m.globalKey("ctrl+n"); !handled {
 		t.Fatal("expected Ctrl+N to be handled")
 	}
-	if m.mode != modeTemplate {
-		t.Fatalf("expected template mode, got %v", m.mode)
-	}
-	if view := stripANSI(m.templateView()); !strings.Contains(view, "选择模板") || !strings.Contains(view, "4. 读书笔记") {
-		t.Fatalf("unexpected template view %q", view)
-	}
-
-	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'2'}})
-	m = updated.(Model)
-	if m.templateIndex != 1 {
-		t.Fatalf("expected daily template selected, got %d", m.templateIndex)
-	}
-	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
-	m = updated.(Model)
 	if m.mode != modePrompt || m.promptKind != promptNote {
 		t.Fatalf("expected note name prompt, mode=%v kind=%v", m.mode, m.promptKind)
 	}
 
-	m.input.SetValue("standup")
-	updated, _ = m.updatePrompt(tea.KeyMsg{Type: tea.KeyEnter})
-	m = updated.(Model)
-	if m.mode != modeEdit {
-		t.Fatalf("expected edit mode after creating note, got %v", m.mode)
-	}
-	content, err := store.Read(m.currentPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if content != noteTemplates["daily"] {
-		t.Fatalf("expected daily template content, got %q", content)
-	}
-	if m.pendingTemplate != "" {
-		t.Fatalf("expected pending template to be consumed, got %q", m.pendingTemplate)
-	}
-}
-
-func TestBlankTemplateUsesTitle(t *testing.T) {
-	store := storage.New(t.TempDir())
-	m := New(store)
-	m.resize(100, 30)
-	m.startTemplate()
-	m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	m.input.SetValue("scratch")
 	updated, _ := m.updatePrompt(tea.KeyMsg{Type: tea.KeyEnter})
 	m = updated.(Model)
+	if m.mode != modeEdit {
+		t.Fatalf("expected edit mode after creating a note, got %v", m.mode)
+	}
 	content, err := store.Read(m.currentPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if content != "# scratch\n\n" {
-		t.Fatalf("expected blank template with title, got %q", content)
+		t.Fatalf("expected blank note content, got %q", content)
 	}
 }
 
@@ -1615,8 +1606,8 @@ func TestCommandPaletteNewNote(t *testing.T) {
 	updated, _ := m.updateCommand(tea.KeyMsg{Type: tea.KeyEnter})
 	m = updated.(Model)
 
-	if m.mode != modeTemplate {
-		t.Fatalf("expected New note command to open template, got %v", m.mode)
+	if m.mode != modePrompt || m.promptKind != promptNote {
+		t.Fatalf("expected New note command to open note prompt, mode=%v kind=%v", m.mode, m.promptKind)
 	}
 }
 
@@ -1684,9 +1675,7 @@ func TestTagFilterNewNoteInheritsFilterTag(t *testing.T) {
 		t.Fatalf("expected filter active after confirm, mode=%v filter=%q", m.mode, m.tagFilter)
 	}
 
-	m.startTemplate()
-	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
-	m = updated.(Model)
+	m.startPrompt(promptNote)
 	m.input.SetValue("task")
 	updated, _ = m.updatePrompt(tea.KeyMsg{Type: tea.KeyEnter})
 	m = updated.(Model)

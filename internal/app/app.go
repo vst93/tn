@@ -58,7 +58,6 @@ const (
 	modeQuickOpen
 	modeTag
 	modeTagFilter
-	modeTemplate
 	modeCommand
 )
 
@@ -90,22 +89,6 @@ type FrontMatter struct {
 	Tags    []string
 	Created string
 	Pinned  bool
-}
-
-var noteTemplates = map[string]string{
-	"blank":   "# {{title}}\n\n",
-	"daily":   "## 今日完成\n\n\n## 明日计划\n\n\n## 问题/阻塞\n\n",
-	"meeting": "## 参会人\n\n\n## 议题\n\n\n## 结论\n\n\n## 待办\n\n",
-	"book":    "## 书名\n\n\n## 作者\n\n\n## 核心观点\n\n\n## 摘录\n\n\n## 我的思考\n\n",
-}
-
-var noteTemplateNames = []string{"blank", "daily", "meeting", "book"}
-
-var noteTemplateLabels = map[string]string{
-	"blank":   "空白笔记",
-	"daily":   "日报",
-	"meeting": "会议记录",
-	"book":    "读书笔记",
 }
 
 // parseFrontMatter extracts YAML metadata from the top of a note. When the
@@ -272,7 +255,7 @@ var helpGroupsData = []helpGroup{
 	{
 		title: "Notes",
 		rows: []helpRow{
-			{"Ctrl+N", "New note + template"},
+			{"Ctrl+N", "New note"},
 			{"Ctrl+D", "New folder"},
 			{"F2 or R", "Rename"},
 			{"Delete or X", "Delete"},
@@ -434,8 +417,6 @@ type Model struct {
 	tagFilter       string
 	nodeTags        map[string][]string
 	nodePinned      map[string]bool
-	templateIndex   int
-	pendingTemplate string
 
 	renderer      *glamour.TermRenderer
 	rendererWidth int
@@ -667,9 +648,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.mode == modeTagFilter {
 			return m.updateTagFilter(msg)
 		}
-		if m.mode == modeTemplate {
-			return m.updateTemplate(msg)
-		}
 		if m.mode == modeCommand {
 			return m.updateCommand(msg)
 		}
@@ -811,7 +789,7 @@ func (m *Model) globalKey(key string) (handled, quit bool) {
 		m.startHTMLExport()
 		return true, false
 	case "ctrl+n":
-		m.startTemplate()
+		m.startPrompt(promptNote)
 		return true, false
 	case "ctrl+d":
 		m.startPrompt(promptDir)
@@ -826,7 +804,7 @@ func (m *Model) globalKey(key string) (handled, quit bool) {
 		m.startPrompt(promptRename)
 		return true, false
 	case "n":
-		m.startTemplate()
+		m.startPrompt(promptNote)
 		return true, false
 	case "d":
 		m.startPrompt(promptDir)
@@ -1007,10 +985,12 @@ func (m *Model) handleMouse(msg tea.MouseEvent) {
 		return
 	}
 	if msg.Y == 0 && msg.Button == tea.MouseButtonLeft {
-		if msg.X >= 10 && msg.X < 20 {
-			m.switchToTree()
-		} else if msg.X >= 20 && msg.X < 34 {
-			m.switchToContent()
+		if p, ok := m.headerTabAt(msg.X); ok {
+			if p == treePane {
+				m.switchToTree()
+			} else {
+				m.switchToContent()
+			}
 		}
 		return
 	}
@@ -1062,7 +1042,7 @@ func (m *Model) handleMouse(msg tea.MouseEvent) {
 func (m *Model) runAction(action string) {
 	switch action {
 	case "note":
-		m.startTemplate()
+		m.startPrompt(promptNote)
 	case "tagfilter":
 		m.startTagFilter()
 	case "folder":
@@ -1992,13 +1972,6 @@ func (m Model) updatePrompt(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		switch m.promptKind {
 		case promptNote:
 			path, err = m.store.CreateNote(m.selectedParent(), value)
-			if err == nil && m.pendingTemplate != "" {
-				if tmpl, ok := noteTemplates[m.pendingTemplate]; ok {
-					title := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
-					_ = m.store.Write(path, strings.ReplaceAll(tmpl, "{{title}}", title))
-				}
-				m.pendingTemplate = ""
-			}
 		case promptDir:
 			path, err = m.store.CreateDir(m.selectedParent(), value)
 		case promptRename:
@@ -2031,50 +2004,6 @@ func (m Model) updatePrompt(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	m.input, cmd = m.input.Update(msg)
 	return m, cmd
-}
-
-func (m *Model) startTemplate() {
-	m.templateIndex = 0
-	m.pendingTemplate = ""
-	m.mode = modeTemplate
-	m.statusErr = false
-	m.status = ""
-}
-
-func (m Model) updateTemplate(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
-	case "esc":
-		m.mode = modeNormal
-		return m, nil
-	case "1", "2", "3", "4":
-		idx, _ := strconv.Atoi(msg.String())
-		m.templateIndex = idx - 1
-		return m, nil
-	case "enter":
-		if m.templateIndex < 0 || m.templateIndex >= len(noteTemplateNames) {
-			m.setStatus("Select a template first", true)
-			return m, nil
-		}
-		m.pendingTemplate = noteTemplateNames[m.templateIndex]
-		m.mode = modeNormal
-		m.startPrompt(promptNote)
-		return m, nil
-	}
-	return m, nil
-}
-
-func (m Model) templateView() string {
-	var b strings.Builder
-	b.WriteString(brandSty.Render("选择模板") + "\n\n")
-	for i, key := range noteTemplateNames {
-		marker := "  "
-		if i == m.templateIndex {
-			marker = "▸ "
-		}
-		b.WriteString(marker + fmt.Sprintf("%d. %s\n", i+1, noteTemplateLabels[key]))
-	}
-	b.WriteString("\n" + mutedSty.Render("1-4 选择 · Enter 确认 · Esc 取消"))
-	return m.bottomOverlay(b.String())
 }
 
 func (m *Model) startTagEdit() {
@@ -3962,9 +3891,6 @@ func (m Model) View() string {
 	if m.mode == modeQuickOpen {
 		return m.quickOpenView()
 	}
-	if m.mode == modeTemplate {
-		return m.templateView()
-	}
 	if m.mode == modeTag {
 		return m.tagEditView()
 	}
@@ -4036,6 +3962,25 @@ func (m Model) headerView() string {
 	space := max(1, m.width-lipgloss.Width(left)-lipgloss.Width(right)-2)
 	line := " " + left + strings.Repeat(" ", space) + right
 	return headerSty.Width(m.width).MaxHeight(1).Render(line)
+}
+
+// headerTabAt maps a header-row x-coordinate to the pane tab it hits. It
+// mirrors headerView's layout so clicks stay aligned when labels change.
+func (m Model) headerTabAt(x int) (pane, bool) {
+	notesStart := 1 + lipgloss.Width("◆ vnote") + lipgloss.Width("  │  ")
+	notesW := lipgloss.Width(" 1 Notes ")
+	contentStart := notesStart + notesW + 1
+	contentW := lipgloss.Width(" 2 Preview ")
+	if m.mode == modeEdit {
+		contentW = lipgloss.Width(" 2 Edit ")
+	}
+	if x >= notesStart && x < notesStart+notesW {
+		return treePane, true
+	}
+	if x >= contentStart && x < contentStart+contentW {
+		return contentPane, true
+	}
+	return treePane, false
 }
 
 func (m Model) headerTabs() string {
@@ -4158,9 +4103,9 @@ func (m Model) treeViewSides(width int, leftB, rightB bool) string {
 	}
 	if len(m.flat) == 0 {
 		lines = append(lines,
-			mutedSty.Render("  No notes here yet"),
-			accentText.Render("  n  create note"),
-			accentText.Render("  d  create folder"),
+			"  "+mutedSty.Render("No notes yet"),
+			"",
+			"  "+accentText.Render("n")+mutedSty.Render(" new note")+"   "+accentText.Render("d")+mutedSty.Render(" new folder"),
 		)
 	}
 	return borderedPanelPart(title, strings.Join(lines, "\n"), width, m.bodyRenderHeight(), focused, leftB, rightB)
@@ -4223,7 +4168,7 @@ func (m Model) contentViewSides(width int, leftB, rightB bool) string {
 	var content string
 	if m.currentPath == "" {
 		content = "\n" + mutedSty.Render("  No note open")
-		content += "\n" + lipgloss.NewStyle().Foreground(accent).Render("  ↑/↓ choose a note · n create one")
+		content += "\n" + lipgloss.NewStyle().Foreground(accent).Render("  ↑/↓ choose a note · n new note")
 	} else if m.mode == modeEdit {
 		content = m.editor.View()
 	} else {
@@ -4667,7 +4612,7 @@ func (m *Model) commandList() []command {
 			}
 			m.startHTMLExport()
 		}},
-		{"New note", m.startTemplate},
+		{"New note", func() { m.startPrompt(promptNote) }},
 		{"New folder", func() { m.startPrompt(promptDir) }},
 		{"Rename", func() { m.startPrompt(promptRename) }},
 		{"Delete", m.startDelete},

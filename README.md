@@ -10,7 +10,7 @@ A quiet, keyboard-first terminal notebook. Vnote stores every note as a normal M
 - Undo/redo with cursor preservation, plus auto-save after two seconds of idle typing
 - One-key clipboard copy plus native terminal text selection mode
 - In-note search with highlighted matches, global search across all notes, and jump-to-line
-- Front-matter tags, tag filtering, and note templates for blank, daily, meeting, and book notes
+- Front-matter tags and tag filtering
 - Pin favorite notes to the top of the tree, with reading-time estimates per note
 - Quick-open any note by name or path with `Ctrl+O`, with a recent-notes list when the query is empty, plus per-note stats and scroll-based reading progress
 - Back/forward note history for fast navigation between recently opened notes
@@ -51,7 +51,7 @@ vnote -dir /path/to/notes
 | Switch panel | `Tab` |
 | Back / forward history | `Alt+←` / `Alt+→` |
 | Quick open note | `Ctrl+O` |
-| New note (with template) | `Ctrl+N` |
+| New note | `Ctrl+N` |
 | New folder | `Ctrl+D` |
 | Pin / unpin note | `*` |
 | Rename | `F2`, `R` |
