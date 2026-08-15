@@ -4216,8 +4216,7 @@ func (m Model) contentViewSides(width int, leftB, rightB bool) string {
 
 	var content string
 	if m.currentPath == "" {
-		content = "\n" + mutedSty.Render("  No note open")
-		content += "\n" + lipgloss.NewStyle().Foreground(accent).Render("  ↑/↓ choose a note · n new note")
+		content = "\n" + mutedSty.Render("  Select a note from the tree, or press n to create one.")
 	} else if m.mode == modeEdit {
 		content = m.editor.View()
 	} else {
