@@ -28,7 +28,7 @@ import (
 	"github.com/yuin/goldmark"
 	"github.com/yuin/goldmark/extension"
 
-	"github.com/vst93/vnote/internal/storage"
+	"github.com/vst93/tn/internal/storage"
 )
 
 var (
@@ -255,8 +255,8 @@ var helpGroupsData = []helpGroup{
 	{
 		title: "Notes",
 		rows: []helpRow{
-			{"Ctrl+N", "New note"},
-			{"Ctrl+D", "New folder"},
+			{"n / Ctrl+N", "New note"},
+			{"N / Ctrl+D", "New folder"},
 			{"F2 or R", "Rename"},
 			{"Delete or X", "Delete"},
 			{"*", "Pin / unpin note"},
@@ -359,7 +359,7 @@ type editRecord struct {
 	after  editSnapshot
 }
 
-// Model is the Vnote Bubble Tea application.
+// Model is the TN Bubble Tea application.
 type Model struct {
 	store *storage.Store
 
@@ -501,7 +501,7 @@ func defaultSessionPath() string {
 	if err != nil {
 		return ""
 	}
-	return filepath.Join(home, ".vnote", "session.json")
+	return filepath.Join(home, ".tn", "session.json")
 }
 
 func (m Model) restoreSession() Model {
@@ -806,7 +806,7 @@ func (m *Model) globalKey(key string) (handled, quit bool) {
 	case "n":
 		m.startPrompt(promptNote)
 		return true, false
-	case "d":
+	case "N":
 		m.startPrompt(promptDir)
 		return true, false
 	case "e":
@@ -1538,7 +1538,7 @@ footer { margin-top: 28px; color: var(--muted); font-size: 12px; }
 <main>
 {{.Body}}
 </main>
-<footer>Exported from vnote · Markdown</footer>
+<footer>Exported from TN · Markdown</footer>
 </article>
 </div>
 </body>
@@ -2444,7 +2444,8 @@ func (m Model) focusView() string {
 		body = m.preview.View()
 	}
 	body = lipgloss.Place(m.width, max(1, m.height-2), lipgloss.Center, lipgloss.Top, body)
-	return topLine + "\n" + body + "\n" + bottomLine
+	view := topLine + "\n" + body + "\n" + bottomLine
+	return lipgloss.NewStyle().Background(bg).Width(m.width).Height(m.height).Render(view)
 }
 
 func (m Model) inNoteSearchFocusView() string {
@@ -3816,7 +3817,7 @@ func decorateCodeBlocks(rendered string, width int) string {
 	lines := strings.Split(rendered, "\n")
 	var out []string
 	inCode := false
-	codeBg := termansi.Style{}.BackgroundColor(termansi.TrueColor(0x1B1E2B)).String()
+	codeBg := termansi.Style{}.BackgroundColor(termansi.TrueColor(surfaceRGB)).String()
 	border := mutedSty.Render(strings.Repeat("─", width))
 	for _, line := range lines {
 		plain := stripANSI(line)
@@ -3874,7 +3875,7 @@ func (m *Model) flashStatus(message string, isError bool, d time.Duration) tea.C
 
 func (m Model) View() string {
 	if m.width <= 1 || m.height <= 1 {
-		return "Vnote"
+		return "TN"
 	}
 	if m.mode == modeHelp {
 		return m.helpView()
@@ -3914,9 +3915,10 @@ func (m Model) View() string {
 		}
 	} else {
 		contentW := max(1, m.width-m.treeWidth-1)
+		separator := strings.Repeat("│\n", m.bodyRenderHeight()-1) + "│"
 		body = lipgloss.JoinHorizontal(lipgloss.Top,
 			m.treeViewSides(m.treeWidth, true, false),
-			mutedSty.Render("│"),
+			mutedSty.Render(separator),
 			m.contentViewSides(contentW, false, true),
 		)
 	}
@@ -3943,7 +3945,7 @@ func (m Model) bodyRenderHeight() int {
 }
 
 func (m Model) headerView() string {
-	brand := lipgloss.NewStyle().Foreground(accent).Bold(true).Render("◆ vnote")
+	brand := lipgloss.NewStyle().Foreground(accent).Bold(true).Render("◆ tn")
 	tabs := m.headerTabs()
 	left := brand + mutedSty.Render("  │  ") + tabs
 
@@ -3967,7 +3969,7 @@ func (m Model) headerView() string {
 // headerTabAt maps a header-row x-coordinate to the pane tab it hits. It
 // mirrors headerView's layout so clicks stay aligned when labels change.
 func (m Model) headerTabAt(x int) (pane, bool) {
-	notesStart := 1 + lipgloss.Width("◆ vnote") + lipgloss.Width("  │  ")
+	notesStart := 1 + lipgloss.Width("◆ tn") + lipgloss.Width("  │  ")
 	notesW := lipgloss.Width(" 1 Notes ")
 	contentStart := notesStart + notesW + 1
 	contentW := lipgloss.Width(" 2 Preview ")
@@ -4000,7 +4002,7 @@ func (m Model) headerTabs() string {
 
 func (m Model) toolbarItems() []toolbarItem {
 	items := []toolbarItem{
-		{"? help", "help"}, {"# tag", "tagfilter"}, {"n note", "note"}, {"d folder", "folder"}, {"e edit", "edit"}, {"s save", "save"}, {"y copy", "copy"}, {"^G select", "select"}, {"r rename", "rename"}, {"x delete", "delete"}, {"q quit", "quit"},
+		{"? help", "help"}, {"# tag", "tagfilter"}, {"n note", "note"}, {"N folder", "folder"}, {"e edit", "edit"}, {"s save", "save"}, {"y copy", "copy"}, {"^G select", "select"}, {"r rename", "rename"}, {"x delete", "delete"}, {"q quit", "quit"},
 	}
 	if m.compact {
 		label := "→ note"
@@ -4105,7 +4107,7 @@ func (m Model) treeViewSides(width int, leftB, rightB bool) string {
 		lines = append(lines,
 			"  "+mutedSty.Render("No notes yet"),
 			"",
-			"  "+accentText.Render("n")+mutedSty.Render(" new note")+"   "+accentText.Render("d")+mutedSty.Render(" new folder"),
+			"  "+accentText.Render("n")+mutedSty.Render(" new note")+"   "+accentText.Render("N")+mutedSty.Render(" new folder"),
 		)
 	}
 	return borderedPanelPart(title, strings.Join(lines, "\n"), width, m.bodyRenderHeight(), focused, leftB, rightB)
@@ -4507,7 +4509,7 @@ func (m Model) helpContent() string {
 
 func (m Model) helpView() string {
 	var b strings.Builder
-	b.WriteString(brandSty.Render("Vnote shortcuts") + "\n\n")
+	b.WriteString(brandSty.Render("TN shortcuts") + "\n\n")
 	b.WriteString("  " + m.input.View() + "\n\n")
 	b.WriteString(m.helpHintView.View())
 	b.WriteString("\n\n" + mutedSty.Render("↑/↓ / mouse scroll · Esc close"))

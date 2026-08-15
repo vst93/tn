@@ -22,13 +22,13 @@ type Store struct {
 	Root string
 }
 
-// DefaultRoot returns the platform-specific user home with .vnote appended.
+// DefaultRoot returns the platform-specific user home with .tn appended.
 func DefaultRoot() (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("find user home: %w", err)
 	}
-	return filepath.Join(home, ".vnote"), nil
+	return filepath.Join(home, ".tn"), nil
 }
 
 func New(root string) *Store {

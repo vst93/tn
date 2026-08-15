@@ -7,19 +7,19 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/vst93/vnote/internal/app"
-	"github.com/vst93/vnote/internal/storage"
+	"github.com/vst93/tn/internal/app"
+	"github.com/vst93/tn/internal/storage"
 )
 
 var version = "dev"
 
 func main() {
-	rootFlag := flag.String("dir", "", "notebook directory (default: ~/.vnote)")
+	rootFlag := flag.String("dir", "", "notebook directory (default: ~/.tn)")
 	showVersion := flag.Bool("version", false, "print version")
 	flag.Parse()
 
 	if *showVersion {
-		fmt.Println("vnote", version)
+		fmt.Println("tn", version)
 		return
 	}
 
@@ -43,6 +43,6 @@ func main() {
 }
 
 func fatal(err error) {
-	fmt.Fprintln(os.Stderr, "vnote:", err)
+	fmt.Fprintln(os.Stderr, "tn:", err)
 	os.Exit(1)
 }

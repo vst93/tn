@@ -1,6 +1,6 @@
-# Vnote
+# TN
 
-A quiet, keyboard-first terminal notebook. Vnote stores every note as a normal Markdown file under `~/.vnote`, with directories preserved as the notebook tree.
+A quiet, keyboard-first terminal notebook. TN stores every note as a normal Markdown file under `~/.tn`, with directories preserved as the notebook tree.
 
 ## Features
 
@@ -25,21 +25,21 @@ A quiet, keyboard-first terminal notebook. Vnote stores every note as a normal M
 Requires Go 1.23 or newer.
 
 ```sh
-go install github.com/vst93/vnote@latest
-vnote
+go install github.com/vst93/tn@latest
+tn
 ```
 
 From this repository:
 
 ```sh
-go build -o vnote .
-./vnote
+go build -o tn .
+./tn
 ```
 
 Use a different notebook directory when needed:
 
 ```sh
-vnote -dir /path/to/notes
+tn -dir /path/to/notes
 ```
 
 ## Controls
@@ -51,8 +51,8 @@ vnote -dir /path/to/notes
 | Switch panel | `Tab` |
 | Back / forward history | `Alt+←` / `Alt+→` |
 | Quick open note | `Ctrl+O` |
-| New note | `Ctrl+N` |
-| New folder | `Ctrl+D` |
+| New note | `n`, `Ctrl+N` |
+| New folder | `N`, `Ctrl+D` |
 | Pin / unpin note | `*` |
 | Rename | `F2`, `R` |
 | Delete | `Delete`, `X` |
@@ -91,15 +91,15 @@ While editing, standard terminal text editing keys and `Ctrl+V` paste are availa
 
 ### Copying text
 
-- Press `Ctrl+C` (or `Ctrl+Y`) or choose **Copy** to copy the complete current Markdown source automatically. Vnote uses the native system clipboard when available and falls back to the OSC 52 terminal clipboard protocol.
-- Press `Ctrl+G` or choose **Select** to temporarily release mouse control to the terminal. Drag across rendered preview text, then use the terminal's copy behavior. Many terminals automatically copy on selection; others use their normal copy shortcut. Press any key to restore Vnote mouse handling.
+- Press `Ctrl+C` (or `Ctrl+Y`) or choose **Copy** to copy the complete current Markdown source automatically. TN uses the native system clipboard when available and falls back to the OSC 52 terminal clipboard protocol.
+- Press `Ctrl+G` or choose **Select** to temporarily release mouse control to the terminal. Drag across rendered preview text, then use the terminal's copy behavior. Many terminals automatically copy on selection; others use their normal copy shortcut. Press any key to restore TN mouse handling.
 - Termux clipboard copy requires the Termux:API add-on and `termux-api` package when OSC 52 is unavailable.
 
-Terminal applications cannot receive the exact range selected by the terminal, so automatic copy-on-release is controlled by the terminal rather than Vnote.
+Terminal applications cannot receive the exact range selected by the terminal, so automatic copy-on-release is controlled by the terminal rather than TN.
 
 ## Screenshots / Demo
 
-Vnote is a TUI, so the rendered interface is only visible inside a terminal emulator. To capture a demo, run the app with `./vnote` in a terminal that supports mouse events, then record the session with a tool such as `asciinema` or your terminal's screen recorder.
+TN is a TUI, so the rendered interface is only visible inside a terminal emulator. To capture a demo, run the app with `./tn` in a terminal that supports mouse events, then record the session with a tool such as `asciinema` or your terminal's screen recorder.
 
 The default workbench shows a `Lists` tree panel on the left and a `Note` preview/edit panel on the right. The top bar shows the active note and dirty state, and the bottom bar shows contextual shortcuts, status messages, edit position, or search results depending on the current mode. The searchable help overlay (`?`) documents every shortcut by category.
 
@@ -107,13 +107,13 @@ Place captured screenshots or recordings in the repository and link them here to
 
 ## Touch support
 
-Terminal protocols expose mouse events, not a portable native touch API. Vnote uses broad row targets and a persistent action bar, so taps and scrolling work when the terminal translates touch into mouse input. This includes common Termux terminal setups. Native gestures such as pinch-to-zoom are terminal-specific and are not available through Bubble Tea.
+Terminal protocols expose mouse events, not a portable native touch API. TN uses broad row targets and a persistent action bar, so taps and scrolling work when the terminal translates touch into mouse input. This includes common Termux terminal setups. Native gestures such as pinch-to-zoom are terminal-specific and are not available through Bubble Tea.
 
 ## Data
 
 The default notebook path is:
 
-- Linux, macOS, Termux: `$HOME/.vnote`
-- Windows: `%USERPROFILE%\\.vnote`
+- Linux, macOS, Termux: `$HOME/.tn`
+- Windows: `%USERPROFILE%\\.tn`
 
 Only `.md` files are shown. Hidden files and non-Markdown files remain untouched.

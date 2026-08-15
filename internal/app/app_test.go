@@ -11,7 +11,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/vst93/vnote/internal/storage"
+	"github.com/vst93/tn/internal/storage"
 )
 
 func TestModelKeyboardAndMouseFlow(t *testing.T) {
@@ -61,6 +61,48 @@ func TestModelKeyboardAndMouseFlow(t *testing.T) {
 	}
 }
 
+func TestSplitViewSeparatorVisible(t *testing.T) {
+	store := storage.New(t.TempDir())
+	note, err := store.CreateNote("", "sep")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := New(store)
+	m.resize(100, 30)
+	if m.compact {
+		t.Fatal("expected split layout at width 100")
+	}
+	m.selectPath(note)
+	m.openSelectedNote()
+	lines := strings.Split(stripANSI(m.View()), "\n")
+	for i := 1; i <= m.bodyHeight; i++ {
+		runes := []rune(lines[i])
+		if m.treeWidth >= len(runes) || string(runes[m.treeWidth]) != "│" {
+			t.Fatalf("line %d missing separator at col %d: %q", i, m.treeWidth, lines[i])
+		}
+	}
+}
+
+func TestNoteAndFolderShortcuts(t *testing.T) {
+	m := New(storage.New(t.TempDir()))
+	m.resize(100, 30)
+
+	if handled, _ := m.globalKey("n"); !handled {
+		t.Fatal("expected n to be handled")
+	}
+	if m.mode != modePrompt || m.promptKind != promptNote {
+		t.Fatalf("expected note prompt from n, mode=%v kind=%v", m.mode, m.promptKind)
+	}
+
+	m.mode = modeNormal
+	if handled, _ := m.globalKey("N"); !handled {
+		t.Fatal("expected N to be handled")
+	}
+	if m.mode != modePrompt || m.promptKind != promptDir {
+		t.Fatalf("expected folder prompt from N, mode=%v kind=%v", m.mode, m.promptKind)
+	}
+}
+
 func TestCompactToolbarHitTargets(t *testing.T) {
 	m := New(storage.New(t.TempDir()))
 	m.resize(60, 24)
@@ -96,8 +138,8 @@ func TestHeaderTabClickTargets(t *testing.T) {
 	}
 
 	m.mode = modeEdit
-	if p, ok := m.headerTabAt(28); !ok || p != contentPane {
-		t.Fatalf("expected Edit tab at x=28, got pane=%v ok=%v", p, ok)
+	if p, ok := m.headerTabAt(24); !ok || p != contentPane {
+		t.Fatalf("expected Edit tab at x=24, got pane=%v ok=%v", p, ok)
 	}
 	if _, ok := m.headerTabAt(31); ok {
 		t.Fatal("expected x=31 outside the Edit tab in edit mode")
@@ -804,7 +846,7 @@ func TestFocusModeTogglesAndRendersFullScreen(t *testing.T) {
 	if !strings.Contains(view, "Esc 退出专注") {
 		t.Fatalf("expected focus hint in view, got %q", view)
 	}
-	if strings.Contains(view, "◆ vnote") {
+	if strings.Contains(view, "◆ tn") {
 		t.Fatal("expected header to be hidden in focus mode")
 	}
 

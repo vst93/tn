@@ -1,4 +1,4 @@
-BINARY := vnote
+BINARY := tn
 VERSION ?= dev
 LDFLAGS := -s -w -X main.version=$(VERSION)
 

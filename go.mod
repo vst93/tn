@@ -1,4 +1,4 @@
-module github.com/vst93/vnote
+module github.com/vst93/tn
 
 go 1.23
 

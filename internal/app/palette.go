@@ -16,6 +16,9 @@ const (
 	dangerColor    = "#EF7996"
 )
 
+// surfaceRGB mirrors surfaceColor for true-color termansi backgrounds.
+const surfaceRGB = 0x1B1E2B
+
 var (
 	bg        = lipgloss.Color(bgColor)
 	surface   = lipgloss.Color(surfaceColor)
