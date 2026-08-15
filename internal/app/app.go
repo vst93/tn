@@ -863,7 +863,7 @@ func (m *Model) globalKey(key string) (handled, quit bool) {
 		m.refresh(m.selectedPath())
 		m.flashStatus("Notebook refreshed", false, 2*time.Second)
 		return true, false
-	case "ctrl+f":
+	case "ctrl+f", "f":
 		if m.mode == modeEdit {
 			return false, false
 		}
@@ -1067,6 +1067,8 @@ func (m *Model) runAction(action string) {
 		m.toggleEdit()
 	case "copy":
 		m.copyCurrent()
+	case "find":
+		m.startSearch()
 	case "select":
 		m.enterSelectionMode()
 	case "save":
@@ -1956,11 +1958,11 @@ func (m *Model) startPrompt(kind promptKind) {
 	m.input.SetValue("")
 	switch kind {
 	case promptNote:
-		m.input.Placeholder = "note name"
+		m.input.Placeholder = "New note:"
 	case promptDir:
-		m.input.Placeholder = "folder name"
+		m.input.Placeholder = "New folder:"
 	case promptRename:
-		m.input.Placeholder = "new name"
+		m.input.Placeholder = "New name:"
 		m.input.SetValue(m.flat[m.selected].node.Name)
 	}
 	m.input.Width = max(20, min(60, m.width-12))
@@ -4018,7 +4020,7 @@ func (m Model) headerTabs() string {
 
 func (m Model) toolbarItems() []toolbarItem {
 	items := []toolbarItem{
-		{"? help", "help"}, {"# tag", "tagfilter"}, {"n note", "note"}, {"N folder", "folder"}, {"e edit", "edit"}, {"s save", "save"}, {"y copy", "copy"}, {"^G select", "select"}, {"r rename", "rename"}, {"x delete", "delete"}, {"q quit", "quit"},
+		{"? help", "help"}, {"# tag", "tagfilter"}, {"n note", "note"}, {"N folder", "folder"}, {"e edit/save", "edit"}, {"s save", "save"}, {"y copy", "copy"}, {"f find", "find"}, {"^G select", "select"}, {"r rename", "rename"}, {"x delete", "delete"}, {"q quit", "quit"},
 	}
 	if m.compact {
 		label := "→ note"
@@ -4328,7 +4330,7 @@ func (m Model) toolbarBudget() int {
 	if right == "" {
 		right = m.readingStatus()
 	}
-	return max(0, m.width-lipgloss.Width(right)-2)
+	return max(0, m.width-lipgloss.Width(right)-4)
 }
 
 func (m Model) shortcutBar() string {
@@ -4417,7 +4419,7 @@ func (m Model) dialogView() string {
 			body = "Delete “" + m.confirm + "” and all contents?"
 		} else {
 			title = "Delete note"
-			body = "Delete “" + m.confirm + "”?"
+			body = "Delete this note “" + m.confirm + "”?"
 		}
 		body += "\n\n" + dangerStyle("Enter / Y  确认删除") + "    " + mutedSty.Render("Esc / N  取消")
 	} else {
