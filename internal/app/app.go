@@ -248,6 +248,7 @@ var helpGroupsData = []helpGroup{
 			{"Tab", "Switch panel"},
 			{"Alt+← / Alt+→", "Back / forward history"},
 			{"F / B", "Page preview down / up"},
+			{"f", "Find in note"},
 		},
 	},
 	{
@@ -4190,9 +4191,9 @@ func (m Model) contentViewSides(width int, leftB, rightB bool) string {
 	// Metadata line (replaces old Details panel)
 	var meta string
 	if m.currentPath != "" {
-		state := lipgloss.NewStyle().Foreground(green).Render("saved")
+		state := lipgloss.NewStyle().Foreground(green).Bold(true).Render("saved")
 		if m.dirty() {
-			state = lipgloss.NewStyle().Foreground(danger).Render("unsaved")
+			state = lipgloss.NewStyle().Foreground(danger).Bold(true).Render("unsaved")
 		}
 		modeName := "preview"
 		if m.mode == modeEdit {
@@ -4204,7 +4205,7 @@ func (m Model) contentViewSides(width int, leftB, rightB bool) string {
 		lines := lineCountOf(content)
 		stats := fmt.Sprintf("%d words · %d chars · %d lines · ~%s read", words, chars, lines, readingTimeEstimate(content))
 		metaLine := " " + mutedSty.Render(m.currentPath) + "   " +
-			lipgloss.NewStyle().Foreground(accent).Bold(true).Render(state) + "   " +
+			state + "   " +
 			mutedSty.Render(modeName) + "   " +
 			mutedSty.Render(stats)
 		meta = truncateANSI(metaLine, max(1, innerWidth-2)) + "\n"
@@ -4446,7 +4447,7 @@ func (m Model) dialogView() string {
 			body = "Delete “" + m.confirm + "” and all contents?"
 		} else {
 			title = "Delete note"
-			body = "Delete this note “" + m.confirm + "”?"
+			body = "Delete “" + m.confirm + "”?"
 		}
 		body += "\n\n" + dangerStyle("Enter / Y  确认删除") + "    " + mutedSty.Render("Esc / N  取消")
 	} else {
