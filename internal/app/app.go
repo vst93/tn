@@ -1209,10 +1209,14 @@ func copyFeedback(content string) string {
 		}
 		return fmt.Sprintf("✓ Copied %d chars: %s…", chars, truncate(display, 36))
 	default:
-		if lines > 1 {
-			return fmt.Sprintf("✓ Copied %d lines · %d chars · %d words", lines, chars, words)
+		wordLabel := "words"
+		if words == 1 {
+			wordLabel = "word"
 		}
-		return fmt.Sprintf("✓ Copied %d chars · %d words", chars, words)
+		if lines > 1 {
+			return fmt.Sprintf("✓ Copied %d lines · %d chars · %d %s", lines, chars, words, wordLabel)
+		}
+		return fmt.Sprintf("✓ Copied %d chars · %d %s", chars, words, wordLabel)
 	}
 }
 
@@ -2259,7 +2263,7 @@ func (m Model) updateTagFilter(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) tagFilterBarView() string {
-	return lipgloss.NewStyle().Background(surface).Foreground(text).Width(m.width).MaxHeight(1).Render(" # " + m.input.View())
+	return m.composeBar(" # "+m.input.View(), mutedSty.Render("Type to filter by tag, Esc to cancel"))
 }
 
 func (m *Model) renameSelected(name string) (string, error) {
@@ -4806,7 +4810,7 @@ func progressBar(percent int) string {
 
 func (m Model) readingStatus() string {
 	if m.currentPath == "" {
-		return ""
+		return mutedSty.Render("TN · select a note from the tree, or press n to create one")
 	}
 	var parts []string
 	if m.mode == modeNormal && m.previewLineCount() > m.preview.Height {

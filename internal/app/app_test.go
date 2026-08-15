@@ -300,6 +300,30 @@ func TestStatusFlashAutoClears(t *testing.T) {
 	}
 }
 
+func TestNoNoteStatusBarShowsHint(t *testing.T) {
+	store := storage.New(t.TempDir())
+	m := New(store)
+	m.resize(100, 30)
+
+	// After a transient status expires, the bar must still show a useful hint.
+	updated, _ := m.Update(statusClearMsg{id: m.statusID})
+	m = updated.(Model)
+	if m.status != "" {
+		t.Fatalf("expected status to clear, got %q", m.status)
+	}
+
+	bar := stripANSI(m.shortcutBar())
+	if !strings.Contains(bar, "TN") {
+		t.Fatalf("no-note status bar missing app name: %q", bar)
+	}
+	if !strings.Contains(bar, "select a note") {
+		t.Fatalf("no-note status bar missing hint: %q", bar)
+	}
+	if !strings.Contains(bar, "[n] note") {
+		t.Fatalf("no-note status bar missing toolbar shortcuts: %q", bar)
+	}
+}
+
 func TestRenderMarkdownCachesRendererAndStylesCodeBlocks(t *testing.T) {
 	store := storage.New(t.TempDir())
 	note, err := store.CreateNote("", "preview")
