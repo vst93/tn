@@ -1914,15 +1914,15 @@ func TestHelpOpensAndFilters(t *testing.T) {
 	if m.mode != modeHelp {
 		t.Fatalf("expected help mode, got %v", m.mode)
 	}
-	if view := stripANSI(m.helpView()); !strings.Contains(view, "Command palette") {
-		t.Fatalf("expected help to list command palette, got %q", view)
+	if view := stripANSI(m.helpView()); !strings.Contains(view, "New note") {
+		t.Fatalf("expected help to list New note, got %q", view)
 	}
 
-	m.input.SetValue("command")
-	m.helpHintQ = "command"
+	m.input.SetValue("new note")
+	m.helpHintQ = "new note"
 	m.renderHelpContent()
-	if view := stripANSI(m.helpView()); !strings.Contains(view, "Command palette") {
-		t.Fatalf("expected filtered help to include command, got %q", view)
+	if view := stripANSI(m.helpView()); !strings.Contains(view, "New note") {
+		t.Fatalf("expected filtered help to include new note, got %q", view)
 	}
 
 	updated, _ := m.updateHelp(tea.KeyMsg{Type: tea.KeyEsc})

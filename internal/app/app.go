@@ -396,14 +396,17 @@ type Model struct {
 	searchMatches []matchPos
 	searchIndex   int
 
-	width, height int
-	treeWidth     int
-	bodyHeight    int
-	compact       bool
-	treeVisible   bool
-	selecting     bool
-	copier        func(string) error
-	pending       tea.Cmd
+	width, height    int
+	treeWidth        int
+	bodyHeight       int
+	compact          bool
+	treeVisible      bool
+	selecting        bool
+	contentDragging  bool
+	contentSelAnchor int
+	contentSelEnd    int
+	copier           func(string) error
+	pending          tea.Cmd
 
 	focusing            bool
 	sessionPath         string
@@ -417,9 +420,9 @@ type Model struct {
 	quickOpenResults []quickOpenResult
 	quickOpenIndex   int
 
-	tagFilter       string
-	nodeTags        map[string][]string
-	nodePinned      map[string]bool
+	tagFilter  string
+	nodeTags   map[string][]string
+	nodePinned map[string]bool
 
 	renderer      *glamour.TermRenderer
 	rendererWidth int
@@ -1022,6 +1025,22 @@ func (m *Model) selectedCount() int {
 }
 
 func (m *Model) handleMouse(msg tea.MouseEvent) {
+	if m.contentDragging {
+		// Track a content-pane drag selection: motion updates the selection
+		// end, release copies the selected text and clears the selection.
+		switch msg.Action {
+		case tea.MouseActionMotion:
+			if off := m.contentOffsetAt(msg.X, msg.Y); off >= 0 {
+				m.contentSelEnd = off
+			}
+		case tea.MouseActionRelease:
+			if off := m.contentOffsetAt(msg.X, msg.Y); off >= 0 {
+				m.contentSelEnd = off
+			}
+			m.finishContentDrag()
+		}
+		return
+	}
 	if msg.Action != tea.MouseActionPress && !msg.IsWheel() {
 		return
 	}
@@ -1077,10 +1096,79 @@ func (m *Model) handleMouse(msg tea.MouseEvent) {
 	}
 
 	m.switchToContent()
+	if m.mode == modeNormal && msg.Button == tea.MouseButtonLeft {
+		if off := m.contentOffsetAt(msg.X, msg.Y); off >= 0 {
+			m.contentSelAnchor = off
+			m.contentSelEnd = off
+			m.contentDragging = true
+			return
+		}
+	}
 	if m.mode == modeNormal && msg.IsWheel() {
 		updated, _ := m.preview.Update(tea.MouseMsg(msg))
 		m.preview = updated
 	}
+}
+
+// contentOffsetAt maps a screen position to a rune offset in the rendered
+// preview text (m.renderedPlain), or returns -1 when the position is not over
+// selectable preview text. Only meaningful in preview mode with a note open;
+// the rendered content and plain text share a 1:1 line structure, and the
+// preview viewport shows lines starting at its YOffset.
+func (m Model) contentOffsetAt(x, y int) int {
+	if m.mode != modeNormal || m.currentPath == "" || m.renderedPlain == "" {
+		return -1
+	}
+	left := 1
+	if !m.compact && m.treeVisible {
+		left = m.treeWidth + 1
+	}
+	if x < left || x >= m.width-1 || y < 2 || y >= m.bodyHeight {
+		return -1
+	}
+	// The panel's top border is at y=1; inside it sit the metadata lines,
+	// then the preview viewport rows.
+	metaLines := 1
+	if len(m.nodeTags[m.currentPath]) > 0 {
+		metaLines = 2
+	}
+	row := y - 2 - metaLines
+	if row < 0 || row >= m.preview.Height {
+		return -1
+	}
+	line := m.preview.YOffset + row
+	lines := strings.Split(m.renderedPlain, "\n")
+	if line >= len(lines) {
+		return -1
+	}
+	offset := 0
+	for _, l := range lines[:line] {
+		offset += utf8.RuneCountInString(l) + 1
+	}
+	col := x - left
+	if col > len([]rune(lines[line])) {
+		col = len([]rune(lines[line]))
+	}
+	return offset + col
+}
+
+// finishContentDrag ends a content-pane drag selection: it copies the
+// selected span of the rendered preview text and clears the selection state.
+func (m *Model) finishContentDrag() {
+	m.contentDragging = false
+	start, end := m.contentSelAnchor, m.contentSelEnd
+	m.contentSelAnchor, m.contentSelEnd = 0, 0
+	if start > end {
+		start, end = end, start
+	}
+	total := utf8.RuneCountInString(m.renderedPlain)
+	if end > total {
+		end = total
+	}
+	if start < 0 || end < 0 || start >= end {
+		return
+	}
+	m.startCopy(string([]rune(m.renderedPlain)[start:end]))
 }
 
 func (m *Model) runAction(action string) {
@@ -3789,6 +3877,23 @@ func highlightSearchContent(content, query string) string {
 	return strings.Join(lines, "\n")
 }
 
+// highlightSelection highlights the span of text between start and end (byte
+// offsets into content) using reverse video, leaving all other text untouched.
+// Out-of-range or inverted offsets are clamped; a zero-length span returns the
+// content unchanged.
+func highlightSelection(content string, start, end int) string {
+	if start < 0 {
+		start = 0
+	}
+	if end > len(content) {
+		end = len(content)
+	}
+	if end <= start {
+		return content
+	}
+	return content[:start] + "\x1b[7m" + content[start:end] + "\x1b[27m" + content[end:]
+}
+
 func applyHighlightRanges(line string, ranges []matchPos, hi, hiEnd string) string {
 	if len(ranges) == 0 {
 		return line
@@ -3832,6 +3937,68 @@ func applyHighlightRanges(line string, ranges []matchPos, hi, hiEnd string) stri
 		i += size
 	}
 	return b.String()
+}
+
+// selectionHighlightCodes returns the ANSI sequences that apply and release
+// the drag-selection highlight. The highlight is built from a lipgloss style
+// using the palette's selection background and text foreground; rendering an
+// empty string yields the SGR sequence followed by a full reset, so we split
+// on that trailing reset. In plain (no-color) profiles the rendered sequence
+// is empty and the highlight degrades to a no-op.
+func selectionHighlightCodes() (hi, hiEnd string) {
+	hiEnd = "\x1b[0m"
+	hi = strings.TrimSuffix(
+		lipgloss.NewStyle().Background(selection).Foreground(text).Render(""),
+		hiEnd,
+	)
+	return hi, hiEnd
+}
+
+// renderSelectionContent returns the rendered content with the rune range
+// [start, end) — expressed in plain-text coordinates (m.renderedPlain) —
+// wrapped in the selection highlight. The rendered and plain contents share a
+// 1:1 line structure (see contentOffsetAt), so each line's visible rune span
+// is mapped onto the rendered line using applyHighlightRanges.
+func renderSelectionContent(content, plain string, start, end int) string {
+	if content == "" || plain == "" || end <= start {
+		return content
+	}
+	total := utf8.RuneCountInString(plain)
+	start = max(0, min(start, total))
+	end = min(end, total)
+	if end <= start {
+		return content
+	}
+	hi, hiEnd := selectionHighlightCodes()
+	if hi == "" {
+		return content
+	}
+	lines := strings.Split(content, "\n")
+	plainLines := strings.Split(plain, "\n")
+	if len(lines) != len(plainLines) {
+		return content
+	}
+	offset := 0
+	changed := false
+	for i, line := range plainLines {
+		lineLen := utf8.RuneCountInString(line)
+		lineStart := offset
+		lineEnd := lineStart + lineLen
+		offset = lineEnd + 1
+		if end <= lineStart || start >= lineEnd {
+			continue
+		}
+		s, e := max(0, start-lineStart), min(lineLen, end-lineStart)
+		if s >= e {
+			continue
+		}
+		lines[i] = applyHighlightRanges(lines[i], []matchPos{{start: s, end: e}}, hi, hiEnd)
+		changed = true
+	}
+	if !changed {
+		return content
+	}
+	return strings.Join(lines, "\n")
 }
 
 var orderedListRe = regexp.MustCompile(`^([0-9]+)([.)]) `)
@@ -4286,6 +4453,22 @@ func (m Model) contentViewSides(width int, leftB, rightB bool) string {
 		content = m.editor.View()
 	} else {
 		content = m.preview.View()
+		if m.contentDragging {
+			// While a drag selection is in progress, render the selected
+			// span highlighted. The selection offsets are rune offsets into
+			// the plain text, so map them onto the ANSI-rendered content
+			// without disturbing the viewport's scroll position (line
+			// count is unchanged).
+			start, end := m.contentSelAnchor, m.contentSelEnd
+			if start > end {
+				start, end = end, start
+			}
+			if end > start {
+				highlighted := renderSelectionContent(m.renderedContent, m.renderedPlain, start, end)
+				m.preview.SetContent(highlighted)
+				content = m.preview.View()
+			}
+		}
 	}
 
 	return borderedPanelPart(title, meta+content, width, m.bodyRenderHeight(), focused, leftB, rightB)
