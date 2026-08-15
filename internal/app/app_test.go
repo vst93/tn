@@ -972,6 +972,55 @@ func TestSessionPersistsAndRestores(t *testing.T) {
 	}
 }
 
+func TestRestoreSessionHandlesCorruptedFile(t *testing.T) {
+	store := storage.New(t.TempDir())
+	note, err := store.CreateNote("", "survivor")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name string
+		data string
+	}{
+		{"garbage", "{not valid json!!"},
+		{"truncated", `{"currentPath": "`},
+		{"wrong types", `{"currentPath": 42, "cursorRow": "x", "expanded": "nope"}`},
+		{"hostile numbers", `{"cursorRow": -5, "cursorCol": 999999, "treeOffset": -3, "previewOff": -1}`},
+		{"empty", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "session.json")
+			if err := os.WriteFile(path, []byte(tc.data), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			m := New(store)
+			m.sessionPath = path
+			restored := m.restoreSession()
+			if restored.currentPath != "" {
+				t.Fatalf("expected no note restored from corrupt session, got %q", restored.currentPath)
+			}
+			if restored.editor.Value() != "" {
+				t.Fatalf("expected empty editor, got %q", restored.editor.Value())
+			}
+		})
+	}
+
+	// A valid session must still restore normally, i.e. a corrupt file
+	// encountered earlier must not poison later restores.
+	good := filepath.Join(t.TempDir(), "session.json")
+	if err := os.WriteFile(good, []byte(`{"currentPath": "`+note+`", "mode": "preview"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m := New(store)
+	m.sessionPath = good
+	restored := m.restoreSession()
+	if restored.currentPath != note {
+		t.Fatalf("expected valid session to restore %q, got %q", note, restored.currentPath)
+	}
+}
+
 func TestGlobalSearchFindsContentAndOpensAtLine(t *testing.T) {
 	store := storage.New(t.TempDir())
 	note, err := store.CreateNote("", "topic")
