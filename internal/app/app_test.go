@@ -1926,3 +1926,131 @@ func TestSearchSnippetShowsMatchWindow(t *testing.T) {
 		t.Fatalf("expected leading context marker, got %q", s)
 	}
 }
+
+func TestQuickOpenFiltersAndOpens(t *testing.T) {
+	store := storage.New(t.TempDir())
+	noteA, err := store.CreateNote("", "quarterly-report")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateNote("", "ideas"); err != nil {
+		t.Fatal(err)
+	}
+
+	m := New(store)
+	m.resize(100, 30)
+	m.startQuickOpen()
+	if m.mode != modeQuickOpen {
+		t.Fatalf("expected quick open mode, got %v", m.mode)
+	}
+
+	m.input.SetValue("report")
+	m.runQuickOpen("report")
+	if len(m.quickOpenResults) != 1 || m.quickOpenResults[0].path != noteA {
+		t.Fatalf("expected only %q to match, got %+v", noteA, m.quickOpenResults)
+	}
+
+	m.quickOpenIndex = 0
+	m.openQuickOpenResult()
+	if m.currentPath != noteA {
+		t.Fatalf("expected quick open to open %q, got %q", noteA, m.currentPath)
+	}
+	if len(m.history) != 1 || m.history[0] != noteA {
+		t.Fatalf("expected quick open to record history, got %v", m.history)
+	}
+	if m.mode != modeNormal {
+		t.Fatalf("expected preview mode after quick open, got %v", m.mode)
+	}
+	if m.quickOpenResults != nil || m.input.Focused() {
+		t.Fatalf("expected quick open dialog cleared, results=%v focused=%v", m.quickOpenResults, m.input.Focused())
+	}
+}
+
+func TestQuickOpenEscRestoresMode(t *testing.T) {
+	m, _, _ := openEditModel(t, "qo-esc")
+	m.startQuickOpen()
+	if m.mode != modeQuickOpen {
+		t.Fatalf("expected quick open mode, got %v", m.mode)
+	}
+	updated, _ := m.updateQuickOpen(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+	if m.mode != modeEdit {
+		t.Fatalf("expected Esc to restore edit mode, got %v", m.mode)
+	}
+	if !m.editor.Focused() {
+		t.Fatal("expected editor to be focused after cancelling quick open")
+	}
+}
+
+func TestContentMetadataShowsStats(t *testing.T) {
+	store := storage.New(t.TempDir())
+	note, err := store.CreateNote("", "stats")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := New(store)
+	m.resize(100, 30)
+	m.selectPath(note)
+	m.openSelectedNote()
+	m.editor.SetValue("one two\n\nthree four")
+	m.renderMarkdown()
+
+	view := stripANSI(m.contentView(100))
+	for _, want := range []string{"4 words", "19 chars", "3 lines", "~<1 min read"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("expected metadata to contain %q, got %q", want, view)
+		}
+	}
+}
+
+func TestReadingProgressReflectsScroll(t *testing.T) {
+	store := storage.New(t.TempDir())
+	note, err := store.CreateNote("", "long-read")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := New(store)
+	m.resize(100, 30)
+	m.selectPath(note)
+	m.openSelectedNote()
+	var b strings.Builder
+	for i := 0; i < 80; i++ {
+		b.WriteString(fmt.Sprintf("line %d\n\n", i))
+	}
+	m.editor.SetValue(b.String())
+	m.renderMarkdown()
+	m.preview.SetYOffset(20)
+
+	pct := m.previewPercent()
+	if pct <= 0 || pct >= 100 {
+		t.Fatalf("expected in-progress reading percent, got %d", pct)
+	}
+	m.status, m.statusErr, m.statusOK = "", false, false
+	if bar := stripANSI(m.shortcutBar()); !strings.Contains(bar, fmt.Sprintf("%d%%", pct)) {
+		t.Fatalf("expected reading percent in status bar, got %q", bar)
+	}
+	if view := stripANSI(m.contentView(100)); !strings.Contains(view, fmt.Sprintf("%d%% read", pct)) {
+		t.Fatalf("expected reading percent in content title, got %q", view)
+	}
+}
+
+func TestTreeMouseWheelStepsByOne(t *testing.T) {
+	store := storage.New(t.TempDir())
+	for i := 0; i < 35; i++ {
+		if _, err := store.CreateNote("", fmt.Sprintf("n%02d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m := New(store)
+	m.resize(100, 30)
+	m.treeOffset = 0
+
+	m.handleMouse(tea.MouseEvent{Button: tea.MouseButtonWheelDown, Action: tea.MouseActionPress, X: 3, Y: 2})
+	if m.treeOffset != 1 {
+		t.Fatalf("expected tree wheel to scroll one row, got %d", m.treeOffset)
+	}
+	m.handleMouse(tea.MouseEvent{Button: tea.MouseButtonWheelUp, Action: tea.MouseActionPress, X: 3, Y: 2})
+	if m.treeOffset != 0 {
+		t.Fatalf("expected tree wheel up to restore offset 0, got %d", m.treeOffset)
+	}
+}

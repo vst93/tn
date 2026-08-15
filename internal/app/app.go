@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -50,6 +51,7 @@ const (
 	modeSearch
 	modeExport
 	modeSearchGlobal
+	modeQuickOpen
 	modeTag
 	modeTagFilter
 	modeTemplate
@@ -255,6 +257,7 @@ var helpGroupsData = []helpGroup{
 			{"↑/↓ or J/K", "Select item"},
 			{"←/→ or H/L", "Collapse / expand"},
 			{"Enter", "Open note"},
+			{"Ctrl+O", "Quick open note"},
 			{"Tab", "Switch panel"},
 			{"Alt+← / Alt+→", "Back / forward history"},
 			{"Space", "Toggle multi-select"},
@@ -334,6 +337,12 @@ type globalSearchResult struct {
 	lineNum int
 }
 
+type quickOpenResult struct {
+	path  string
+	title string
+	dir   string
+}
+
 type globalSearchMsg struct {
 	query string
 }
@@ -406,6 +415,11 @@ type Model struct {
 	globalSearchQuery   string
 	globalSearchResults []globalSearchResult
 	globalSearchIndex   int
+
+	beforeQuickOpen  mode
+	quickOpenQuery   string
+	quickOpenResults []quickOpenResult
+	quickOpenIndex   int
 
 	tagFilter       string
 	nodeTags        map[string][]string
@@ -482,9 +496,9 @@ func New(store *storage.Store) Model {
 		helpHintView:  viewport.New(60, 20),
 	}
 	m.preview.MouseWheelEnabled = true
-	m.preview.MouseWheelDelta = 3
+	m.preview.MouseWheelDelta = 2
 	m.helpHintView.MouseWheelEnabled = true
-	m.helpHintView.MouseWheelDelta = 3
+	m.helpHintView.MouseWheelDelta = 2
 	m.refresh("")
 	m = m.restoreSession()
 	return m
@@ -624,6 +638,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.mode == modeSearchGlobal {
 			return m.updateGlobalSearch(msg)
+		}
+		if m.mode == modeQuickOpen {
+			return m.updateQuickOpen(msg)
 		}
 		if m.mode == modeExport {
 			return m.updateExport(msg)
@@ -822,6 +839,9 @@ func (m *Model) globalKey(key string) (handled, quit bool) {
 	case "ctrl+shift+o":
 		m.startGlobalSearch()
 		return true, false
+	case "ctrl+o":
+		m.startQuickOpen()
+		return true, false
 	case "ctrl+shift+f":
 		m.toggleFocus()
 		return true, false
@@ -985,11 +1005,11 @@ func (m *Model) handleMouse(msg tea.MouseEvent) {
 	if inTree {
 		m.switchToTree()
 		if msg.Button == tea.MouseButtonWheelUp {
-			m.treeOffset = max(0, m.treeOffset-3)
+			m.treeOffset = max(0, m.treeOffset-1)
 			return
 		}
 		if msg.Button == tea.MouseButtonWheelDown {
-			m.treeOffset = min(max(0, len(m.flat)-m.treeRows()), m.treeOffset+3)
+			m.treeOffset = min(max(0, len(m.flat)-m.treeRows()), m.treeOffset+1)
 			return
 		}
 		if msg.Button == tea.MouseButtonLeft {
@@ -2351,6 +2371,170 @@ func (m *Model) openGlobalSearchResult() {
 	}
 }
 
+func (m *Model) startQuickOpen() {
+	m.beforeQuickOpen = m.mode
+	m.mode = modeQuickOpen
+	m.active = contentPane
+	m.quickOpenQuery = ""
+	m.quickOpenResults = nil
+	m.quickOpenIndex = 0
+	m.status = ""
+	m.input.Prompt = "Open: "
+	m.input.Placeholder = "note name"
+	m.input.SetValue("")
+	m.input.Width = max(10, min(50, m.width-12))
+	m.input.Focus()
+}
+
+func (m Model) updateQuickOpen(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.exitQuickOpen()
+		return m, nil
+	case "enter":
+		m.openQuickOpenResult()
+		return m, nil
+	case "up", "shift+tab":
+		m.moveQuickOpen(-1)
+		return m, nil
+	case "down", "tab":
+		m.moveQuickOpen(1)
+		return m, nil
+	}
+	var cmd tea.Cmd
+	m.input, cmd = m.input.Update(msg)
+	q := m.input.Value()
+	if q != m.quickOpenQuery {
+		m.quickOpenQuery = q
+		m.runQuickOpen(q)
+	}
+	return m, cmd
+}
+
+func (m *Model) exitQuickOpen() {
+	mode := m.beforeQuickOpen
+	m.mode = mode
+	m.active = contentPane
+	m.input.Blur()
+	m.input.Prompt = "› "
+	m.quickOpenQuery = ""
+	m.quickOpenResults = nil
+	m.quickOpenIndex = 0
+	m.renderMarkdown()
+	m.adjustPreviewHeight()
+	if mode == modeEdit && m.currentPath != "" {
+		m.setEditorBackground(surface)
+		m.editor.Focus()
+	} else {
+		m.setEditorBackground(bg)
+	}
+}
+
+func (m *Model) runQuickOpen(query string) {
+	m.quickOpenResults = nil
+	m.quickOpenIndex = 0
+	q := strings.ToLower(strings.TrimSpace(query))
+	if q == "" {
+		return
+	}
+	type candidate struct {
+		path       string
+		title      string
+		dir        string
+		titleMatch bool
+	}
+	var cands []candidate
+	var walk func([]*storage.Node)
+	walk = func(nodes []*storage.Node) {
+		for _, n := range nodes {
+			if n.IsDir {
+				walk(n.Children)
+				continue
+			}
+			title := strings.TrimSuffix(n.Name, filepath.Ext(n.Name))
+			titleLower := strings.ToLower(title)
+			if !strings.Contains(titleLower, q) && !strings.Contains(strings.ToLower(n.RelPath), q) {
+				continue
+			}
+			cands = append(cands, candidate{
+				path:       n.RelPath,
+				title:      title,
+				dir:        filepath.Dir(n.RelPath),
+				titleMatch: strings.Contains(titleLower, q),
+			})
+			if len(cands) >= 50 {
+				break
+			}
+		}
+	}
+	walk(m.tree)
+	sort.SliceStable(cands, func(i, j int) bool {
+		if cands[i].titleMatch != cands[j].titleMatch {
+			return cands[i].titleMatch
+		}
+		return strings.ToLower(cands[i].path) < strings.ToLower(cands[j].path)
+	})
+	if len(cands) > 20 {
+		cands = cands[:20]
+	}
+	for _, c := range cands {
+		m.quickOpenResults = append(m.quickOpenResults, quickOpenResult{path: c.path, title: c.title, dir: c.dir})
+	}
+}
+
+func (m *Model) moveQuickOpen(delta int) {
+	n := len(m.quickOpenResults)
+	if n == 0 {
+		return
+	}
+	m.quickOpenIndex = ((m.quickOpenIndex+delta)%n + n) % n
+}
+
+func (m *Model) openQuickOpenResult() {
+	if m.quickOpenIndex < 0 || m.quickOpenIndex >= len(m.quickOpenResults) {
+		return
+	}
+	r := m.quickOpenResults[m.quickOpenIndex]
+	if !m.openPath(r.path) {
+		return
+	}
+	m.pushHistory(r.path)
+	m.exitQuickOpen()
+}
+
+func (m Model) quickOpenView() string {
+	var b strings.Builder
+	b.WriteString(brandSty.Render("Quick open") + "\n\n")
+	b.WriteString(m.input.View() + "\n")
+	if len(m.quickOpenResults) == 0 {
+		if strings.TrimSpace(m.quickOpenQuery) == "" {
+			b.WriteString("\n" + mutedSty.Render("Type to filter notes by name"))
+		} else {
+			b.WriteString("\n" + errorSty.Render("No matching notes"))
+		}
+	} else {
+		for i, r := range m.quickOpenResults {
+			b.WriteString("\n" + m.quickOpenResultRow(r, i == m.quickOpenIndex))
+		}
+	}
+	b.WriteString("\n\n" + mutedSty.Render("↑/↓ select · Enter open · Esc cancel"))
+	return m.bottomOverlay(b.String())
+}
+
+func (m Model) quickOpenResultRow(r quickOpenResult, selected bool) string {
+	var title string
+	if r.dir != "." {
+		title = lipgloss.NewStyle().Foreground(accent).Bold(true).Render(r.dir+"/") + lipgloss.NewStyle().Foreground(text).Bold(true).Render(r.title)
+	} else {
+		title = lipgloss.NewStyle().Foreground(text).Bold(true).Render(r.title)
+	}
+	row := title
+	if selected {
+		row = lipgloss.NewStyle().Background(selection).Foreground(text).Render(row)
+	}
+	return row
+}
+
 func (m Model) globalSearchView() string {
 	var b strings.Builder
 	b.WriteString(brandSty.Render("Global search") + "\n\n")
@@ -3406,6 +3590,9 @@ func (m Model) View() string {
 	if m.mode == modeSearchGlobal {
 		return m.globalSearchView()
 	}
+	if m.mode == modeQuickOpen {
+		return m.quickOpenView()
+	}
 	if m.mode == modeTemplate {
 		return m.templateView()
 	}
@@ -3463,7 +3650,7 @@ func (m Model) bodyRenderHeight() int {
 func (m Model) headerView() string {
 	brand := lipgloss.NewStyle().Foreground(accent).Bold(true).Render("◆ vnote")
 	tabs := m.headerTabs()
-	left := brand + "  " + tabs
+	left := brand + mutedSty.Render("  ·  ") + tabs
 
 	name := "no note"
 	if m.currentPath != "" {
@@ -3625,6 +3812,17 @@ func (m Model) contentViewSides(width int, leftB, rightB bool) string {
 		if m.nodePinned[m.currentPath] {
 			title += " ★"
 		}
+		if m.mode == modeNormal && m.previewLineCount() > m.preview.Height {
+			title += " · " + lipgloss.NewStyle().Foreground(accent).Render(fmt.Sprintf("%d%% read", m.previewPercent()))
+		}
+	}
+
+	innerWidth := max(1, width)
+	if leftB {
+		innerWidth--
+	}
+	if rightB {
+		innerWidth--
 	}
 
 	// Metadata line (replaces old Details panel)
@@ -3640,19 +3838,16 @@ func (m Model) contentViewSides(width int, leftB, rightB bool) string {
 		}
 		content := m.editor.Value()
 		words := wordCount(content)
-		meta = " " + mutedSty.Render("  "+m.currentPath) + "   " +
+		chars := charCount(content)
+		lines := lineCountOf(content)
+		stats := fmt.Sprintf("%d words · %d chars · %d lines · ~%s read", words, chars, lines, readingTimeEstimate(content))
+		metaLine := " " + mutedSty.Render(m.currentPath) + "   " +
 			lipgloss.NewStyle().Foreground(accent).Bold(true).Render(state) + "   " +
 			mutedSty.Render(modeName) + "   " +
-			mutedSty.Render(fmt.Sprintf("%d words · ~%s read", words, readingTimeEstimate(content))) + "\n"
+			mutedSty.Render(stats)
+		meta = truncateANSI(metaLine, max(1, innerWidth-2)) + "\n"
 		if tags := m.nodeTags[m.currentPath]; len(tags) > 0 {
-			inner := max(1, width)
-			if leftB {
-				inner--
-			}
-			if rightB {
-				inner--
-			}
-			meta += " " + m.tagsRow(tags, max(4, inner-2)) + "\n"
+			meta += " " + m.tagsRow(tags, max(4, innerWidth-2)) + "\n"
 		}
 	}
 
@@ -3800,8 +3995,8 @@ func (m Model) shortcutBar() string {
 		return m.editShortcutBar()
 	}
 	right := m.statusText(m.status)
-	if right == "" && m.currentPath != "" && m.nodePinned[m.currentPath] {
-		right = lipgloss.NewStyle().Foreground(accent).Render("★ pinned")
+	if right == "" {
+		right = m.readingStatus()
 	}
 	return m.composeBar(m.toolbarShortcut(m.width-lipgloss.Width(right)-2), right)
 }
@@ -3949,7 +4144,7 @@ func (m Model) updateHelp(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m *Model) renderHelpContent() {
 	w := m.helpBoxWidth()
 	m.helpHintView.Width = max(10, w-6)
-	m.helpHintView.Height = max(3, m.height-8)
+	m.helpHintView.Height = max(3, m.height-6)
 	m.helpHintView.SetContent(m.helpContent())
 }
 
@@ -4075,6 +4270,7 @@ func (m *Model) commandList() []command {
 		{"Toggle edit/preview", m.toggleEdit},
 		{"Find in note", m.findInNoteCommand},
 		{"Find everywhere", m.startGlobalSearch},
+		{"Quick open", m.startQuickOpen},
 		{"Go to line", m.startGotoLine},
 		{"Focus mode", m.toggleFocus},
 		{"Export note", m.exportNoteCommand},
@@ -4166,6 +4362,50 @@ func readingTimeEstimate(s string) string {
 		return "<1 min"
 	}
 	return fmt.Sprintf("%d min", (words+199)/200)
+}
+
+func charCount(s string) int {
+	return utf8.RuneCountInString(s)
+}
+
+func lineCountOf(s string) int {
+	if s == "" {
+		return 0
+	}
+	return strings.Count(s, "\n") + 1
+}
+
+func (m Model) previewPercent() int {
+	return max(0, min(100, int(math.Round(m.preview.ScrollPercent()*100))))
+}
+
+func progressBar(percent int) string {
+	const width = 8
+	pct := max(0, min(100, percent))
+	filled := int(math.Round(float64(pct) / 100 * width))
+	if filled < 0 {
+		filled = 0
+	}
+	if filled > width {
+		filled = width
+	}
+	return lipgloss.NewStyle().Foreground(accent).Render(strings.Repeat("▰", filled)) +
+		mutedSty.Render(strings.Repeat("▱", width-filled))
+}
+
+func (m Model) readingStatus() string {
+	if m.currentPath == "" {
+		return ""
+	}
+	var parts []string
+	if m.mode == modeNormal && m.previewLineCount() > m.preview.Height {
+		pct := m.previewPercent()
+		parts = append(parts, progressBar(pct)+" "+fmt.Sprintf("%d%%", pct))
+	}
+	if m.nodePinned[m.currentPath] {
+		parts = append(parts, lipgloss.NewStyle().Foreground(accent).Render("★ pinned"))
+	}
+	return strings.Join(parts, "  ")
 }
 
 func truncate(s string, width int) string {
