@@ -2862,7 +2862,7 @@ func (m Model) quickOpenView() string {
 			b.WriteString("\n" + m.quickOpenResultRow(r, i == m.quickOpenIndex))
 		}
 	}
-	b.WriteString("\n\n" + mutedSty.Render("↑/↓ select · Enter open · Esc cancel"))
+	b.WriteString("\n\n" + mutedSty.Render("Type to filter notes · ↑/↓ select · Enter open · Esc cancel"))
 	return m.bottomOverlay(b.String())
 }
 
@@ -4730,7 +4730,7 @@ func (m Model) commandView() string {
 			b.WriteString("\n" + row)
 		}
 	}
-	b.WriteString("\n\n" + mutedSty.Render("↑/↓ select · Enter run · Esc close"))
+	b.WriteString("\n\n" + mutedSty.Render("Type to filter commands · ↑/↓ select · Enter run · Esc close"))
 	return m.bottomOverlay(b.String())
 }
 
