@@ -12,10 +12,10 @@ A quiet, keyboard-first terminal notebook. Vnote stores every note as a normal M
 - In-note search with highlighted matches, global search across all notes, and jump-to-line
 - Front-matter tags, tag filtering, and note templates for blank, daily, meeting, and book notes
 - Pin favorite notes to the top of the tree, with reading-time estimates per note
-- Quick-open any note by name or path with `Ctrl+O`, plus per-note stats and scroll-based reading progress
+- Quick-open any note by name or path with `Ctrl+O`, with a recent-notes list when the query is empty, plus per-note stats and scroll-based reading progress
 - Back/forward note history for fast navigation between recently opened notes
 - Focus mode for distraction-free writing and session persistence across restarts
-- Export a note or a batch to the clipboard or a file, plus batch delete and batch tag editing
+- Export a note or a batch to Markdown or styled standalone HTML, to the clipboard, or to a file, plus batch delete and batch tag editing
 - Command palette and a searchable, scrollable help overlay
 - No database or lock-in: data is ordinary `.md` files
 - Windows, Linux, macOS, and Termux support
@@ -74,12 +74,20 @@ vnote -dir /path/to/notes
 | Select all | `Ctrl+A` |
 | Clear selection | `Ctrl+Shift+A` |
 | Export | `Ctrl+Shift+E` |
+| Export as HTML | `Alt+H` |
 | Refresh | `Ctrl+R` |
 | Help | `?` |
 | Quit | `Ctrl+Q` |
 | Cancel / close | `Esc` |
 
 While editing, standard terminal text editing keys and `Ctrl+V` paste are available. Press `Esc` to return to preview.
+
+### Exporting
+
+- `Ctrl+Shift+E` opens the export menu. From there you can copy the current rendered note, save the Markdown source, or export a standalone HTML page.
+- `Alt+H` jumps straight to the HTML export path dialog for the current note.
+- For a batch, select notes with `Space`, then `Ctrl+Shift+E` and choose Markdown or HTML before entering the destination directory.
+- Exported HTML is a self-contained, styled document that embeds the note title, tags, and rendered Markdown. Raw HTML inside a note is sanitized before export.
 
 ### Copying text
 

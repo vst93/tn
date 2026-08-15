@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html/template"
 	"math"
 	"os"
 	"path/filepath"
@@ -23,6 +24,9 @@ import (
 	glamansi "github.com/charmbracelet/glamour/ansi"
 	"github.com/charmbracelet/lipgloss"
 	termansi "github.com/charmbracelet/x/ansi"
+	"github.com/microcosm-cc/bluemonday"
+	"github.com/yuin/goldmark"
+	"github.com/yuin/goldmark/extension"
 
 	"github.com/vst93/vnote/internal/storage"
 )
@@ -262,6 +266,7 @@ var helpGroupsData = []helpGroup{
 			{"Alt+← / Alt+→", "Back / forward history"},
 			{"Space", "Toggle multi-select"},
 			{"Ctrl+A / Ctrl+Shift+A", "Select all / clear"},
+			{"Space / B", "Page preview down / up"},
 		},
 	},
 	{
@@ -304,6 +309,7 @@ var helpGroupsData = []helpGroup{
 			{"Ctrl+A", "Select all"},
 			{"Ctrl+Shift+A", "Clear selection"},
 			{"Ctrl+Shift+E", "Export"},
+			{"Alt+H", "Export note as HTML"},
 		},
 	},
 	{
@@ -328,6 +334,7 @@ type SessionState struct {
 	TreeOffset  int             `json:"treeOffset"`
 	PreviewOff  int             `json:"previewOff"`
 	ActivePane  string          `json:"activePane"`
+	Recent      []string        `json:"recent"`
 }
 
 type globalSearchResult struct {
@@ -396,6 +403,9 @@ type Model struct {
 	beforePrompt    mode
 	exportPath      bool
 	exportCopy      bool
+	exportHTML      bool
+
+	recent []string
 
 	searchQuery   string
 	searchMatches []matchPos
@@ -485,6 +495,7 @@ func New(store *storage.Store) Model {
 		nodeTags:      make(map[string][]string),
 		nodePinned:    make(map[string]bool),
 		selectedItems: make(map[string]bool),
+		recent:        make([]string, 0, 20),
 		active:        treePane,
 		mode:          modeNormal,
 		editor:        editor,
@@ -527,6 +538,10 @@ func (m Model) restoreSession() Model {
 	if s.Expanded != nil {
 		m.expanded = s.Expanded
 		m.rebuildFlat()
+	}
+	m.recent = s.Recent
+	if m.recent == nil {
+		m.recent = make([]string, 0, 20)
 	}
 	m.treeOffset = max(0, s.TreeOffset)
 	m.active = treePane
@@ -574,6 +589,7 @@ func (m Model) saveSession() {
 		TreeOffset:  m.treeOffset,
 		PreviewOff:  m.preview.YOffset,
 		ActivePane:  "tree",
+		Recent:      m.recent,
 	}
 	if m.mode == modeEdit {
 		s.Mode = "edit"
@@ -783,6 +799,16 @@ func (m *Model) globalKey(key string) (handled, quit bool) {
 			return true, false
 		}
 		m.startExport()
+		return true, false
+	case "alt+h":
+		if m.mode == modeEdit {
+			return false, false
+		}
+		if m.currentPath == "" {
+			m.setStatus("Open a note first", true)
+			return true, false
+		}
+		m.startHTMLExport()
 		return true, false
 	case "ctrl+n":
 		m.startTemplate()
@@ -1162,6 +1188,7 @@ func (m *Model) startExport() {
 	m.mode = modeExport
 	m.exportPath = false
 	m.exportCopy = false
+	m.exportHTML = false
 	m.statusErr = false
 	m.status = ""
 	m.input.Prompt = "Export to: "
@@ -1171,18 +1198,29 @@ func (m *Model) startExport() {
 	m.input.Blur()
 }
 
-func (m *Model) startBatchExport() {
+func (m *Model) startHTMLExport() {
 	m.mode = modeExport
 	m.exportPath = true
-	m.batchExport = true
 	m.exportCopy = false
+	m.exportHTML = true
 	m.statusErr = false
 	m.status = ""
-	m.input.Prompt = fmt.Sprintf("Export %d notes to: ", m.selectedCount())
-	m.input.Placeholder = "directory path"
-	m.input.SetValue("")
+	m.input.Prompt = "Export HTML to: "
+	m.input.Placeholder = "filename or path"
+	m.input.SetValue(m.defaultHTMLPath())
 	m.input.Width = max(20, min(60, m.width-12))
 	m.input.Focus()
+}
+
+func (m *Model) startBatchExport() {
+	m.mode = modeExport
+	m.exportPath = false
+	m.batchExport = true
+	m.exportCopy = false
+	m.exportHTML = false
+	m.statusErr = false
+	m.status = ""
+	m.input.Blur()
 }
 
 func (m Model) updateExport(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -1190,16 +1228,57 @@ func (m Model) updateExport(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "esc":
 			m.mode = modeNormal
+			m.batchExport = false
 			m.input.Blur()
 			return m, nil
+		}
+		if m.batchExport {
+			switch msg.String() {
+			case "1":
+				m.exportHTML = false
+				m.exportPath = true
+				m.statusErr = false
+				m.status = ""
+				m.input.Prompt = m.exportPrompt()
+				m.input.Placeholder = "directory path"
+				m.input.SetValue("")
+				m.input.Width = max(20, min(60, m.width-12))
+				m.input.Focus()
+				return m, nil
+			case "2":
+				m.exportHTML = true
+				m.exportPath = true
+				m.statusErr = false
+				m.status = ""
+				m.input.Prompt = m.exportPrompt()
+				m.input.Placeholder = "directory path"
+				m.input.SetValue("")
+				m.input.Width = max(20, min(60, m.width-12))
+				m.input.Focus()
+				return m, nil
+			}
+			return m, nil
+		}
+		switch msg.String() {
 		case "1":
 			m.doExportCopy()
 			return m, m.takePending()
 		case "2":
+			m.exportHTML = false
 			m.exportPath = true
 			m.statusErr = false
 			m.status = ""
 			m.input.SetValue(m.defaultExportPath())
+			m.input.Prompt = m.exportPrompt()
+			m.input.Focus()
+			return m, nil
+		case "3":
+			m.exportHTML = true
+			m.exportPath = true
+			m.statusErr = false
+			m.status = ""
+			m.input.SetValue(m.defaultHTMLPath())
+			m.input.Prompt = m.exportPrompt()
 			m.input.Focus()
 			return m, nil
 		}
@@ -1210,6 +1289,7 @@ func (m Model) updateExport(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.mode = modeNormal
 		m.exportPath = false
 		m.batchExport = false
+		m.exportHTML = false
 		m.input.Blur()
 		return m, nil
 	case "enter":
@@ -1250,12 +1330,30 @@ func (m *Model) performSaveAs() {
 		m.setStatus("Export failed: "+err.Error(), true)
 		return
 	}
+	if m.exportHTML {
+		htmlContent, err := buildHTMLExport(m.currentPath, m.editor.Value())
+		if err != nil {
+			m.setStatus("Export failed: "+err.Error(), true)
+			return
+		}
+		if err := os.WriteFile(path, []byte(htmlContent), 0o644); err != nil {
+			m.setStatus("Export failed: "+err.Error(), true)
+			return
+		}
+		m.mode = modeNormal
+		m.exportPath = false
+		m.exportHTML = false
+		m.input.Blur()
+		m.flashStatus("✓ Exported HTML to "+path, false, 2*time.Second)
+		return
+	}
 	if err := os.WriteFile(path, []byte(m.editor.Value()), 0o644); err != nil {
 		m.setStatus("Export failed: "+err.Error(), true)
 		return
 	}
 	m.mode = modeNormal
 	m.exportPath = false
+	m.exportHTML = false
 	m.input.Blur()
 	m.flashStatus("✓ Exported to "+path, false, 2*time.Second)
 }
@@ -1285,6 +1383,13 @@ func (m *Model) performBatchExport() {
 			continue
 		}
 		target := filepath.Join(dir, path)
+		if m.exportHTML {
+			content, err = buildHTMLExport(path, content)
+			if err != nil {
+				continue
+			}
+			target = filepath.Join(dir, strings.TrimSuffix(path, filepath.Ext(path))+".html")
+		}
 		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 			continue
 		}
@@ -1304,6 +1409,20 @@ func (m *Model) performBatchExport() {
 	m.flashStatus(fmt.Sprintf("✓ Exported %d notes to %s", count, dir), false, 2*time.Second)
 }
 
+func (m Model) exportPrompt() string {
+	if m.batchExport {
+		label := "notes"
+		if m.exportHTML {
+			label = "notes as HTML"
+		}
+		return fmt.Sprintf("Export %d %s to: ", m.selectedCount(), label)
+	}
+	if m.exportHTML {
+		return "Export HTML to: "
+	}
+	return "Export to: "
+}
+
 func (m Model) exportDir() string {
 	if m.currentPath == "" {
 		return m.store.Root
@@ -1320,6 +1439,169 @@ func (m Model) defaultExportPath() string {
 	return filepath.Join(m.exportDir(), base)
 }
 
+func (m Model) defaultHTMLPath() string {
+	if m.currentPath == "" {
+		return ""
+	}
+	base := filepath.Base(m.currentPath)
+	base = strings.TrimSuffix(base, filepath.Ext(base)) + ".html"
+	return filepath.Join(m.exportDir(), base)
+}
+
+// htmlExportData feeds the self-contained export template. Body is rendered
+// Markdown that has already been sanitized by bluemonday.
+type htmlExportData struct {
+	Title   string
+	Path    string
+	Created string
+	Tags    []string
+	Body    template.HTML
+}
+
+var htmlExportPage = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{.Title}}</title>
+<style>
+:root {
+	--bg: #eef1f8;
+	--paper: #ffffff;
+	--ink: #1b1e2b;
+	--muted: #68708c;
+	--accent: #3f6fce;
+	--rule: #dbe2f0;
+	--code: #f0f3fa;
+}
+* { box-sizing: border-box; }
+body {
+	margin: 0;
+	background: var(--bg);
+	color: var(--ink);
+	font: 15px/1.65 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, "PingFang SC", "Microsoft YaHei", sans-serif;
+}
+.page {
+	max-width: 840px;
+	margin: 0 auto;
+	padding: 48px 28px 72px;
+}
+.paper {
+	background: var(--paper);
+	border: 1px solid var(--rule);
+	border-radius: 8px;
+	padding: 40px 44px;
+	box-shadow: 0 10px 30px rgba(20, 22, 33, .08);
+}
+.head {
+	border-bottom: 1px solid var(--rule);
+	padding-bottom: 18px;
+	margin-bottom: 24px;
+}
+h1.title { margin: 0 0 8px; font-size: 28px; line-height: 1.3; }
+.meta { color: var(--muted); font-size: 13px; }
+.tags { margin-top: 12px; }
+.tag {
+	display: inline-block;
+	color: var(--accent);
+	border: 1px solid var(--accent);
+	border-radius: 99px;
+	padding: 2px 10px;
+	margin: 0 6px 4px 0;
+	font-size: 12px;
+}
+main h1, main h2 { color: var(--accent); line-height: 1.35; }
+main h1 { font-size: 24px; border-bottom: 2px solid var(--rule); padding-bottom: 6px; margin: 1.4em 0 .5em; }
+main h2 { font-size: 20px; margin: 1.4em 0 .5em; }
+main h3 { color: var(--ink); font-size: 17px; margin: 1.3em 0 .4em; }
+main h4, main h5, main h6 { color: var(--muted); margin: 1.2em 0 .4em; }
+main p { margin: .8em 0; }
+main a { color: var(--accent); text-decoration: none; border-bottom: 1px solid var(--accent); }
+main ul, main ol { padding-left: 1.4em; }
+main li { margin: .25em 0; }
+main code {
+	background: var(--code);
+	padding: .15em .4em;
+	border-radius: 4px;
+	font: 13px/1.5 "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+}
+pre {
+	background: var(--code);
+	border: 1px solid var(--rule);
+	border-radius: 6px;
+	padding: 14px 16px;
+	overflow-x: auto;
+}
+pre code { background: transparent; padding: 0; }
+blockquote {
+	margin: .8em 0;
+	padding: .1em 1em;
+	border-left: 3px solid var(--accent);
+	color: var(--muted);
+}
+hr { border: none; border-top: 1px solid var(--rule); margin: 2em 0; }
+table { border-collapse: collapse; width: 100%; margin: 1em 0; }
+th, td { border: 1px solid var(--rule); padding: 7px 12px; text-align: left; }
+th { background: var(--code); }
+img { max-width: 100%; }
+footer { margin-top: 28px; color: var(--muted); font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="page">
+<article class="paper">
+<header class="head">
+<h1 class="title">{{.Title}}</h1>
+<div class="meta">{{.Path}}{{if .Created}} · created {{.Created}}{{end}}</div>
+{{if .Tags}}<div class="tags">{{range .Tags}}<span class="tag">{{.}}</span>{{end}}</div>{{end}}
+</header>
+<main>
+{{.Body}}
+</main>
+<footer>Exported from vnote · Markdown</footer>
+</article>
+</div>
+</body>
+</html>
+`
+
+var htmlExportTemplate = template.Must(template.New("note").Parse(htmlExportPage))
+
+// buildHTMLExport renders a note's Markdown body into a self-contained,
+// styled HTML page. Front-matter metadata becomes the document title and
+// tags, and raw HTML in the note is sanitized before being embedded.
+func buildHTMLExport(path, content string) (string, error) {
+	meta, body := parseFrontMatter(content)
+	title := meta.Title
+	if title == "" {
+		title = strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+	}
+	rendered, err := renderMarkdownHTML(body)
+	if err != nil {
+		return "", err
+	}
+	var buf strings.Builder
+	if err := htmlExportTemplate.Execute(&buf, htmlExportData{
+		Title:   title,
+		Path:    path,
+		Created: meta.Created,
+		Tags:    meta.Tags,
+		Body:    template.HTML(rendered),
+	}); err != nil {
+		return "", err
+	}
+	return buf.String(), nil
+}
+
+func renderMarkdownHTML(markdown string) (string, error) {
+	md := goldmark.New(goldmark.WithExtensions(extension.GFM))
+	var buf strings.Builder
+	if err := md.Convert([]byte(markdown), &buf); err != nil {
+		return "", err
+	}
+	return bluemonday.UGCPolicy().Sanitize(buf.String()), nil
+}
+
 func (m Model) exportDialogView() string {
 	title := "Export"
 	if m.batchExport {
@@ -1327,12 +1609,18 @@ func (m Model) exportDialogView() string {
 	}
 	var body string
 	if m.exportPath {
-		body = m.input.View() + "\n\n" + mutedSty.Render("Enter 导出  ·  Esc 取消")
+		format := "Markdown"
+		if m.exportHTML {
+			format = "HTML"
+		}
+		body = m.input.View() + "\n\n" + mutedSty.Render("Format: "+format) + "\n" + mutedSty.Render("Enter 导出  ·  Esc 取消")
 		if m.statusErr {
 			body += "\n" + errorSty.Render(m.status)
 		}
+	} else if m.batchExport {
+		body = "1  Markdown\n2  HTML\n\n" + mutedSty.Render("Esc 取消")
 	} else {
-		body = "1  复制到剪贴板\n2  另存为\n\n" + mutedSty.Render("Esc 取消")
+		body = "1  复制到剪贴板\n2  另存为\n3  导出 HTML\n\n" + mutedSty.Render("Esc 取消")
 	}
 	dialog := lipgloss.NewStyle().Background(surface).Foreground(text).Border(lipgloss.RoundedBorder()).BorderForeground(muted).Padding(1, 3).Width(min(64, max(28, m.width-6))).Render(brandSty.Render(title) + "\n\n" + body)
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, dialog, lipgloss.WithWhitespaceBackground(bg))
@@ -1530,6 +1818,7 @@ func (m *Model) openPath(path string) bool {
 }
 
 func (m *Model) pushHistory(path string) {
+	m.rememberRecent(path)
 	if len(m.history) > 0 && m.history[m.historyIndex] == path {
 		return
 	}
@@ -1556,6 +1845,8 @@ func (m *Model) goBack() {
 	}
 	if !m.openPath(m.history[m.historyIndex]) {
 		m.historyIndex++
+	} else {
+		m.rememberRecent(m.history[m.historyIndex])
 	}
 }
 
@@ -1571,7 +1862,26 @@ func (m *Model) goForward() {
 	}
 	if !m.openPath(m.history[m.historyIndex]) {
 		m.historyIndex--
+	} else {
+		m.rememberRecent(m.history[m.historyIndex])
 	}
+}
+
+func (m *Model) rememberRecent(path string) {
+	if path == "" {
+		return
+	}
+	out := make([]string, 0, len(m.recent)+1)
+	out = append(out, path)
+	for _, p := range m.recent {
+		if p != path {
+			out = append(out, p)
+		}
+	}
+	if len(out) > 20 {
+		out = out[:20]
+	}
+	m.recent = out
 }
 
 func (m *Model) togglePinned() {
@@ -2250,6 +2560,18 @@ func (m Model) updateGlobalSearch(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "down", "tab":
 		m.moveGlobalSearch(1)
 		return m, nil
+	case "home":
+		m.globalSearchIndex = 0
+		return m, nil
+	case "end":
+		m.globalSearchIndex = max(0, len(m.globalSearchResults)-1)
+		return m, nil
+	case "pgup":
+		m.moveGlobalSearch(-10)
+		return m, nil
+	case "pgdown":
+		m.moveGlobalSearch(10)
+		return m, nil
 	}
 	var cmd tea.Cmd
 	m.input, cmd = m.input.Update(msg)
@@ -2384,6 +2706,7 @@ func (m *Model) startQuickOpen() {
 	m.input.SetValue("")
 	m.input.Width = max(10, min(50, m.width-12))
 	m.input.Focus()
+	m.runQuickOpen("")
 }
 
 func (m Model) updateQuickOpen(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -2399,6 +2722,18 @@ func (m Model) updateQuickOpen(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "down", "tab":
 		m.moveQuickOpen(1)
+		return m, nil
+	case "home":
+		m.quickOpenIndex = 0
+		return m, nil
+	case "end":
+		m.quickOpenIndex = max(0, len(m.quickOpenResults)-1)
+		return m, nil
+	case "pgup":
+		m.moveQuickOpen(-10)
+		return m, nil
+	case "pgdown":
+		m.moveQuickOpen(10)
 		return m, nil
 	}
 	var cmd tea.Cmd
@@ -2435,6 +2770,7 @@ func (m *Model) runQuickOpen(query string) {
 	m.quickOpenIndex = 0
 	q := strings.ToLower(strings.TrimSpace(query))
 	if q == "" {
+		m.quickOpenResults = m.recentQuickOpenResults()
 		return
 	}
 	type candidate struct {
@@ -2482,6 +2818,36 @@ func (m *Model) runQuickOpen(query string) {
 	}
 }
 
+// recentQuickOpenResults returns recently opened notes that still exist on
+// disk, most recent first, for the empty Quick Open query.
+func (m Model) recentQuickOpenResults() []quickOpenResult {
+	exists := make(map[string]bool)
+	var collect func([]*storage.Node)
+	collect = func(nodes []*storage.Node) {
+		for _, n := range nodes {
+			if n.IsDir {
+				collect(n.Children)
+				continue
+			}
+			exists[n.RelPath] = true
+		}
+	}
+	collect(m.tree)
+
+	var out []quickOpenResult
+	for _, path := range m.recent {
+		if !exists[path] {
+			continue
+		}
+		title := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+		out = append(out, quickOpenResult{path: path, title: title, dir: filepath.Dir(path)})
+		if len(out) >= 12 {
+			break
+		}
+	}
+	return out
+}
+
 func (m *Model) moveQuickOpen(delta int) {
 	n := len(m.quickOpenResults)
 	if n == 0 {
@@ -2513,6 +2879,9 @@ func (m Model) quickOpenView() string {
 			b.WriteString("\n" + errorSty.Render("No matching notes"))
 		}
 	} else {
+		if strings.TrimSpace(m.quickOpenQuery) == "" {
+			b.WriteString("\n" + lipgloss.NewStyle().Foreground(accent).Bold(true).Render("Recent") + "\n")
+		}
 		for i, r := range m.quickOpenResults {
 			b.WriteString("\n" + m.quickOpenResultRow(r, i == m.quickOpenIndex))
 		}
@@ -3650,7 +4019,7 @@ func (m Model) bodyRenderHeight() int {
 func (m Model) headerView() string {
 	brand := lipgloss.NewStyle().Foreground(accent).Bold(true).Render("◆ vnote")
 	tabs := m.headerTabs()
-	left := brand + mutedSty.Render("  ·  ") + tabs
+	left := brand + mutedSty.Render("  │  ") + tabs
 
 	name := "no note"
 	if m.currentPath != "" {
@@ -4024,11 +4393,16 @@ func (m Model) editShortcutBar() string {
 func (m Model) composeBar(left, right string) string {
 	lw := lipgloss.Width(left)
 	rw := lipgloss.Width(right)
-	pad := m.width - lw - rw - 2
+	divider := ""
+	if lw > 0 && rw > 0 {
+		divider = mutedSty.Render("│") + " "
+	}
+	dw := lipgloss.Width(divider)
+	pad := m.width - lw - rw - dw - 2
 	if pad < 0 {
 		pad = 0
 	}
-	return lipgloss.NewStyle().Foreground(muted).Width(m.width).MaxHeight(1).Render(" " + left + strings.Repeat(" ", pad) + " " + right)
+	return lipgloss.NewStyle().Foreground(muted).Width(m.width).MaxHeight(1).Render(" " + left + divider + strings.Repeat(" ", pad) + " " + right)
 }
 
 func (m Model) searchBarView() string {
@@ -4231,6 +4605,18 @@ func (m *Model) updateCommand(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "down":
 		m.moveCommand(1)
 		return *m, nil
+	case "home":
+		m.commandIndex = 0
+		return *m, nil
+	case "end":
+		m.commandIndex = max(0, len(m.filteredCommands())-1)
+		return *m, nil
+	case "pgup":
+		m.moveCommand(-10)
+		return *m, nil
+	case "pgdown":
+		m.moveCommand(10)
+		return *m, nil
 	}
 	var cmd tea.Cmd
 	m.input, cmd = m.input.Update(msg)
@@ -4274,6 +4660,13 @@ func (m *Model) commandList() []command {
 		{"Go to line", m.startGotoLine},
 		{"Focus mode", m.toggleFocus},
 		{"Export note", m.exportNoteCommand},
+		{"Export as HTML", func() {
+			if m.currentPath == "" {
+				m.flashStatus("Open a note first", true, 2*time.Second)
+				return
+			}
+			m.startHTMLExport()
+		}},
 		{"New note", m.startTemplate},
 		{"New folder", func() { m.startPrompt(promptDir) }},
 		{"Rename", func() { m.startPrompt(promptRename) }},

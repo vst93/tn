@@ -1341,13 +1341,19 @@ func TestBatchExport(t *testing.T) {
 	if handled, _ := m.globalKey("ctrl+shift+e"); !handled {
 		t.Fatal("expected Ctrl+Shift+E to handle batch export")
 	}
-	if m.mode != modeExport || !m.batchExport || !m.exportPath {
-		t.Fatalf("expected batch export path dialog, mode=%v batch=%v path=%v", m.mode, m.batchExport, m.exportPath)
+	if m.mode != modeExport || !m.batchExport || m.exportPath {
+		t.Fatalf("expected batch export format menu, mode=%v batch=%v path=%v", m.mode, m.batchExport, m.exportPath)
+	}
+
+	updated, _ := m.updateExport(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'1'}})
+	m = updated.(Model)
+	if !m.batchExport || !m.exportPath || m.exportHTML {
+		t.Fatalf("expected Markdown batch export path dialog, batch=%v path=%v html=%v", m.batchExport, m.exportPath, m.exportHTML)
 	}
 
 	outDir := filepath.Join(t.TempDir(), "out")
 	m.input.SetValue(outDir)
-	updated, _ := m.updateExport(tea.KeyMsg{Type: tea.KeyEnter})
+	updated, _ = m.updateExport(tea.KeyMsg{Type: tea.KeyEnter})
 	m = updated.(Model)
 	if m.mode != modeNormal {
 		t.Fatalf("expected export to finish, mode=%v", m.mode)
@@ -2052,5 +2058,245 @@ func TestTreeMouseWheelStepsByOne(t *testing.T) {
 	m.handleMouse(tea.MouseEvent{Button: tea.MouseButtonWheelUp, Action: tea.MouseActionPress, X: 3, Y: 2})
 	if m.treeOffset != 0 {
 		t.Fatalf("expected tree wheel up to restore offset 0, got %d", m.treeOffset)
+	}
+}
+
+func TestHTMLExportShortcutSavesStyledPage(t *testing.T) {
+	store := storage.New(t.TempDir())
+	note, err := store.CreateNote("", "html-export")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := New(store)
+	m.resize(100, 30)
+	m.selectPath(note)
+	m.openSelectedNote()
+	m.editor.SetValue(writeFrontMatter("# Heading\n\nSome **bold** text.\n", FrontMatter{Title: "My Doc", Tags: []string{"work", "report"}}))
+
+	if handled, _ := m.globalKey("alt+h"); !handled {
+		t.Fatal("expected Alt+H to be handled in preview mode")
+	}
+	if m.mode != modeExport || !m.exportHTML || !m.exportPath {
+		t.Fatalf("expected HTML export path dialog, mode=%v html=%v path=%v", m.mode, m.exportHTML, m.exportPath)
+	}
+	if want := filepath.Join(store.Root, "html-export.html"); m.input.Value() != want {
+		t.Fatalf("default HTML path = %q, want %q", m.input.Value(), want)
+	}
+
+	m.input.SetValue("out.html")
+	updated, _ := m.updateExport(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	if m.mode != modeNormal {
+		t.Fatalf("expected export to finish, mode=%v", m.mode)
+	}
+	data, err := os.ReadFile(filepath.Join(store.Root, "out.html"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := string(data)
+	for _, want := range []string{"<title>My Doc</title>", "<span class=\"tag\">work</span>", "<h1>Heading</h1>", "<strong>bold</strong>"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("expected HTML to contain %q, got:\n%s", want, out)
+		}
+	}
+	if m.status != "✓ Exported HTML to "+filepath.Join(store.Root, "out.html") || !m.statusOK {
+		t.Fatalf("unexpected export status %q, ok=%v", m.status, m.statusOK)
+	}
+}
+
+func TestHTMLExportDialogOption3(t *testing.T) {
+	store := storage.New(t.TempDir())
+	note, err := store.CreateNote("", "html-option")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := New(store)
+	m.resize(100, 30)
+	m.selectPath(note)
+	m.openSelectedNote()
+	m.editor.SetValue("# Option 3\n")
+
+	m.startExport()
+	updated, _ := m.updateExport(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'3'}})
+	m = updated.(Model)
+	if !m.exportHTML || !m.exportPath {
+		t.Fatalf("expected option 3 to start HTML path dialog, html=%v path=%v", m.exportHTML, m.exportPath)
+	}
+	if want := filepath.Join(store.Root, "html-option.html"); m.input.Value() != want {
+		t.Fatalf("default HTML path = %q, want %q", m.input.Value(), want)
+	}
+
+	m.input.SetValue("opt3.html")
+	updated, _ = m.updateExport(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	if m.mode != modeNormal {
+		t.Fatalf("expected export to finish, mode=%v", m.mode)
+	}
+	data, err := os.ReadFile(filepath.Join(store.Root, "opt3.html"))
+	if err != nil || !strings.Contains(string(data), "Option 3") {
+		t.Fatalf("expected HTML content, got %q, %v", string(data), err)
+	}
+}
+
+func TestBatchHTMLExport(t *testing.T) {
+	store := storage.New(t.TempDir())
+	noteA, err := store.CreateNote("", "alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	noteB, err := store.CreateNote("", "beta")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Write(noteA, "# Alpha\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Write(noteB, "# Beta\n"); err != nil {
+		t.Fatal(err)
+	}
+
+	m := New(store)
+	m.resize(100, 30)
+	m.selectAllVisible()
+	if handled, _ := m.globalKey("ctrl+shift+e"); !handled {
+		t.Fatal("expected Ctrl+Shift+E to handle batch export")
+	}
+	updated, _ := m.updateExport(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'2'}})
+	m = updated.(Model)
+	if !m.batchExport || !m.exportHTML || !m.exportPath {
+		t.Fatalf("expected HTML batch path dialog, batch=%v html=%v path=%v", m.batchExport, m.exportHTML, m.exportPath)
+	}
+
+	outDir := filepath.Join(t.TempDir(), "html")
+	m.input.SetValue(outDir)
+	updated, _ = m.updateExport(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	if m.mode != modeNormal {
+		t.Fatalf("expected export to finish, mode=%v", m.mode)
+	}
+	for _, name := range []string{"alpha.html", "beta.html"} {
+		data, err := os.ReadFile(filepath.Join(outDir, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(data), "<!DOCTYPE html>") {
+			t.Fatalf("expected %s to be HTML, got %q", name, string(data))
+		}
+	}
+}
+
+func TestBuildHTMLExportSanitizesRawHTML(t *testing.T) {
+	out, err := buildHTMLExport("note.md", "# Safe\n\n<script>alert(1)</script>\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out, "<script>") {
+		t.Fatalf("expected raw script to be sanitized, got:\n%s", out)
+	}
+	if !strings.Contains(out, "Safe") {
+		t.Fatalf("expected rendered content in HTML, got:\n%s", out)
+	}
+}
+
+func TestRecentNotesOrderAndQuickOpen(t *testing.T) {
+	store := storage.New(t.TempDir())
+	alpha, err := store.CreateNote("", "alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	beta, err := store.CreateNote("", "beta")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	m := New(store)
+	m.resize(100, 30)
+	m.selectPath(alpha)
+	m.openSelectedNote()
+	m.selectPath(beta)
+	m.openSelectedNote()
+	if len(m.recent) != 2 || m.recent[0] != beta || m.recent[1] != alpha {
+		t.Fatalf("unexpected recent order %v", m.recent)
+	}
+
+	m.startQuickOpen()
+	if len(m.quickOpenResults) != 2 || m.quickOpenResults[0].path != beta || m.quickOpenResults[1].path != alpha {
+		t.Fatalf("unexpected recent quick open results %+v", m.quickOpenResults)
+	}
+	view := stripANSI(m.quickOpenView())
+	if !strings.Contains(view, "Recent") {
+		t.Fatalf("expected Recent heading in quick open, got %q", view)
+	}
+}
+
+func TestRecentNotesPersistAcrossSession(t *testing.T) {
+	store := storage.New(t.TempDir())
+	alpha, err := store.CreateNote("", "alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	beta, err := store.CreateNote("", "beta")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	m := New(store)
+	m.sessionPath = filepath.Join(t.TempDir(), "session.json")
+	m.resize(100, 30)
+	m.selectPath(alpha)
+	m.openSelectedNote()
+	m.selectPath(beta)
+	m.openSelectedNote()
+	m.saveSession()
+
+	restored := New(store)
+	restored.sessionPath = m.sessionPath
+	restored = restored.restoreSession()
+	if len(restored.recent) != 2 || restored.recent[0] != beta || restored.recent[1] != alpha {
+		t.Fatalf("expected recent list restored, got %v", restored.recent)
+	}
+}
+
+func TestResultListHomeEndNavigation(t *testing.T) {
+	m := New(storage.New(t.TempDir()))
+	m.resize(100, 30)
+	m.quickOpenResults = []quickOpenResult{
+		{path: "a.md", title: "a"},
+		{path: "b.md", title: "b"},
+		{path: "c.md", title: "c"},
+	}
+	m.quickOpenIndex = 0
+	updated, _ := m.updateQuickOpen(tea.KeyMsg{Type: tea.KeyEnd})
+	m = updated.(Model)
+	if m.quickOpenIndex != 2 {
+		t.Fatalf("expected End to jump to last quick open result, got %d", m.quickOpenIndex)
+	}
+	updated, _ = m.updateQuickOpen(tea.KeyMsg{Type: tea.KeyHome})
+	m = updated.(Model)
+	if m.quickOpenIndex != 0 {
+		t.Fatalf("expected Home to jump to first quick open result, got %d", m.quickOpenIndex)
+	}
+	updated, _ = m.updateQuickOpen(tea.KeyMsg{Type: tea.KeyPgDown})
+	m = updated.(Model)
+	if m.quickOpenIndex != 1 {
+		t.Fatalf("expected PgDn to move quick open result, got %d", m.quickOpenIndex)
+	}
+
+	m.globalSearchResults = []globalSearchResult{
+		{path: "a.md", title: "a"},
+		{path: "b.md", title: "b"},
+	}
+	m.globalSearchIndex = 0
+	updated, _ = m.updateGlobalSearch(tea.KeyMsg{Type: tea.KeyEnd})
+	m = updated.(Model)
+	if m.globalSearchIndex != 1 {
+		t.Fatalf("expected End to jump to last global search result, got %d", m.globalSearchIndex)
+	}
+
+	m.startCommand()
+	updated, _ = m.updateCommand(tea.KeyMsg{Type: tea.KeyEnd})
+	m = updated.(Model)
+	if m.commandIndex != len(m.filteredCommands())-1 {
+		t.Fatalf("expected End to jump to last command, got %d", m.commandIndex)
 	}
 }
