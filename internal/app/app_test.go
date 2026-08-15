@@ -300,6 +300,58 @@ func TestStatusFlashAutoClears(t *testing.T) {
 	}
 }
 
+func TestSaveKeyInPreviewAndEditModes(t *testing.T) {
+	store := storage.New(t.TempDir())
+	note, err := store.CreateNote("", "save-keys")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := New(store)
+	m.resize(100, 30)
+	m.selectPath(note)
+	m.openSelectedNote()
+
+	// Preview mode: plain 's' saves the note.
+	m.editor.SetValue("# Preview edit\n")
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m = updated.(Model)
+	if m.mode != modeNormal {
+		t.Fatalf("expected preview mode, got %v", m.mode)
+	}
+	if m.status != "✓ Saved "+note || !m.statusOK {
+		t.Fatalf("expected 's' to save in preview mode, got status %q ok=%v", m.status, m.statusOK)
+	}
+	if content, err := store.Read(note); err != nil || content != "# Preview edit\n" {
+		t.Fatalf("preview-mode save wrote %q, %v", content, err)
+	}
+
+	// Edit mode: plain 's' must type into the editor, not save.
+	m.toggleEdit()
+	m.editor.SetValue("abc")
+	m.editor.SetCursor(3)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m = updated.(Model)
+	if m.mode != modeEdit {
+		t.Fatalf("expected edit mode, got %v", m.mode)
+	}
+	if m.editor.Value() != "abcs" {
+		t.Fatalf("expected 's' to be typed in edit mode, got %q", m.editor.Value())
+	}
+	if content, _ := store.Read(note); content != "# Preview edit\n" {
+		t.Fatalf("edit-mode 's' must not save, store content = %q", content)
+	}
+
+	// Edit mode: Ctrl+S saves.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlS})
+	m = updated.(Model)
+	if m.status != "✓ Saved "+note || !m.statusOK {
+		t.Fatalf("expected Ctrl+S to save in edit mode, got status %q ok=%v", m.status, m.statusOK)
+	}
+	if content, err := store.Read(note); err != nil || content != "abcs" {
+		t.Fatalf("edit-mode Ctrl+S wrote %q, %v", content, err)
+	}
+}
+
 func TestNoNoteStatusBarShowsHint(t *testing.T) {
 	store := storage.New(t.TempDir())
 	m := New(store)
@@ -1421,6 +1473,98 @@ func TestBatchDelete(t *testing.T) {
 	}
 	if m.selectedCount() != 0 {
 		t.Fatalf("expected selection cleared after batch delete, got %d", m.selectedCount())
+	}
+}
+
+func TestSingleDeleteViaXKey(t *testing.T) {
+	store := storage.New(t.TempDir())
+	noteA, err := store.CreateNote("", "alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	noteB, err := store.CreateNote("", "beta")
+	if err != nil {
+		t.Fatal(err)
+	}
+	noteC, err := store.CreateNote("", "gamma")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	m := New(store)
+	m.resize(100, 30)
+	if len(m.flat) != 3 {
+		t.Fatalf("expected 3 flat rows, got %d", len(m.flat))
+	}
+
+	// Select the middle note (beta) and press 'x'.
+	m.selectPath(noteB)
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}})
+	m = updated.(Model)
+	if m.mode != modeConfirm {
+		t.Fatalf("expected confirm mode after 'x', got mode=%v", m.mode)
+	}
+	if m.confirm != "beta.md" || m.confirmCount != 0 || m.confirmDir {
+		t.Fatalf("unexpected confirm state: confirm=%q count=%d dir=%v", m.confirm, m.confirmCount, m.confirmDir)
+	}
+	if view := stripANSI(m.dialogView()); !strings.Contains(view, "Delete \u201cbeta.md\u201d?") {
+		t.Fatalf("expected delete confirmation dialog, got %q", view)
+	}
+
+	// Confirm the delete.
+	updated, _ = m.updateConfirm("y")
+	m = updated.(Model)
+	if m.mode != modeNormal {
+		t.Fatalf("expected normal mode after confirm, got %v", m.mode)
+	}
+	// Note deleted on disk.
+	if _, err := os.Stat(filepath.Join(store.Root, noteB)); !os.IsNotExist(err) {
+		t.Fatalf("expected %q deleted, err=%v", noteB, err)
+	}
+	// Tree refreshed: flat list rebuilt without beta.
+	if len(m.flat) != 2 {
+		t.Fatalf("expected tree refreshed to 2 rows, got %d", len(m.flat))
+	}
+	var paths []string
+	for _, item := range m.flat {
+		paths = append(paths, item.node.RelPath)
+	}
+	if paths[0] != noteA || paths[1] != noteC {
+		t.Fatalf("unexpected flat rows after delete: %v", paths)
+	}
+	// Selection must land on the NEXT item (gamma), not the first item.
+	if got := m.selectedPath(); got != noteC {
+		t.Fatalf("expected selection on next item %q after delete, got %q", noteC, got)
+	}
+}
+
+func TestSingleDeleteLastItemClampsSelection(t *testing.T) {
+	store := storage.New(t.TempDir())
+	noteA, err := store.CreateNote("", "alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	noteB, err := store.CreateNote("", "beta")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	m := New(store)
+	m.resize(100, 30)
+	m.selectPath(noteB) // last item
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}})
+	m = updated.(Model)
+	updated, _ = m.updateConfirm("y")
+	m = updated.(Model)
+
+	if _, err := os.Stat(filepath.Join(store.Root, noteB)); !os.IsNotExist(err) {
+		t.Fatalf("expected %q deleted, err=%v", noteB, err)
+	}
+	if len(m.flat) != 1 {
+		t.Fatalf("expected 1 remaining row, got %d", len(m.flat))
+	}
+	if got := m.selectedPath(); got != noteA {
+		t.Fatalf("expected selection clamped to last remaining item %q, got %q", noteA, got)
 	}
 }
 

@@ -262,6 +262,7 @@ var helpGroupsData = []helpGroup{
 			{"*", "Pin / unpin note"},
 			{"Ctrl+E", "Edit / preview"},
 			{"Ctrl+S", "Save"},
+			{"s", "Save (preview)"},
 			{"Ctrl+Z", "Undo"},
 			{"Ctrl+Shift+Z / Ctrl+Y", "Redo"},
 			{"Ctrl+Shift+T", "Edit tags"},
