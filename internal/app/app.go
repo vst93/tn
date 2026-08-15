@@ -246,6 +246,7 @@ var helpGroupsData = []helpGroup{
 			{"Enter", "Open note"},
 			{"Ctrl+O", "Quick open note"},
 			{"Tab", "Switch panel"},
+			{"t", "Toggle tree visibility"},
 			{"Alt+← / Alt+→", "Back / forward history"},
 			{"F / B", "Page preview down / up"},
 			{"f", "Find in note"},
@@ -398,6 +399,7 @@ type Model struct {
 	treeWidth     int
 	bodyHeight    int
 	compact       bool
+	treeVisible   bool
 	selecting     bool
 	copier        func(string) error
 	pending       tea.Cmd
@@ -478,6 +480,7 @@ func New(store *storage.Store) Model {
 		selectedItems: make(map[string]bool),
 		recent:        make([]string, 0, 20),
 		active:        treePane,
+		treeVisible:   true,
 		mode:          modeNormal,
 		editor:        editor,
 		preview:       viewport.New(60, 20),
@@ -840,6 +843,9 @@ func (m *Model) globalKey(key string) (handled, quit bool) {
 	case "s":
 		m.save()
 		return true, false
+	case "t":
+		m.toggleTree()
+		return true, false
 	case "y":
 		m.copyCurrent()
 		return true, false
@@ -1038,9 +1044,9 @@ func (m *Model) handleMouse(msg tea.MouseEvent) {
 		return
 	}
 
-	inTree := !m.compact && msg.X < m.treeWidth
+	inTree := !m.compact && m.treeVisible && msg.X < m.treeWidth
 	if m.compact {
-		inTree = m.active == treePane
+		inTree = m.active == treePane && m.treeVisible
 	}
 	if inTree {
 		m.switchToTree()
@@ -1107,6 +1113,8 @@ func (m *Model) runAction(action string) {
 		m.save()
 	case "pane":
 		m.togglePane()
+	case "tree":
+		m.toggleTree()
 	case "help":
 		m.startHelp()
 	}
@@ -1772,9 +1780,17 @@ func editSelectionKey(msg tea.KeyMsg) (tea.KeyMsg, bool) {
 func (m *Model) togglePane() {
 	if m.active == treePane {
 		m.switchToContent()
-	} else {
+	} else if m.treeVisible {
 		m.switchToTree()
 	}
+}
+
+func (m *Model) toggleTree() {
+	m.treeVisible = !m.treeVisible
+	if !m.treeVisible {
+		m.active = contentPane
+	}
+	m.resize(m.width, m.height)
 }
 
 func (m *Model) switchToTree() {
@@ -3410,6 +3426,7 @@ func (m Model) tagsRow(tags []string, width int) string {
 		if i > 0 && lipgloss.Width(b.String())+sep+lipgloss.Width(chip) > width {
 			lines = append(lines, b.String())
 			b.Reset()
+			b.WriteString(" ")
 			sep = 0
 		}
 		if sep > 0 {
@@ -3507,7 +3524,7 @@ func (m *Model) resize(width, height int) {
 	}
 
 	contentWidth := m.width
-	if !m.compact {
+	if !m.compact && m.treeVisible {
 		contentWidth = max(1, m.width-m.treeWidth-1)
 	}
 	m.editor.SetWidth(max(10, contentWidth-4))
@@ -3975,11 +3992,13 @@ func (m Model) View() string {
 	header := m.headerView()
 	var body string
 	if m.compact {
-		if m.active == treePane {
+		if m.treeVisible && m.active == treePane {
 			body = m.treeView(m.width)
 		} else {
 			body = m.contentView(m.width)
 		}
+	} else if !m.treeVisible {
+		body = m.contentView(m.width)
 	} else {
 		contentW := max(1, m.width-m.treeWidth-1)
 		separator := strings.Repeat("│\n", m.bodyRenderHeight()-1) + "│"
@@ -4037,6 +4056,13 @@ func (m Model) headerView() string {
 // mirrors headerView's layout so clicks stay aligned when labels change.
 func (m Model) headerTabAt(x int) (pane, bool) {
 	notesStart := 1 + lipgloss.Width("◆ tn") + lipgloss.Width("  │  ")
+	if !m.treeVisible {
+		contentW := lipgloss.Width(m.contentTabLabel())
+		if x >= notesStart && x < notesStart+contentW {
+			return contentPane, true
+		}
+		return contentPane, false
+	}
 	notesW := lipgloss.Width(" 1 Notes ")
 	contentStart := notesStart + notesW + 1
 	contentW := lipgloss.Width(" 2 Preview ")
@@ -4053,6 +4079,9 @@ func (m Model) headerTabAt(x int) (pane, bool) {
 }
 
 func (m Model) headerTabs() string {
+	if !m.treeVisible {
+		return m.contentTabLabel()
+	}
 	notesStyle := lipgloss.NewStyle().Foreground(muted)
 	contentStyle := lipgloss.NewStyle().Foreground(muted)
 	if m.active == treePane {
@@ -4067,6 +4096,18 @@ func (m Model) headerTabs() string {
 	return notesStyle.Render(" 1 Notes ") + " " + contentStyle.Render(" "+contentLabel+" ")
 }
 
+func (m Model) contentTabLabel() string {
+	contentStyle := lipgloss.NewStyle().Foreground(muted)
+	if !m.treeVisible || m.active != treePane {
+		contentStyle = contentStyle.Background(accent).Foreground(bg).Bold(true)
+	}
+	contentLabel := "2 Preview"
+	if m.mode == modeEdit {
+		contentLabel = "2 Edit"
+	}
+	return contentStyle.Render(" " + contentLabel + " ")
+}
+
 func (m Model) toolbarItems() []toolbarItem {
 	items := []toolbarItem{
 		{"? help", "help"}, {"# tag", "tagfilter"}, {"n note", "note"}, {"N folder", "folder"}, {"e edit/save", "edit"}, {"s save", "save"}, {"y copy", "copy"}, {"f find", "find"}, {"^G select", "select"}, {"r rename", "rename"}, {"x delete", "delete"}, {"q quit", "quit"},
@@ -4077,6 +4118,8 @@ func (m Model) toolbarItems() []toolbarItem {
 			label = "← lists"
 		}
 		items = append(items, toolbarItem{label, "pane"})
+	} else if m.treeVisible {
+		items = append(items, toolbarItem{"t tree", "tree"})
 	}
 	return items
 }
@@ -4681,6 +4724,7 @@ func (m *Model) commandList() []command {
 		{"Quick open", m.startQuickOpen},
 		{"Go to line", m.startGotoLine},
 		{"Focus mode", m.toggleFocus},
+		{"Toggle tree", m.toggleTree},
 		{"Export note", m.exportNoteCommand},
 		{"Export as HTML", func() {
 			if m.currentPath == "" {

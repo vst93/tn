@@ -1617,6 +1617,40 @@ func TestAutoSaveNotBeforeTwoSeconds(t *testing.T) {
 	}
 }
 
+func TestQQuitBlockedWhenDirty(t *testing.T) {
+	m, _, _ := openEditModel(t, "quit-dirty")
+	m.sessionPath = filepath.Join(t.TempDir(), "session.json") // never touch the real ~/.tn session
+	m.editor.SetValue("# Unsaved\n")
+	m.toggleEdit() // leave edit mode; q only quits from normal mode
+	if m.mode != modeNormal {
+		t.Fatalf("expected normal mode, got %v", m.mode)
+	}
+	if !m.dirty() {
+		t.Fatal("expected note to be dirty")
+	}
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	m = updated.(Model)
+	if cmd != nil {
+		t.Fatalf("expected no quit command while dirty, got %v", cmd)
+	}
+	if !strings.Contains(m.status, "Save or discard changes before quitting") {
+		t.Fatalf("expected discard warning, got %q", m.status)
+	}
+
+	if !m.save() {
+		t.Fatal("save failed")
+	}
+	updated, cmd = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	m = updated.(Model)
+	if cmd == nil {
+		t.Fatal("expected quit command after saving")
+	}
+	if msg := cmd(); msg != (tea.QuitMsg{}) {
+		t.Fatalf("expected tea.QuitMsg, got %T %v", msg, msg)
+	}
+}
+
 func TestCommandPaletteOpensAndFilters(t *testing.T) {
 	m, _, _ := openEditModel(t, "palette")
 
