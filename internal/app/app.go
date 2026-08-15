@@ -788,15 +788,36 @@ func (m *Model) globalKey(key string) (handled, quit bool) {
 		m.startHTMLExport()
 		return true, false
 	case "ctrl+n":
+		if m.mode == modeEdit {
+			return false, false
+		}
 		m.startPrompt(promptNote)
 		return true, false
 	case "ctrl+d":
+		if m.mode == modeEdit {
+			return false, false
+		}
 		m.startPrompt(promptDir)
 		return true, false
 	case "f2":
+		if m.mode == modeEdit {
+			return false, false
+		}
 		m.startPrompt(promptRename)
 		return true, false
-	case "delete", "ctrl+backspace", "x":
+	case "delete":
+		if m.mode == modeEdit {
+			return false, false
+		}
+		m.startDelete()
+		return true, false
+	case "ctrl+backspace":
+		if m.mode == modeEdit {
+			return false, false
+		}
+		m.startDelete()
+		return true, false
+	case "x":
 		m.startDelete()
 		return true, false
 	case "r":
@@ -883,9 +904,15 @@ func (m *Model) globalKey(key string) (handled, quit bool) {
 		}
 		return false, false
 	case "ctrl+g":
+		if m.mode == modeEdit {
+			return false, false
+		}
 		m.enterSelectionMode()
 		return true, false
 	case "ctrl+e":
+		if m.mode == modeEdit {
+			return false, false
+		}
 		m.toggleEdit()
 		return true, false
 	case "tab":
