@@ -503,7 +503,7 @@ func TestEditStatusBarShowsPosition(t *testing.T) {
 	m.gotoLineEdit(0)
 
 	bar := stripANSI(m.editShortcutBar())
-	if !strings.Contains(bar, "Ln 1 / 3 · Col 1") {
+	if !strings.Contains(bar, "Line 1 / 3 · Column 1") {
 		t.Fatalf("edit status bar missing position: %q", bar)
 	}
 }

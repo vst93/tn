@@ -247,9 +247,7 @@ var helpGroupsData = []helpGroup{
 			{"Ctrl+O", "Quick open note"},
 			{"Tab", "Switch panel"},
 			{"Alt+← / Alt+→", "Back / forward history"},
-			{"Space", "Toggle multi-select"},
-			{"Ctrl+A / Ctrl+Shift+A", "Select all / clear"},
-			{"Space / B", "Page preview down / up"},
+			{"F / B", "Page preview down / up"},
 		},
 	},
 	{
@@ -272,8 +270,9 @@ var helpGroupsData = []helpGroup{
 	{
 		title: "Copy",
 		rows: []helpRow{
-			{"Ctrl+C / Ctrl+Y", "Copy text"},
-			{"Ctrl+L", "Copy current line"},
+			{"Ctrl+C", "Copy text"},
+			{"y", "Copy text (preview)"},
+			{"Ctrl+L", "Copy current line (edit)"},
 			{"Ctrl+G", "Select terminal text"},
 		},
 	},
@@ -617,7 +616,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.setStatus("Mouse restored", false)
 			return m, tea.EnableMouseCellMotion
 		}
-		if key == "ctrl+c" {
+		if key == "ctrl+c" && (m.mode == modeNormal || m.mode == modeEdit) {
 			m.copyCurrent()
 			return m, m.takePending()
 		}
@@ -904,6 +903,9 @@ func (m *Model) globalKey(key string) (handled, quit bool) {
 			m.active = treePane
 		}
 		return true, false
+	case "#":
+		m.startTagFilter()
+		return true, false
 	case "ctrl+shift+p":
 		m.startCommand()
 		return true, false
@@ -1026,6 +1028,9 @@ func (m *Model) handleMouse(msg tea.MouseEvent) {
 					m.activateSelected()
 				} else {
 					m.openSelectedNote()
+					if m.mode == modeEdit {
+						m.switchToContent()
+					}
 				}
 			}
 		}
@@ -1791,7 +1796,13 @@ func (m *Model) openPath(path string) bool {
 	m.expandParents(path)
 	m.rebuildFlat()
 	m.selectPath(path)
-	m.setEditorBackground(bg)
+	if m.mode == modeEdit {
+		m.setEditorBackground(surface)
+		m.editor.Focus()
+	} else {
+		m.setEditorBackground(bg)
+		m.editor.Blur()
+	}
 	m.preview.GotoTop()
 	m.renderMarkdown()
 	return true
@@ -1967,6 +1978,11 @@ func (m Model) updatePrompt(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "enter":
 		value := m.input.Value()
+		if m.promptKind == promptRename && len(m.flat) > 0 && strings.TrimSpace(value) == m.flat[m.selected].node.Name {
+			m.mode = modeNormal
+			m.input.Blur()
+			return m, nil
+		}
 		var path string
 		var err error
 		switch m.promptKind {
@@ -2866,10 +2882,10 @@ func (m Model) globalSearchResultRow(r globalSearchResult, selected bool) string
 	}
 	line := ""
 	if r.lineNum > 0 {
-		line = mutedSty.Render(" · " + fmt.Sprintf("%d", r.lineNum))
+		line = mutedSty.Render(fmt.Sprintf("line %d: ", r.lineNum))
 	}
 	snippet := highlightKeyword(r.snippet, m.globalSearchQuery)
-	row := title + line + "   " + snippet
+	row := title + "   " + line + snippet
 	if selected {
 		row = lipgloss.NewStyle().Background(selection).Foreground(text).Render(row)
 	}
@@ -4018,11 +4034,12 @@ func (m Model) footerActionAt(x int) string {
 	if m.mode == modeEdit {
 		return ""
 	}
+	budget := m.toolbarBudget()
 	position := 1
 	for _, item := range m.toolbarItems() {
 		key, label, _ := strings.Cut(item.label, " ")
 		width := lipgloss.Width("[" + key + "] " + label + "  ")
-		if position+width > m.width {
+		if position+width > budget+1 {
 			break
 		}
 		if x >= position && x < position+width {
@@ -4105,7 +4122,7 @@ func (m Model) treeViewSides(width int, leftB, rightB bool) string {
 	}
 	if len(m.flat) == 0 {
 		lines = append(lines,
-			"  "+mutedSty.Render("No notes yet"),
+			"  "+mutedSty.Render("No notes yet. Press n to create one."),
 			"",
 			"  "+accentText.Render("n")+mutedSty.Render(" new note")+"   "+accentText.Render("N")+mutedSty.Render(" new folder"),
 		)
@@ -4146,7 +4163,7 @@ func (m Model) contentViewSides(width int, leftB, rightB bool) string {
 	if m.currentPath != "" {
 		state := lipgloss.NewStyle().Foreground(green).Render("saved")
 		if m.dirty() {
-			state = lipgloss.NewStyle().Foreground(danger).Render("modified")
+			state = lipgloss.NewStyle().Foreground(danger).Render("unsaved")
 		}
 		modeName := "preview"
 		if m.mode == modeEdit {
@@ -4193,7 +4210,7 @@ func (m Model) detailsView(width int) string {
 	}
 	state := lipgloss.NewStyle().Foreground(green).Render("saved")
 	if m.dirty() {
-		state = lipgloss.NewStyle().Foreground(danger).Render("modified")
+		state = lipgloss.NewStyle().Foreground(danger).Render("unsaved")
 	}
 	modeName := "preview"
 	if m.mode == modeEdit {
@@ -4306,6 +4323,14 @@ func (m Model) toolbarShortcut(budget int) string {
 	return b.String()
 }
 
+func (m Model) toolbarBudget() int {
+	right := m.statusText(m.status)
+	if right == "" {
+		right = m.readingStatus()
+	}
+	return max(0, m.width-lipgloss.Width(right)-2)
+}
+
 func (m Model) shortcutBar() string {
 	if m.mode == modeEdit {
 		return m.editShortcutBar()
@@ -4314,7 +4339,7 @@ func (m Model) shortcutBar() string {
 	if right == "" {
 		right = m.readingStatus()
 	}
-	return m.composeBar(m.toolbarShortcut(m.width-lipgloss.Width(right)-2), right)
+	return m.composeBar(m.toolbarShortcut(m.toolbarBudget()), right)
 }
 
 func (m Model) editShortcutBar() string {
@@ -4333,7 +4358,7 @@ func (m Model) editShortcutBar() string {
 		mutedSty.Render(" · Esc · Ctrl+L")
 	pos := m.cursorPos()
 	total := m.editor.LineCount()
-	right := fmt.Sprintf("Ln %d / %d · Col %d", pos.row+1, total, pos.col+1)
+	right := fmt.Sprintf("Line %d / %d · Column %d", pos.row+1, total, pos.col+1)
 	return m.composeBar(left, right)
 }
 
