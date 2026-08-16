@@ -577,6 +577,7 @@ func TestEditStatusBarShowsPosition(t *testing.T) {
 	m.toggleEdit()
 	m.editor.SetValue("a\nb\nc")
 	m.gotoLineEdit(0)
+	m.editor.SetCursor(0)
 
 	bar := stripANSI(m.editShortcutBar())
 	if !strings.Contains(bar, "Line 1 / 3 · Column 1") {

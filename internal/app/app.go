@@ -697,20 +697,29 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.editSel.end = m.cursorPos()
 				}
 			} else {
-				if msg.Type == tea.KeyEnter {
+				switch msg.Type {
+				case tea.KeyEnter:
 					if m.handleEditEnter(before, beforePos) {
 						m.editSel = nil
 						return m, nil
 					}
-				}
-				// Handle Ctrl+V for image paste in edit mode.
-				if msg.Type == tea.KeyCtrlV {
+				case tea.KeyCtrlV:
 					if ref, ok := m.tryPasteImage(); ok {
 						m.insertImageRef(ref)
 						m.editSel = nil
 						m.recordEdit(before, m.editor.Value(), beforePos, m.cursorPos())
 						return m, cmd
 					}
+				case tea.KeyCtrlLeft:
+					m.wordLeft()
+					m.editSel = nil
+					m.recordEdit(before, m.editor.Value(), beforePos, m.cursorPos())
+					return m, cmd
+				case tea.KeyCtrlRight:
+					m.wordRight()
+					m.editSel = nil
+					m.recordEdit(before, m.editor.Value(), beforePos, m.cursorPos())
+					return m, cmd
 				}
 				m.editSel = nil
 				m.editor, cmd = m.editor.Update(msg)
@@ -959,9 +968,6 @@ func (m *Model) globalKey(key string) (handled, quit bool) {
 		m.enterSelectionMode()
 		return true, false
 	case "ctrl+e":
-		if m.mode == modeEdit {
-			return false, false
-		}
 		m.toggleEdit()
 		return true, false
 	case "tab":
@@ -2022,7 +2028,7 @@ func (m *Model) pushHistory(path string) {
 
 func (m *Model) goBack() {
 	if m.historyIndex <= 0 {
-		m.flashStatus("No earlier note", true, 2*time.Second)
+		m.setStatus("No earlier note", false)
 		return
 	}
 	m.historyIndex--
@@ -2039,7 +2045,7 @@ func (m *Model) goBack() {
 
 func (m *Model) goForward() {
 	if m.historyIndex >= len(m.history)-1 {
-		m.flashStatus("No newer note", true, 2*time.Second)
+		m.setStatus("No newer note", false)
 		return
 	}
 	m.historyIndex++
@@ -2578,6 +2584,43 @@ func (m *Model) leaveEdit() {
 	} else {
 		m.setStatus("Preview mode", false)
 	}
+}
+
+// wordLeft moves cursor one word left (for Ctrl+Left).
+func (m *Model) wordLeft() {
+	line := m.currentLineText()
+	col := m.cursorPos().col
+	if col <= 0 {
+		return
+	}
+	// Skip spaces left, then skip word chars.
+	runes := []rune(line)
+	i := col - 1
+	for i >= 0 && runes[i] == ' ' {
+		i--
+	}
+	for i >= 0 && runes[i] != ' ' {
+		i--
+	}
+	m.editor.SetCursor(i + 1)
+}
+
+// wordRight moves cursor one word right (for Ctrl+Right).
+func (m *Model) wordRight() {
+	line := m.currentLineText()
+	col := m.cursorPos().col
+	runes := []rune(line)
+	if col >= len(runes) {
+		return
+	}
+	i := col
+	for i < len(runes) && runes[i] != ' ' {
+		i++
+	}
+	for i < len(runes) && runes[i] == ' ' {
+		i++
+	}
+	m.editor.SetCursor(i)
 }
 
 func (m *Model) setEditorBackground(c lipgloss.Color) {
@@ -3389,10 +3432,15 @@ func (m *Model) gotoLineEdit(line int) {
 	if line < 0 {
 		line = 0
 	}
-	if line > m.editor.LineCount()-1 {
-		line = m.editor.LineCount() - 1
+	maxLine := m.editor.LineCount() - 1
+	if maxLine < 0 {
+		maxLine = 0
+	}
+	if line > maxLine {
+		line = maxLine
 	}
 	current := m.editor.Line()
+	col := m.cursorPos().col
 	for current > line {
 		m.editor.CursorUp()
 		current--
@@ -3401,7 +3449,12 @@ func (m *Model) gotoLineEdit(line int) {
 		m.editor.CursorDown()
 		current++
 	}
-	m.editor.SetCursor(0)
+	// Preserve column position when possible; clamp to line length.
+	lineLen := len([]rune(m.currentLineText()))
+	if col > lineLen {
+		col = lineLen
+	}
+	m.editor.SetCursor(col)
 }
 
 func (m *Model) restoreEditFocus() {
@@ -3431,11 +3484,13 @@ func (m *Model) insertImageRef(ref string) {
 	lines := strings.Split(current, "\n")
 	row := m.editor.Line()
 	if row < len(lines) {
+		// Insert image ref on a new line after current, preserving cursor.
 		lines[row] = lines[row] + "\n\n![image](" + ref + ")\n"
 	} else {
 		lines = append(lines, "![image](" + ref + ")")
 	}
 	m.editor.SetValue(strings.Join(lines, "\n"))
+	// Move cursor to the line with the image ref.
 	m.gotoLineEdit(row + 2)
 	m.editor.SetCursor(0)
 	m.flashStatus("✓ Pasted image: "+filepath.Base(ref), false, 2*time.Second)
@@ -4737,7 +4792,7 @@ func (m Model) shortcutBar() string {
 	return m.composeBar(m.toolbarShortcut(m.toolbarBudget()), right)
 }
 
-func (m Model) editShortcutBar() string {
+func (m *Model) editShortcutBar() string {
 	undoSty := mutedSty
 	if m.undoable() {
 		undoSty = lipgloss.NewStyle().Foreground(accent)
@@ -4750,7 +4805,7 @@ func (m Model) editShortcutBar() string {
 		undoSty.Render("Ctrl+Z") +
 		mutedSty.Render(" · ") +
 		redoSty.Render("Ctrl+Shift+Z") +
-		mutedSty.Render(" · Esc · Ctrl+L")
+		mutedSty.Render(" · Esc · Ctrl+L · Ctrl+V")
 	pos := m.cursorPos()
 	total := m.editor.LineCount()
 	right := fmt.Sprintf("Line %d / %d · Column %d", pos.row+1, total, pos.col+1)
