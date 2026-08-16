@@ -61,6 +61,8 @@ const (
 	modeCommand
 	modeWebdavConfig
 	modeWebdavSync
+	modeBackup
+	modeImport
 )
 
 type promptKind int
@@ -292,19 +294,19 @@ var helpGroupsData = []helpGroup{
 		},
 	},
 	{
-		title: "Batch & export",
+		title: "Data",
 		rows: []helpRow{
-			{"Space", "Toggle multi-select"},
-			{"Ctrl+A", "Select all"},
-			{"Ctrl+Shift+A", "Clear selection"},
-			{"Ctrl+Shift+E", "Export"},
-			{"Alt+H", "Export note as HTML"},
+			{"Ctrl+Shift+E", "Export note"},
+			{"Alt+H", "Export as HTML"},
+			{"Ctrl+Shift+B", "Backup notebook"},
+			{"Ctrl+Shift+I", "Import from backup"},
 		},
 	},
 	{
 		title: "App",
 		rows: []helpRow{
 			{"Ctrl+Shift+F", "Focus mode"},
+			{"Alt+T", "Switch theme"},
 			{"Ctrl+R", "Refresh"},
 			{"Ctrl+Q", "Quit"},
 			{"?", "Help"},
@@ -663,6 +665,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.mode == modeExport {
 			return m.updateExport(msg)
 		}
+		if m.mode == modeBackup {
+			return m.updateBackup(msg)
+		}
+		if m.mode == modeImport {
+			return m.updateImport(msg)
+		}
 		if m.mode == modeTag {
 			return m.updateTagEdit(msg)
 		}
@@ -991,11 +999,25 @@ func (m *Model) globalKey(key string) (handled, quit bool) {
 	case "ctrl+shift+p":
 		m.startCommand()
 		return true, false
-	case "ctrl+shift+s":
-		m.startWebdavConfig()
+	case "ctrl+shift+b":
+		if m.mode == modeEdit {
+			return false, false
+		}
+		m.startBackup()
+		return true, false
+	case "ctrl+shift+i":
+		if m.mode == modeEdit {
+			return false, false
+		}
+		m.startImport()
 		return true, false
 	case "ctrl+shift+w":
 		m.syncWebdavNow()
+		return true, false
+	case "alt+t":
+		nextTheme()
+		m.refresh(m.currentPath)
+		m.flashStatus("Theme: "+currentTheme().Name, false, 1500*time.Millisecond)
 		return true, false
 	case "?":
 		m.startHelp()
@@ -4311,6 +4333,12 @@ func (m Model) View() string {
 	if m.mode == modeExport {
 		return m.exportDialogView()
 	}
+	if m.mode == modeBackup {
+		return m.backupView()
+	}
+	if m.mode == modeImport {
+		return m.importView()
+	}
 	if m.mode == modeSearchGlobal {
 		return m.globalSearchView()
 	}
@@ -5213,6 +5241,13 @@ func (m *Model) commandList() []command {
 		}},
 		{"WebDAV sync settings", func() { m.startWebdavConfig() }},
 		{"Sync now", func() { m.syncWebdavNow() }},
+		{"Backup notebook", func() { m.startBackup() }},
+		{"Import from backup", func() { m.startImport() }},
+		{"Switch theme", func() {
+			nextTheme()
+			m.refresh(m.currentPath)
+			m.flashStatus("Theme: "+currentTheme().Name, false, 1500*time.Millisecond)
+		}},
 	}
 }
 

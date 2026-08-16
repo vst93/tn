@@ -244,6 +244,11 @@ func (s *Store) resolve(rel string) (string, error) {
 	return path, nil
 }
 
+// Resolve maps a relative path to an absolute path within the notebook.
+func (s *Store) Resolve(rel string) (string, error) {
+	return s.resolve(rel)
+}
+
 func validName(name string) (string, error) {
 	name = strings.TrimSpace(name)
 	if name == "" || name == "." || name == ".." {
