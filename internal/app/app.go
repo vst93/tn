@@ -592,7 +592,10 @@ func (m Model) restoreSession() Model {
 	if m.recent == nil {
 		m.recent = make([]string, 0, 20)
 	}
-	m.treeOffset = max(0, s.TreeOffset)
+	// Don't restore treeOffset — always start from top so the full
+	// directory structure is visible on startup. selectPath will
+	// scroll to make the selected item visible below.
+	m.treeOffset = 0
 	m.active = treePane
 	if s.ActivePane == "content" {
 		m.active = contentPane
@@ -606,7 +609,13 @@ func (m Model) restoreSession() Model {
 			m.undoStack = nil
 			m.redoStack = nil
 			m.editSel = nil
-			m.selectPath(s.CurrentPath)
+			// Set selection index without ensuring visibility (bodyHeight not yet known)
+			for i, item := range m.flat {
+				if item.node.RelPath == s.CurrentPath {
+					m.selected = i
+					break
+				}
+			}
 			m.setEditorBackground(bg)
 			m.renderMarkdown()
 		}
