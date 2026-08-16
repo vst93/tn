@@ -311,9 +311,19 @@ var helpGroupsData = []helpGroup{
 			{"Ctrl+Q", "Quit"},
 			{"?", "Help"},
 			{"Esc", "Close / cancel"},
-		},
-	},
-}
+			},
+			},
+			{
+			title: "Edit Markdown",
+			rows: []helpRow{
+				{"Ctrl+B", "Bold"},
+				{"Ctrl+I", "Italic"},
+				{"Ctrl+K", "Insert link"},
+				{"Ctrl+V", "Paste image"},
+				{"Ctrl+L", "Copy current line"},
+			},
+			},
+			}
 
 // SessionState is the persisted workspace state restored on startup.
 type SessionState struct {
@@ -729,6 +739,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				case tea.KeyCtrlRight:
 					m.wordRight()
 					m.editSel = nil
+					m.recordEdit(before, m.editor.Value(), beforePos, m.cursorPos())
+					return m, cmd
+				case tea.KeyCtrlB:
+					m.wrapSelection("**", "**")
+					m.recordEdit(before, m.editor.Value(), beforePos, m.cursorPos())
+					return m, cmd
+				case tea.KeyCtrlI:
+					m.wrapSelection("*", "*")
+					m.recordEdit(before, m.editor.Value(), beforePos, m.cursorPos())
+					return m, cmd
+				case tea.KeyCtrlK:
+					m.insertLink()
 					m.recordEdit(before, m.editor.Value(), beforePos, m.cursorPos())
 					return m, cmd
 				}
@@ -1844,6 +1866,68 @@ func (m Model) currentLineText() string {
 	return lines[row]
 }
 
+func (m *Model) wrapSelection(prefix, suffix string) {
+	cur := m.editor.Value()
+	from, to := m.selectionRange()
+	if from >= 0 && to > from {
+		before := cur[:from]
+		selected := cur[from:to]
+		after := cur[to:]
+		newText := prefix + selected + suffix
+		m.editor.SetValue(before + newText + after)
+		m.editSel = nil
+		m.editor.SetCursor(from + len(newText))
+	} else {
+		m.editor.InsertString(prefix + "text" + suffix)
+		m.editor.SetCursor(from + len(prefix))
+	}
+}
+
+func (m *Model) insertLink() {
+	cur := m.editor.Value()
+	from, to := m.selectionRange()
+	if from >= 0 && to > from {
+		before := cur[:from]
+		selected := cur[from:to]
+		after := cur[to:]
+		wrapped := "[" + selected + "](url)"
+		m.editor.SetValue(before + wrapped + after)
+		m.editSel = nil
+		urlStart := from + len(selected) + 3
+		m.editor.SetCursor(urlStart)
+	} else {
+		m.editor.InsertString("[text](url)")
+		m.editor.SetCursor(from + 1)
+	}
+}
+
+func (m *Model) selectionRange() (int, int) {
+	if m.editSel == nil {
+		return -1, -1
+	}
+	start, end := m.editSel.anchor, m.editSel.end
+	if start.row > end.row || (start.row == end.row && start.col > end.col) {
+		start, end = end, start
+	}
+	lines := strings.Split(m.editor.Value(), "\n")
+	offset := 0
+	for i := 0; i < start.row; i++ {
+		offset += len([]rune(lines[i])) + 1
+	}
+	from := offset + start.col
+	offset = 0
+	for i := 0; i < end.row; i++ {
+		offset += len([]rune(lines[i])) + 1
+	}
+	to := offset + end.col
+	if from < 0 {
+		from = 0
+	}
+	if to > len([]rune(m.editor.Value())) {
+		to = len([]rune(m.editor.Value()))
+	}
+	return from, to
+}
 func (m Model) selectionText() string {
 	if m.editSel == nil {
 		return ""
@@ -4871,6 +4955,8 @@ func (m *Model) editShortcutBar() string {
 		mutedSty.Render(" · ") +
 		redoSty.Render("Ctrl+Shift+Z") +
 		mutedSty.Render(" · Esc · Ctrl+L · Ctrl+V")
+	mdHints := mutedSty.Render(" · B/I/K")
+	left += mdHints
 	pos := m.cursorPos()
 	total := m.editor.LineCount()
 	right := fmt.Sprintf("Line %d/%d · Col %d", pos.row+1, total, pos.col+1)
@@ -5057,33 +5143,34 @@ func (m Model) helpContent() string {
 		if len(rows) == 0 {
 			continue
 		}
-		maxKey := 0
-		for _, r := range rows {
-			if w := lipgloss.Width(r.keys); w > maxKey {
-				maxKey = w
-			}
-		}
 		b.WriteString(lipgloss.NewStyle().Foreground(accent).Bold(true).Render(g.title) + "\n")
 		for _, r := range rows {
 			total++
-			pad := maxKey - lipgloss.Width(r.keys) + 2
-			b.WriteString("  " + lipgloss.NewStyle().Foreground(accent).Render(r.keys) + strings.Repeat(" ", pad) + mutedSty.Render(r.desc) + "\n")
+			b.WriteString("  " + lipgloss.NewStyle().Foreground(accent).Render(r.keys) + "  " + mutedSty.Render(r.desc) + "\n")
 		}
 		b.WriteString("\n")
 	}
 	if q != "" && total == 0 {
 		b.WriteString(errorSty.Render("No matching shortcuts"))
 	}
-	return strings.TrimRight(b.String(), "\n")
+	return b.String()
 }
 
 func (m Model) helpView() string {
 	var b strings.Builder
-	b.WriteString(brandSty.Render("TN shortcuts") + "\n\n")
+	b.WriteString("\n")
+	b.WriteString(brandSty.Render("  TN 快捷键") + "\n\n")
 	b.WriteString("  " + m.input.View() + "\n\n")
-	b.WriteString(m.helpHintView.View())
-	b.WriteString("\n\n" + mutedSty.Render("↑/↓ / mouse scroll · Esc close"))
-	box := lipgloss.NewStyle().Background(surface).Foreground(text).Border(lipgloss.RoundedBorder()).BorderForeground(muted).Padding(1, 2).Width(m.helpBoxWidth()).Render(b.String())
+	b.WriteString(m.helpContent())
+	b.WriteString("\n\n" + mutedSty.Render("  ↑/↓ 滚动 · Esc 关闭"))
+	box := lipgloss.NewStyle().
+		Background(surface).
+		Foreground(text).
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(accent).
+		Padding(1, 3).
+		Width(min(80, max(30, m.width-4))).
+		Render(b.String())
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box, lipgloss.WithWhitespaceBackground(bg))
 }
 
