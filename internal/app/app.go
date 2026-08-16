@@ -784,8 +784,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.editSel.end = m.cursorPos()
 				}
 			} else if msg.String() == "/" {
-				// Slash opens markdown format menu
+				// Slash opens markdown format menu, also insert slash into editor
 				m.startMarkdown()
+				// Continue to let the slash be inserted into editor below
+				m.editSel = nil
+				m.editor, cmd = m.editor.Update(msg)
+				m.recordEdit(before, m.editor.Value(), beforePos, m.cursorPos())
 				return m, cmd
 			} else {
 				switch msg.Type {
@@ -5537,26 +5541,26 @@ func (m *Model) applyMarkdown(item markdownItem) {
 }
 
 func (m *Model) updateMarkdown(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
-	case "esc":
+	switch msg.Type {
+	case tea.KeyEsc:
 		m.exitMarkdown()
 		return m, nil
-	case "enter":
+	case tea.KeyEnter:
 		items := m.filteredMarkdownItems()
 		if len(items) > 0 && m.markdownIndex >= 0 && m.markdownIndex < len(items) {
 			m.applyMarkdown(items[m.markdownIndex])
 		}
 		return m, m.takePending()
-	case "up":
+	case tea.KeyUp:
 		m.moveMarkdown(-1)
 		return m, nil
-	case "down":
+	case tea.KeyDown:
 		m.moveMarkdown(1)
 		return m, nil
-	case "home":
+	case tea.KeyHome:
 		m.markdownIndex = 0
 		return m, nil
-	case "end":
+	case tea.KeyEnd:
 		m.markdownIndex = max(0, len(m.filteredMarkdownItems())-1)
 		return m, nil
 	}
