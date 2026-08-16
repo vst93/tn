@@ -103,7 +103,7 @@ func (m *Model) updateImport(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 func (m *Model) backupView() string {
 	var b strings.Builder
-	b.WriteString(brandSty.Render("Backup notebook") + "\n\n")
+	b.WriteString(brandSty.Render("Backup notes") + "\n\n")
 	stats := m.collectBackupStats()
 	b.WriteString(fmt.Sprintf("  Notes: %d\n", stats.NoteCount))
 	b.WriteString(fmt.Sprintf("  Folders: %d\n", stats.FolderCount))

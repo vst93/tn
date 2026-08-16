@@ -27,7 +27,7 @@ type backupNoteEntry struct {
 	Modified string `json:"modified"`
 }
 
-// backupStats summarizes a notebook for the status bar.
+// backupStats summarizes all notes for the status bar.
 type backupStats struct {
 	NoteCount  int
 	FolderCount int
@@ -230,7 +230,7 @@ func (m *Model) importBackup(src string) (int, error) {
 	return count, nil
 }
 
-// importDir imports all .md files from a directory into the notebook root.
+// importDir imports all .md files from a directory into the note root.
 // Existing files are skipped.
 func (m *Model) importDir(srcDir string) (int, int, error) {
 	imported := 0

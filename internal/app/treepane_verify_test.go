@@ -129,7 +129,7 @@ func TestHeaderTabsWhenTreeHidden(t *testing.T) {
 
 	// Hit-testing must match the drawn tab: the content tab starts right
 	// after the brand separator when the tree is hidden.
-	notesStart := 1 + lipgloss.Width("◆ tn") + lipgloss.Width(" │ ")
+	notesStart := 1 + lipgloss.Width("◆ TN") + lipgloss.Width(" │ ")
 	if p, ok := m.headerTabAt(notesStart); !ok || p != contentPane {
 		t.Fatalf("hidden-tree x=%d: pane=%v ok=%v, want contentPane hit", notesStart, p, ok)
 	}

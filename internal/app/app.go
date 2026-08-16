@@ -328,7 +328,7 @@ var helpGroupsData = []helpGroup{
 		rows: []helpRow{
 			{"Ctrl+Shift+E", "Export note"},
 			{"Alt+H", "Export as HTML"},
-			{"Ctrl+Shift+B", "Backup notebook"},
+			{"Ctrl+Shift+B", "Backup notes"},
 			{"Ctrl+Shift+I", "Import from backup"},
 		},
 	},
@@ -1059,7 +1059,7 @@ func (m *Model) globalKey(key string) (handled, quit bool) {
 		return true, false
 	case "ctrl+r":
 		m.refresh(m.selectedPath())
-		m.flashStatus("Notebook refreshed", false, 2*time.Second)
+		m.flashStatus("Notes refreshed", false, 2*time.Second)
 		return true, false
 	case "ctrl+f", "f":
 		if m.mode == modeEdit {
@@ -2772,7 +2772,7 @@ func (m *Model) cleanupImages() {
 	}
 }
 
-// allNoteContents returns the markdown content of every note in the notebook.
+// allNoteContents returns the markdown content of every note in the store.
 func (m *Model) allNoteContents() []string {
 	var contents []string
 	var walk func(nodes []*storage.Node)
@@ -4655,7 +4655,7 @@ func (m Model) bodyRenderHeight() int {
 }
 
 func (m Model) headerView() string {
-	brand := lipgloss.NewStyle().Foreground(accent).Bold(true).Render("◆ tn")
+	brand := lipgloss.NewStyle().Foreground(accent).Bold(true).Render("◆ TN")
 	tabs := m.headerTabs()
 	left := brand + mutedSty.Render(" │ ") + tabs
 
@@ -4679,7 +4679,7 @@ func (m Model) headerView() string {
 // headerTabAt maps a header-row x-coordinate to the pane tab it hits. It
 // mirrors headerView's layout so clicks stay aligned when labels change.
 func (m Model) headerTabAt(x int) (pane, bool) {
-	brandWidth := lipgloss.Width("◆ tn")
+	brandWidth := lipgloss.Width("◆ TN")
 	sepWidth := lipgloss.Width(" │ ")
 	notesStart := 1 + brandWidth + sepWidth
 	if !m.treeVisible {
@@ -5706,7 +5706,7 @@ func (m *Model) commandList() []command {
 		}},
 		{"WebDAV sync settings", func() { m.startWebdavConfig() }},
 		{"Sync now", func() { m.syncWebdavNow() }},
-		{"Backup notebook", func() { m.startBackup() }},
+		{"Backup notes", func() { m.startBackup() }},
 		{"Import from backup", func() { m.startImport() }},
 		{"Switch theme", func() {
 			nextTheme()

@@ -14,7 +14,7 @@ import (
 var version = "dev"
 
 func main() {
-	rootFlag := flag.String("dir", "", "notebook directory (default: ~/.tn)")
+	rootFlag := flag.String("dir", "", "note directory (default: ~/.tn)")
 	showVersion := flag.Bool("version", false, "print version")
 	flag.Parse()
 

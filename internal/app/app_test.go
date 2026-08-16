@@ -124,7 +124,7 @@ func TestHeaderTabClickTargets(t *testing.T) {
 	m := New(storage.New(t.TempDir()))
 	m.resize(100, 30)
 
-	// "◆ tn │  Lists  │  Preview "
+	// "◆ TN │  Lists  │  Preview "
 	//    1234567890123456789012345678
 	if p, ok := m.headerTabAt(13); !ok || p != treePane {
 		t.Fatalf("expected Lists tab at x=13, got pane=%v ok=%v", p, ok)
@@ -926,7 +926,7 @@ func TestFocusModeTogglesAndRendersFullScreen(t *testing.T) {
 	if !strings.Contains(view, "Esc 退出专注") {
 		t.Fatalf("expected focus hint in view, got %q", view)
 	}
-	if strings.Contains(view, "◆ tn") {
+	if strings.Contains(view, "◆ TN") {
 		t.Fatal("expected header to be hidden in focus mode")
 	}
 

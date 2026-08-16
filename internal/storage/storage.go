@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-// Node is a directory or Markdown note in the notebook tree.
+// Node is a directory or Markdown note in the note tree.
 type Node struct {
 	Name     string
 	RelPath  string
@@ -38,7 +38,7 @@ func New(root string) *Store {
 
 func (s *Store) Init() error {
 	if err := os.MkdirAll(s.Root, 0o755); err != nil {
-		return fmt.Errorf("create notebook directory: %w", err)
+		return fmt.Errorf("create note directory: %w", err)
 	}
 	return nil
 }
@@ -279,7 +279,7 @@ func (s *Store) Rename(rel, name string) (string, error) {
 
 func (s *Store) Delete(rel string) error {
 	if rel == "" || rel == "." {
-		return errors.New("cannot delete notebook root")
+		return errors.New("cannot delete note root")
 	}
 	path, err := s.resolve(rel)
 	if err != nil {
@@ -307,17 +307,17 @@ func (s *Store) resolve(rel string) (string, error) {
 		clean = ""
 	}
 	if clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
-		return "", errors.New("path escapes notebook directory")
+		return "", errors.New("path escapes note directory")
 	}
 	path := filepath.Join(s.Root, clean)
 	relToRoot, err := filepath.Rel(s.Root, path)
 	if err != nil || relToRoot == ".." || strings.HasPrefix(relToRoot, ".."+string(filepath.Separator)) {
-		return "", errors.New("path escapes notebook directory")
+		return "", errors.New("path escapes note directory")
 	}
 	return path, nil
 }
 
-// Resolve maps a relative path to an absolute path within the notebook.
+// Resolve maps a relative path to an absolute path within the note tree.
 func (s *Store) Resolve(rel string) (string, error) {
 	return s.resolve(rel)
 }

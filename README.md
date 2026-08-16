@@ -1,6 +1,6 @@
 # TN
 
-A quiet, keyboard-first terminal notebook. TN stores every note as a normal Markdown file under `~/.tn`, with directories preserved as the notebook tree.
+A quiet, keyboard-first terminal note. TN stores every note as a normal Markdown file under `~/.tn`, with directories preserved as the note tree.
 
 ## Features
 
@@ -36,7 +36,7 @@ go build -o tn .
 ./tn
 ```
 
-Use a different notebook directory when needed:
+Use a different note directory when needed:
 
 ```sh
 tn -dir /path/to/notes
@@ -111,7 +111,7 @@ Terminal protocols expose mouse events, not a portable native touch API. TN uses
 
 ## Data
 
-The default notebook path is:
+The default note path is:
 
 - Linux, macOS, Termux: `$HOME/.tn`
 - Windows: `%USERPROFILE%\\.tn`

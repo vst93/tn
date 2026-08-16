@@ -1,0 +1,83 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version tag (no v prefix, e.g. 0.0.1)"
+        required: true
+        type: string
+      prerelease:
+        description: "Mark as pre-release"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache: true
+
+      - name: Build all platforms
+        env:
+          CGO_ENABLED: 0
+        run: |
+          VERSION="${{ github.event.inputs.version }}"
+          LDFLAGS="-s -w -X main.version=${VERSION}"
+          mkdir -p dist
+          GOOS=linux   GOARCH=amd64 go build -ldflags "$LDFLAGS" -o dist/tn-${VERSION}-linux-amd64       .
+          GOOS=linux   GOARCH=arm64 go build -ldflags "$LDFLAGS" -o dist/tn-${VERSION}-linux-arm64       .
+          GOOS=darwin  GOARCH=amd64 go build -ldflags "$LDFLAGS" -o dist/tn-${VERSION}-darwin-amd64      .
+          GOOS=darwin  GOARCH=arm64 go build -ldflags "$LDFLAGS" -o dist/tn-${VERSION}-darwin-arm64      .
+          GOOS=windows GOARCH=amd64 go build -ldflags "$LDFLAGS" -o dist/tn-${VERSION}-windows-amd64.exe .
+          GOOS=windows GOARCH=arm64 go build -ldflags "$LDFLAGS" -o dist/tn-${VERSION}-windows-arm64.exe .
+
+      - name: Generate release notes
+        id: notes
+        run: |
+          PREV=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          if [ -n "$PREV" ]; then
+            LOG=$(git log --oneline --no-decorate ${PREV}..HEAD)
+          else
+            LOG=$(git log --oneline --no-decorate)
+          fi
+          echo "log<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$LOG" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.version }}
+          name: ${{ github.event.inputs.version }}
+          prerelease: ${{ github.event.inputs.prerelease }}
+          body: |
+            ## What's Changed
+
+            ${{ steps.notes.outputs.log }}
+
+            ---
+
+            ## 更新内容
+
+            ${{ steps.notes.outputs.log }}
+
+            ## Install
+
+            ```sh
+            go install github.com/vst93/tn@${{ github.event.inputs.version }}
+            ```
+
+            Or download the binary for your platform from the assets below.
+          files: dist/*
