@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 )
 
 // Node is a directory or Markdown note in the notebook tree.
@@ -161,6 +162,78 @@ func (s *Store) create(parent, name string, directory bool) (string, error) {
 		return "", fmt.Errorf("create note: %w", err)
 	}
 	return rel, nil
+}
+
+// MoveNode reorders a node within its parent's children.
+// direction: -1 moves up, +1 moves down. Returns false if move not possible.
+func (s *Store) MoveNode(rel string, direction int) (string, bool, error) {
+	if rel == "" || rel == "." {
+		return "", false, nil
+	}
+	parentDir := filepath.Dir(rel)
+	if parentDir == "." {
+		parentDir = ""
+	}
+	children, err := s.readDir(parentDir)
+	if err != nil {
+		return "", false, err
+	}
+	// Find current index
+	idx := -1
+	for i, c := range children {
+		if c.RelPath == rel {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return "", false, nil
+	}
+	newIdx := idx + direction
+	if newIdx < 0 || newIdx >= len(children) {
+		return "", false, nil
+	}
+	// Swap by renaming to temp then to target order
+	// We use a simple approach: rename current to temp, then rename target to current, then temp to target
+	current := children[idx]
+	target := children[newIdx]
+
+	// Generate unique temp name
+	tempName := fmt.Sprintf(".tn_move_%d", time.Now().UnixNano())
+	tempRel := filepath.Join(parentDir, tempName)
+
+	oldPath, err := s.resolve(current.RelPath)
+	if err != nil {
+		return "", false, err
+	}
+	tempPath, err := s.resolve(tempRel)
+	if err != nil {
+		return "", false, err
+	}
+	newPath, err := s.resolve(target.RelPath)
+	if err != nil {
+		return "", false, err
+	}
+
+	// 1. Rename current to temp
+	if err := os.Rename(oldPath, tempPath); err != nil {
+		return "", false, fmt.Errorf("move item: %w", err)
+	}
+	// 2. Rename target to current's old path
+	if err := os.Rename(newPath, oldPath); err != nil {
+		// Rollback: rename temp back to current
+		os.Rename(tempPath, oldPath)
+		return "", false, fmt.Errorf("move item: %w", err)
+	}
+	// 3. Rename temp to target's old path
+	if err := os.Rename(tempPath, newPath); err != nil {
+		// Rollback best-effort
+		os.Rename(oldPath, newPath)
+		os.Rename(tempPath, oldPath)
+		return "", false, fmt.Errorf("move item: %w", err)
+	}
+
+	return target.RelPath, true, nil
 }
 
 // Rename renames an item in place and returns its new relative path.

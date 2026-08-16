@@ -1154,7 +1154,38 @@ func (m *Model) treeKey(key string) {
 		m.selectAllVisible()
 	case "ctrl+shift+a":
 		m.clearSelection()
+	case "ctrl+up":
+		m.moveSelected(-1)
+	case "ctrl+down":
+		m.moveSelected(1)
 	}
+}
+
+func (m *Model) moveSelected(direction int) {
+	if len(m.flat) == 0 || m.selected < 0 || m.selected >= len(m.flat) {
+		return
+	}
+	item := m.flat[m.selected]
+	rel := item.node.RelPath
+	newRel, ok, err := m.store.MoveNode(rel, direction)
+	if err != nil {
+		m.flashStatus(fmt.Sprintf("Move failed: %v", err), true, 2*time.Second)
+		return
+	}
+	if !ok {
+		m.flashStatus("Cannot move further", true, 1*time.Second)
+		return
+	}
+	m.refresh(m.currentPath)
+	// Keep selection on moved item
+	for i, n := range m.flat {
+		if n.node.RelPath == newRel || n.node.RelPath == rel {
+			m.selected = i
+			m.ensureSelectionVisible()
+			break
+		}
+	}
+	m.flashStatus("Item moved", false, 1*time.Second)
 }
 
 func (m *Model) toggleSelect() {
@@ -1944,37 +1975,42 @@ func (m Model) currentLineText() string {
 }
 
 func (m *Model) wrapSelection(prefix, suffix string) {
-	cur := m.editor.Value()
+	runes := []rune(m.editor.Value())
 	from, to := m.selectionRange()
 	if from >= 0 && to > from {
-		before := cur[:from]
-		selected := cur[from:to]
-		after := cur[to:]
-		newText := prefix + selected + suffix
-		m.editor.SetValue(before + newText + after)
+		selected := string(runes[from:to])
+		wrapped := prefix + selected + suffix
+		newRunes := append(runes[:from], []rune(wrapped)...)
+		newRunes = append(newRunes, runes[to:]...)
+		m.editor.SetValue(string(newRunes))
 		m.editSel = nil
-		m.editor.SetCursor(from + len(newText))
+		m.setCursorAt(from + len([]rune(wrapped)))
 	} else {
-		m.editor.InsertString(prefix + "text" + suffix)
-		m.editor.SetCursor(from + len(prefix))
+		inserted := prefix + "text" + suffix
+		newRunes := append(runes[:from], []rune(inserted)...)
+		newRunes = append(newRunes, runes[from:]...)
+		m.editor.SetValue(string(newRunes))
+		m.setCursorAt(from + len([]rune(prefix)))
 	}
 }
 
 func (m *Model) insertLink() {
-	cur := m.editor.Value()
+	runes := []rune(m.editor.Value())
 	from, to := m.selectionRange()
 	if from >= 0 && to > from {
-		before := cur[:from]
-		selected := cur[from:to]
-		after := cur[to:]
+		selected := string(runes[from:to])
 		wrapped := "[" + selected + "](url)"
-		m.editor.SetValue(before + wrapped + after)
+		newRunes := append(runes[:from], []rune(wrapped)...)
+		newRunes = append(newRunes, runes[to:]...)
+		m.editor.SetValue(string(newRunes))
 		m.editSel = nil
-		urlStart := from + len(selected) + 3
-		m.editor.SetCursor(urlStart)
+		m.setCursorAt(from + len([]rune(selected)) + 3)
 	} else {
-		m.editor.InsertString("[text](url)")
-		m.editor.SetCursor(from + 1)
+		inserted := "[text](url)"
+		newRunes := append(runes[:from], []rune(inserted)...)
+		newRunes = append(newRunes, runes[from:]...)
+		m.editor.SetValue(string(newRunes))
+		m.setCursorAt(from + 1)
 	}
 }
 
@@ -2792,6 +2828,16 @@ func (m *Model) toggleEdit() {
 }
 
 func (m *Model) leaveEdit() {
+	// Sync editor scroll to preview scroll proportion
+	previewTotal := m.previewLineCount()
+	if previewTotal > 0 {
+		previewRatio := m.preview.ScrollPercent()
+		editorTotal := m.editor.LineCount()
+		if editorTotal > 0 {
+			editorTarget := int(previewRatio * float64(editorTotal-1))
+			m.gotoLineEdit(editorTarget)
+		}
+	}
 	m.editor.Blur()
 	m.mode = modeNormal
 	m.editSel = nil
@@ -4523,9 +4569,6 @@ func (m Model) View() string {
 	if m.mode == modeCommand {
 		return m.commandView()
 	}
-	if m.mode == modeMarkdown {
-		return m.markdownView()
-	}
 	if m.mode == modeWebdavConfig {
 		return m.webdavConfigView()
 	}
@@ -4588,7 +4631,32 @@ func (m Model) View() string {
 		bottom = m.statusView()
 	}
 	view := header + "\n" + body + "\n" + bottom
-	return lipgloss.NewStyle().Background(bg).Width(m.width).Height(m.height).Render(view)
+	baseView := lipgloss.NewStyle().Background(bg).Width(m.width).Height(m.height).Render(view)
+	if m.mode == modeMarkdown {
+		popup := m.markdownView()
+		baseView = overlayBottom(baseView, popup)
+	}
+	return baseView
+}
+
+// overlayBottom places a string on top of another at the bottom.
+func overlayBottom(base, top string) string {
+	baseLines := strings.Split(base, "\n")
+	topLines := strings.Split(top, "\n")
+	if len(topLines) == 0 {
+		return base
+	}
+	// Place top lines above the last lines of base
+	startRow := len(baseLines) - len(topLines)
+	if startRow < 0 {
+		startRow = 0
+	}
+	for i, line := range topLines {
+		if startRow+i < len(baseLines) {
+			baseLines[startRow+i] = line
+		}
+	}
+	return strings.Join(baseLines, "\n")
 }
 
 func (m Model) bodyRenderHeight() int {
@@ -5485,7 +5553,10 @@ func (m *Model) applyMarkdown(item markdownItem) {
 	}
 	cur := m.editor.Value()
 	pos := m.cursorPos()
-	// Calculate byte offset from (row, col)
+	prefix := item.prefix
+	suffix := item.suffix
+	// Use rune-based operations to avoid byte/rune offset mismatch
+	runes := []rune(cur)
 	offset := 0
 	lines := strings.Split(cur, "\n")
 	for i := 0; i < pos.row && i < len(lines); i++ {
@@ -5493,48 +5564,49 @@ func (m *Model) applyMarkdown(item markdownItem) {
 	}
 	offset += pos.col
 
-	prefix := item.prefix
-	suffix := item.suffix
-
 	if !item.multiLine && !strings.HasSuffix(prefix, "\n") && !strings.HasPrefix(prefix, "---") && prefix != "" {
-		// Block-level elements (headings, list items, quote): insert at line start
+		// Block-level: insert at line start
 		lineStart := 0
 		for i := 0; i < pos.row && i < len(lines); i++ {
 			lineStart += len([]rune(lines[i])) + 1
 		}
-		newCur := cur[:lineStart] + prefix + cur[lineStart:]
-		m.editor.SetValue(newCur)
-		newOffset := lineStart + len(prefix)
-		m.setCursorAt(newOffset)
+		newRunes := append(runes[:lineStart], []rune(prefix)...)
+		newRunes = append(newRunes, runes[lineStart:]...)
+		m.editor.SetValue(string(newRunes))
+		m.setCursorAt(lineStart + len([]rune(prefix)))
 	} else if strings.HasPrefix(prefix, "---") {
 		// Divider: insert after current line
 		lineEnd := offset
 		if pos.row < len(lines) {
 			lineEnd += len([]rune(lines[pos.row])) - pos.col
 		}
-		newCur := cur[:lineEnd] + "\n" + prefix + cur[lineEnd:]
-		m.editor.SetValue(newCur)
-		m.setCursorAt(lineEnd + 1 + len(prefix))
+		newRunes := append(runes[:lineEnd], []rune("\n"+prefix)...)
+		newRunes = append(newRunes, runes[lineEnd:]...)
+		m.editor.SetValue(string(newRunes))
+		m.setCursorAt(lineEnd + 1 + len([]rune(prefix)))
 	} else if item.multiLine {
-		// Multi-line blocks (code block, table)
-		newCur := cur[:offset] + prefix + suffix + cur[offset:]
-		m.editor.SetValue(newCur)
-		m.setCursorAt(offset + len(prefix))
+		// Multi-line blocks
+		newRunes := append(runes[:offset], []rune(prefix+suffix)...)
+		newRunes = append(newRunes, runes[offset:]...)
+		m.editor.SetValue(string(newRunes))
+		m.setCursorAt(offset + len([]rune(prefix)))
 	} else {
 		// Inline elements (bold, italic, link, code, strikethrough)
 		from, to := m.selectionRange()
 		if from >= 0 && to > from {
-			selected := cur[from:to]
+			selected := string(runes[from:to])
 			wrapped := prefix + selected + suffix
-			newCur := cur[:from] + wrapped + cur[to:]
-			m.editor.SetValue(newCur)
+			newRunes := append(runes[:from], []rune(wrapped)...)
+			newRunes = append(newRunes, runes[to:]...)
+			m.editor.SetValue(string(newRunes))
 			m.editSel = nil
-			m.setCursorAt(from + len(wrapped))
+			m.setCursorAt(from + len([]rune(wrapped)))
 		} else {
 			inserted := prefix + "text" + suffix
-			newCur := cur[:offset] + inserted + cur[offset:]
-			m.editor.SetValue(newCur)
-			m.setCursorAt(offset + len(prefix))
+			newRunes := append(runes[:offset], []rune(inserted)...)
+			newRunes = append(newRunes, runes[offset:]...)
+			m.editor.SetValue(string(newRunes))
+			m.setCursorAt(offset + len([]rune(prefix)))
 		}
 	}
 	m.recordEdit(m.editor.Value(), m.editor.Value(), m.cursorPos(), m.cursorPos())
@@ -5575,29 +5647,40 @@ func (m *Model) updateMarkdown(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 func (m Model) markdownView() string {
 	items := m.filteredMarkdownItems()
-	var b strings.Builder
-	b.WriteString(brandSty.Render("Insert Format") + "\n\n")
-	b.WriteString(m.input.View() + "\n\n")
-	for i, item := range items {
-		line := "  " + item.name
-		if i == m.markdownIndex {
-			line = lipgloss.NewStyle().Foreground(accent).Bold(true).Render("▸ " + item.name)
-		}
-		b.WriteString(line + "\n")
-	}
 	if len(items) == 0 {
-		b.WriteString(errorSty.Render("No matching format") + "\n")
+		items = append(items, markdownItem{name: "No match"})
 	}
-	b.WriteString("\n" + mutedSty.Render("↑/↓ select · Enter insert · Esc close"))
-	dialog := lipgloss.NewStyle().
-		Background(surface).
-		Foreground(text).
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(accent).
-		Padding(1, 3).
-		Width(min(64, max(28, m.width-6))).
-		Render(b.String())
-	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, dialog, lipgloss.WithWhitespaceBackground(bg))
+	// Compact horizontal list: [ filter ] ▸ Bold  Italic  Link  Code  ...
+	var b strings.Builder
+	b.WriteString(m.input.View())
+	b.WriteString("\n")
+	// Show items in a wrapping row, highlighted one in accent
+	parts := []string{}
+	for i, item := range items {
+		if i >= 12 {
+			parts = append(parts, mutedSty.Render("…"))
+			break
+		}
+		if i == m.markdownIndex {
+			parts = append(parts, lipgloss.NewStyle().Foreground(accent).Bold(true).Render(item.name))
+		} else {
+			parts = append(parts, mutedSty.Render(item.name))
+		}
+	}
+	b.WriteString(lipgloss.JoinHorizontal(lipgloss.Left, parts...))
+	b.WriteString("\n")
+	b.WriteString(mutedSty.Render("↑/↓ select · Enter insert · Esc close"))
+	// Render as a thin strip at bottom of screen (above status bar)
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Bottom,
+		lipgloss.NewStyle().
+			Background(surface).
+			Foreground(text).
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(accent).
+			Padding(0, 2).
+			Width(min(120, m.width-4)).
+			Render(b.String()),
+		lipgloss.WithWhitespaceBackground(bg))
 }
 
 func (m *Model) restoreCommandFocus() {
