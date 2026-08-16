@@ -224,6 +224,8 @@ type cursorPos struct{ row, col int }
 
 type autoSaveMsg struct{}
 
+type webdavSyncMsg struct{}
+
 type command struct {
 	name   string
 	action func()
@@ -456,6 +458,7 @@ type Model struct {
 
 	webdavInputStep int
 	webdavConfig    WebDAVConfig
+	lastWebdavSync  time.Time
 
 	history      []string
 	historyIndex int
@@ -750,6 +753,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.autoSave()
 		}
 		return m, tea.Batch(autoSaveCmd(), m.takePending())
+	case webdavSyncMsg:
+		config := loadWebDAVConfig(m.store.Root)
+		if config.SyncEnabled && config.URL != "" && config.AutoSyncMins > 0 {
+			now := time.Now()
+			if m.lastWebdavSync.IsZero() || now.Sub(m.lastWebdavSync) >= time.Duration(config.AutoSyncMins)*time.Minute {
+				result := m.doWebDAVSync()
+				if result.Errors == 0 && result.LastErr == nil {
+					m.lastWebdavSync = now
+				}
+			}
+		}
+		return m, tea.Batch(webdavSyncCmd(), m.takePending())
 	}
 
 	if m.mode == modeEdit {
@@ -2600,6 +2615,10 @@ func (m *Model) save() bool {
 
 func autoSaveCmd() tea.Cmd {
 	return tea.Tick(2*time.Second, func(time.Time) tea.Msg { return autoSaveMsg{} })
+}
+
+func webdavSyncCmd() tea.Cmd {
+	return tea.Tick(60*time.Second, func(time.Time) tea.Msg { return webdavSyncMsg{} })
 }
 
 // autoSave writes changes silently on success and surfaces failures in red.
@@ -4952,8 +4971,17 @@ func (m *Model) startWebdavConfig() {
 func (m *Model) syncWebdavNow() {
 	m.mode = modeWebdavSync
 	m.status = "Syncing…"
-	stats := m.doWebDAVSync()
-	_ = stats
+	result := m.doWebDAVSync()
+	if result.LastErr != nil {
+		m.flashStatus("Sync failed: "+result.LastErr.Error(), true, 3*time.Second)
+	} else if result.Errors > 0 {
+		m.flashStatus(fmt.Sprintf("Sync done: %d uploaded, %d downloaded, %d errors", result.Uploaded, result.Downloaded, result.Errors), true, 3*time.Second)
+	} else if result.Uploaded > 0 || result.Downloaded > 0 {
+		m.flashStatus(fmt.Sprintf("✓ Synced: %d uploaded, %d downloaded", result.Uploaded, result.Downloaded), false, 3*time.Second)
+	} else {
+		m.flashStatus("✓ Already up to date", false, 2*time.Second)
+	}
+	m.mode = modeNormal
 }
 
 // webdavInputStep tracks which field we're editing.
