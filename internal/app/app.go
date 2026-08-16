@@ -3659,7 +3659,7 @@ func (m *Model) renderMarkdown() {
 		m.renderedPlain = m.editor.Value()
 		return
 	}
-	content := strings.TrimSpace(decorateCodeBlocks(rendered, width))
+	content := strings.Trim(decorateCodeBlocks(rendered, width), "\n")
 	m.preview.SetContent(content)
 	m.renderedContent = content
 	m.renderedPlain = extractPlainText(content)
