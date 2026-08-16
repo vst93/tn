@@ -59,6 +59,8 @@ const (
 	modeTag
 	modeTagFilter
 	modeCommand
+	modeWebdavConfig
+	modeWebdavSync
 )
 
 type promptKind int
@@ -364,6 +366,7 @@ type editRecord struct {
 // Model is the TN Bubble Tea application.
 type Model struct {
 	store *storage.Store
+	images *imageStore
 
 	tree       []*storage.Node
 	flat       []flatNode
@@ -451,6 +454,9 @@ type Model struct {
 	commandIndex        int
 	commandQuery        string
 
+	webdavInputStep int
+	webdavConfig    WebDAVConfig
+
 	history      []string
 	historyIndex int
 }
@@ -478,6 +484,7 @@ func New(store *storage.Store) Model {
 
 	m := Model{
 		store:         store,
+		images:        newImageStore(store.Root),
 		expanded:      make(map[string]bool),
 		nodeTags:      make(map[string][]string),
 		nodePinned:    make(map[string]bool),
@@ -662,6 +669,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.mode == modeCommand {
 			return m.updateCommand(msg)
 		}
+		if m.mode == modeWebdavConfig {
+			return m.updateWebdavConfig(msg)
+		}
 
 		if handled, quit := m.globalKey(key); handled {
 			if quit {
@@ -688,6 +698,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					if m.handleEditEnter(before, beforePos) {
 						m.editSel = nil
 						return m, nil
+					}
+				}
+				// Handle Ctrl+V for image paste in edit mode.
+				if msg.Type == tea.KeyCtrlV {
+					if ref, ok := m.tryPasteImage(); ok {
+						m.insertImageRef(ref)
+						m.editSel = nil
+						m.recordEdit(before, m.editor.Value(), beforePos, m.cursorPos())
+						return m, cmd
 					}
 				}
 				m.editSel = nil
@@ -950,6 +969,12 @@ func (m *Model) globalKey(key string) (handled, quit bool) {
 		return true, false
 	case "ctrl+shift+p":
 		m.startCommand()
+		return true, false
+	case "ctrl+shift+s":
+		m.startWebdavConfig()
+		return true, false
+	case "ctrl+shift+w":
+		m.syncWebdavNow()
 		return true, false
 	case "?":
 		m.startHelp()
@@ -2443,12 +2468,41 @@ func (m Model) updateConfirm(key string) (tea.Model, tea.Cmd) {
 		}
 		m.confirmCount = 0
 		m.mode = modeNormal
+		// Clean up orphaned images after deletion.
+		m.cleanupImages()
 	case "n", "N", "esc":
 		m.confirmCount = 0
 		m.mode = modeNormal
 		m.flashStatus("Delete cancelled", false, 2*time.Second)
 	}
 	return m, m.takePending()
+}
+
+// cleanupImages removes image files not referenced by any note.
+func (m *Model) cleanupImages() {
+	contents := m.allNoteContents()
+	if removed, err := m.images.cleanupOrphanedImages(contents); err == nil && removed > 0 {
+		m.flashStatus(fmt.Sprintf("Cleaned up %d unused images", removed), false, 2*time.Second)
+	}
+}
+
+// allNoteContents returns the markdown content of every note in the notebook.
+func (m *Model) allNoteContents() []string {
+	var contents []string
+	var walk func(nodes []*storage.Node)
+	walk = func(nodes []*storage.Node) {
+		for _, n := range nodes {
+			if n.IsDir {
+				walk(n.Children)
+				continue
+			}
+			if content, err := m.store.Read(n.RelPath); err == nil {
+				contents = append(contents, content)
+			}
+		}
+	}
+	walk(m.tree)
+	return contents
 }
 
 func (m *Model) batchDelete() {
@@ -3337,6 +3391,37 @@ func (m *Model) restoreEditFocus() {
 	}
 }
 
+// tryPasteImage checks the clipboard for an image and saves it if found.
+// Returns the relative path reference for markdown insertion.
+func (m *Model) tryPasteImage() (string, bool) {
+	data, _, err := readImageFromClipboard()
+	if err != nil || len(data) == 0 {
+		return "", false
+	}
+	ref, err := m.images.saveImage(data)
+	if err != nil {
+		m.flashStatus("Image paste failed: "+err.Error(), true, 3*time.Second)
+		return "", false
+	}
+	return ref, true
+}
+
+// insertImageRef inserts a markdown image reference at the cursor position.
+func (m *Model) insertImageRef(ref string) {
+	current := m.editor.Value()
+	lines := strings.Split(current, "\n")
+	row := m.editor.Line()
+	if row < len(lines) {
+		lines[row] = lines[row] + "\n\n![image](" + ref + ")\n"
+	} else {
+		lines = append(lines, "![image](" + ref + ")")
+	}
+	m.editor.SetValue(strings.Join(lines, "\n"))
+	m.gotoLineEdit(row + 2)
+	m.editor.SetCursor(0)
+	m.flashStatus("✓ Pasted image: "+filepath.Base(ref), false, 2*time.Second)
+}
+
 func (m *Model) handleEditEnter(before string, beforePos cursorPos) bool {
 	pos := m.cursorPos()
 	line := m.currentLineText()
@@ -3651,7 +3736,10 @@ func (m *Model) renderMarkdown() {
 		m.renderer = renderer
 		m.rendererWidth = width
 	}
-	rendered, err := m.renderer.Render(m.editor.Value())
+	// Pre-process: replace image syntax with terminal-safe placeholders before
+	// glamour renders it (glamour would otherwise emit unhelpful alt text).
+	preprocessed := renderImagesInMarkdown(m.editor.Value())
+	rendered, err := m.renderer.Render(preprocessed)
 	if err != nil {
 		m.setStatus("Markdown preview: "+err.Error(), true)
 		m.preview.SetContent(m.editor.Value())
@@ -3907,6 +3995,7 @@ func applyHighlightRanges(line string, ranges []matchPos, hi, hiEnd string) stri
 	var b strings.Builder
 	vis := 0
 	i := 0
+	highlightOpen := false
 	for i < len(line) {
 		if line[i] == 0x1b {
 			j := i + 1
@@ -3921,20 +4010,27 @@ func applyHighlightRanges(line string, ranges []matchPos, hi, hiEnd string) stri
 			continue
 		}
 		r, size := utf8.DecodeRuneInString(line[i:])
-		if (r < 0x20 && r != '\t') || r == 0x7f {
+		if (r < 0x20 && r != '	') || r == 0x7f {
 			b.WriteRune(r)
 			i += size
 			continue
 		}
 		if startAt[vis] {
 			b.WriteString(hi)
+			highlightOpen = true
 		}
 		b.WriteRune(r)
 		vis++
 		if endAt[vis] {
 			b.WriteString(hiEnd)
+			highlightOpen = false
 		}
 		i += size
+	}
+	// Close any highlight left open at end of line to prevent visual bleeding
+	// into adjacent panels (tree/separator) via padding or wrapping.
+	if highlightOpen {
+		b.WriteString(hiEnd)
 	}
 	return b.String()
 }
@@ -4134,6 +4230,9 @@ func (m Model) View() string {
 	}
 	if m.mode == modeCommand {
 		return m.commandView()
+	}
+	if m.mode == modeWebdavConfig {
+		return m.webdavConfigView()
 	}
 	if m.mode == modeExport {
 		return m.exportDialogView()
@@ -4834,6 +4933,110 @@ func (m *Model) startCommand() {
 	m.status = ""
 }
 
+// startWebdavConfig opens the WebDAV configuration dialog.
+func (m *Model) startWebdavConfig() {
+	m.mode = modeWebdavConfig
+	m.input.Prompt = "WebDAV URL: "
+	m.input.Placeholder = "https://example.com/dav"
+	config := loadWebDAVConfig(m.store.Root)
+	m.input.SetValue(config.URL)
+	m.input.Width = max(20, min(80, m.width-12))
+	m.input.Focus()
+	m.statusErr = false
+	m.status = ""
+	m.webdavInputStep = 0
+	m.webdavConfig = config
+}
+
+// syncWebdavNow triggers immediate sync.
+func (m *Model) syncWebdavNow() {
+	m.mode = modeWebdavSync
+	m.status = "Syncing…"
+	stats := m.doWebDAVSync()
+	_ = stats
+}
+
+// webdavInputStep tracks which field we're editing.
+// 0=URL, 1=username, 2=password, 3=remote_path, 4=auto_sync_minutes.
+
+// updateWebdavConfig handles input during WebDAV config mode.
+func (m *Model) updateWebdavConfig(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.mode = modeNormal
+		m.input.Blur()
+		m.input.Prompt = "› "
+		return m, nil
+	case "enter":
+		return m.advanceWebdavConfig()
+	case "tab":
+		return m.advanceWebdavConfig()
+	}
+	var cmd tea.Cmd
+	m.input, cmd = m.input.Update(msg)
+	return m, cmd
+}
+
+// advanceWebdavConfig saves the current field and advances to next.
+func (m *Model) advanceWebdavConfig() (tea.Model, tea.Cmd) {
+	val := strings.TrimSpace(m.input.Value())
+	switch m.webdavInputStep {
+	case 0:
+		m.webdavConfig.URL = val
+		m.webdavConfig.SyncEnabled = val != ""
+		m.input.Prompt = "Username: "
+		m.input.Placeholder = "user"
+		m.input.SetValue(m.webdavConfig.Username)
+	case 1:
+		m.webdavConfig.Username = val
+		m.input.Prompt = "Password: "
+		m.input.Placeholder = "password"
+		m.input.SetValue(m.webdavConfig.Password)
+	case 2:
+		m.webdavConfig.Password = val
+		m.input.Prompt = "Remote path: "
+		m.input.Placeholder = "/tn"
+		m.input.SetValue(m.webdavConfig.RemotePath)
+	case 3:
+		m.webdavConfig.RemotePath = val
+		if val == "" {
+			m.webdavConfig.RemotePath = "/tn"
+		}
+		m.input.Prompt = "Auto-sync mins (0=manual): "
+		m.input.Placeholder = "0"
+		m.input.SetValue(fmt.Sprintf("%d", m.webdavConfig.AutoSyncMins))
+	case 4:
+		autoSync := 0
+		fmt.Sscanf(val, "%d", &autoSync)
+		m.webdavConfig.AutoSyncMins = autoSync
+		// Save config
+		if err := saveWebDAVConfig(m.store.Root, m.webdavConfig); err != nil {
+			m.flashStatus("Save failed: "+err.Error(), true, 2*time.Second)
+		} else {
+			m.flashStatus("✓ WebDAV config saved", false, 2*time.Second)
+		}
+		m.mode = modeNormal
+		m.input.Blur()
+		m.input.Prompt = "› "
+		m.webdavInputStep = 0
+		return m, m.takePending()
+	}
+	m.webdavInputStep++
+	m.input.Width = max(20, min(80, m.width-12))
+	m.input.Focus()
+	return m, nil
+}
+
+// webdavConfigView renders the WebDAV config form.
+func (m *Model) webdavConfigView() string {
+	var b strings.Builder
+	b.WriteString(brandSty.Render("WebDAV sync settings") + "\n\n")
+	b.WriteString(m.input.View() + "\n\n")
+	b.WriteString(mutedSty.Render("Tab/Enter next · Esc cancel"))
+	dialog := lipgloss.NewStyle().Background(surface).Foreground(text).Border(lipgloss.RoundedBorder()).BorderForeground(muted).Padding(1, 3).Width(min(80, max(40, m.width-6))).Render(b.String())
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, dialog, lipgloss.WithWhitespaceBackground(bg))
+}
+
 func (m *Model) updateCommand(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "esc":
@@ -4922,6 +5125,11 @@ func (m *Model) commandList() []command {
 		{"Rename", func() { m.startPrompt(promptRename) }},
 		{"Delete", m.startDelete},
 		{"Toggle tag filter", m.startTagFilter},
+		{"Clean up unused images", func() {
+			m.cleanupImages()
+		}},
+		{"WebDAV sync settings", func() { m.startWebdavConfig() }},
+		{"Sync now", func() { m.syncWebdavNow() }},
 	}
 }
 

@@ -228,3 +228,33 @@ func TestContentDragAfterScroll(t *testing.T) {
 		t.Fatalf("expected copied text not to include scrolled-out first paragraph, got %q", copied)
 	}
 }
+
+// TestSelectionHighlightClosesAtLineEnd verifies that when a drag selection
+// extends to the end of a rendered line, the highlight reset code is emitted
+// so that the selection color does not bleed into adjacent panels.
+func TestSelectionHighlightClosesAtLineEnd(t *testing.T) {
+	m := openNoteForDrag(t, "line one\n\nline two\n\nline three")
+	m.copier = func(s string) error { return nil }
+	startX := m.treeWidth + 2
+	m.handleMouse(tea.MouseEvent{X: startX, Y: 3, Button: tea.MouseButtonLeft, Action: tea.MouseActionPress})
+	m.handleMouse(tea.MouseEvent{X: startX + 100, Y: 3, Button: tea.MouseButtonNone, Action: tea.MouseActionMotion})
+	// Capture offsets before release clears them.
+	anchor, end := m.contentSelAnchor, m.contentSelEnd
+	m.handleMouse(tea.MouseEvent{X: startX + 100, Y: 3, Button: tea.MouseButtonNone, Action: tea.MouseActionRelease})
+	if m.contentDragging {
+		t.Fatal("expected drag to end after release")
+	}
+	hi, hiEnd := selectionHighlightCodes()
+	if hi == "" {
+		t.Skip("no highlight codes in this terminal profile")
+	}
+	rendered := renderSelectionContent(m.renderedContent, m.renderedPlain, anchor, end)
+	lines := strings.Split(rendered, "\n")
+	if !strings.Contains(lines[0], hi) {
+		t.Fatalf("expected highlight in first line, got %q", lines[0])
+	}
+	trimmed := strings.TrimRight(lines[0], " ")
+	if !strings.HasSuffix(trimmed, hiEnd) {
+		t.Fatalf("expected first line to end with highlight reset to prevent bleed, got %q", lines[0])
+	}
+}
