@@ -22,16 +22,30 @@ A quiet, keyboard-first terminal note. TN stores every note as a normal Markdown
 
 ## Install
 
-Requires Go 1.23 or newer.
+**Install script (Linux / macOS / Termux):**
 
-```sh
+```bash
+curl -fsSL https://raw.githubusercontent.com/vst93/tn/main/cmd/install.sh | bash
+```
+
+Options: `--install-dir <dir>`, `--force`, `--skip-github`, `--lang <en|zh>`
+
+**China users (GitHub mirror):**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/vst93/tn/main/cmd/install.sh | bash -s -- --skip-github
+```
+
+**go install (requires Go 1.23+):**
+
+```bash
 go install github.com/vst93/tn@latest
 tn
 ```
 
-From this repository:
+**From source:**
 
-```sh
+```bash
 go build -o tn .
 ./tn
 ```

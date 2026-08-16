@@ -43,6 +43,12 @@ jobs:
           GOOS=windows GOARCH=amd64 go build -ldflags "$LDFLAGS" -o dist/tn-${VERSION}-windows-amd64.exe .
           GOOS=windows GOARCH=arm64 go build -ldflags "$LDFLAGS" -o dist/tn-${VERSION}-windows-arm64.exe .
 
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum tn-* > checksums.txt
+          cat checksums.txt
+
       - name: Generate release notes
         id: notes
         run: |
@@ -74,6 +80,16 @@ jobs:
             ${{ steps.notes.outputs.log }}
 
             ## Install
+
+            **Install script:**
+
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/vst93/tn/main/cmd/install.sh | bash
+            ```
+
+            Options: `--install-dir <dir>`, `--force`, `--skip-github`, `--lang <en|zh>`
+
+            **go install:**
 
             ```sh
             go install github.com/vst93/tn@${{ github.event.inputs.version }}
