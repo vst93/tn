@@ -63,6 +63,7 @@ const (
 	modeWebdavSync
 	modeBackup
 	modeImport
+	modeMarkdown
 )
 
 type promptKind int
@@ -233,6 +234,35 @@ type command struct {
 	action func()
 }
 
+type markdownItem struct {
+	name      string
+	prefix    string
+	suffix    string
+	multiLine bool
+}
+
+var markdownItems = []markdownItem{
+	{"Heading 1", "# ", "", false},
+	{"Heading 2", "## ", "", false},
+	{"Heading 3", "### ", "", false},
+	{"Heading 4", "#### ", "", false},
+	{"Heading 5", "##### ", "", false},
+	{"Heading 6", "###### ", "", false},
+	{"Bold", "**", "**", false},
+	{"Italic", "*", "*", false},
+	{"Strikethrough", "~~", "~~", false},
+	{"Link", "[", "](url)", false},
+	{"Image", "![", "](url)", false},
+	{"Code", "`", "`", false},
+	{"Code block", "```\n", "\n```", true},
+	{"Quote", "> ", "", false},
+	{"Unordered list", "- ", "", false},
+	{"Ordered list", "1. ", "", false},
+	{"Task list", "- [ ] ", "", false},
+	{"Divider", "---\n", "", false},
+	{"Table", "|  |  |\n|---|---|\n|  |  |", "", true},
+}
+
 type helpRow struct {
 	keys string
 	desc string
@@ -311,19 +341,19 @@ var helpGroupsData = []helpGroup{
 			{"Ctrl+Q", "Quit"},
 			{"?", "Help"},
 			{"Esc", "Close / cancel"},
-			},
-			},
-			{
-			title: "Edit Markdown",
-			rows: []helpRow{
-				{"Ctrl+B", "Bold"},
-				{"Ctrl+I", "Italic"},
-				{"Ctrl+K", "Insert link"},
-				{"Ctrl+V", "Paste image"},
-				{"Ctrl+L", "Copy current line"},
-			},
-			},
-			}
+		},
+	},
+	{
+		title: "Edit Markdown",
+		rows: []helpRow{
+			{"Ctrl+B", "Bold"},
+			{"Ctrl+I", "Italic"},
+			{"Ctrl+K", "Insert link"},
+			{"Ctrl+V", "Paste image"},
+			{"Ctrl+L", "Copy current line"},
+		},
+	},
+}
 
 // SessionState is the persisted workspace state restored on startup.
 type SessionState struct {
@@ -379,7 +409,7 @@ type editRecord struct {
 
 // Model is the TN Bubble Tea application.
 type Model struct {
-	store *storage.Store
+	store  *storage.Store
 	images *imageStore
 
 	tree       []*storage.Node
@@ -467,6 +497,8 @@ type Model struct {
 	commandBeforeActive pane
 	commandIndex        int
 	commandQuery        string
+	markdownIndex       int
+	markdownQuery       string
 
 	webdavInputStep int
 	webdavConfig    WebDAVConfig
@@ -630,6 +662,37 @@ func (m *Model) setCursor(row, col int) {
 	m.editor.SetCursor(col)
 }
 
+func (m *Model) cursorOffset() int {
+	pos := m.cursorPos()
+	lines := strings.Split(m.editor.Value(), "\n")
+	offset := 0
+	for i := 0; i < pos.row && i < len(lines); i++ {
+		offset += len([]rune(lines[i])) + 1
+	}
+	return offset + pos.col
+}
+
+func (m *Model) setCursorAt(offset int) {
+	cur := m.editor.Value()
+	row := 0
+	col := 0
+	remaining := offset
+	for _, r := range cur {
+		if remaining <= 0 {
+			break
+		}
+		if r == '\n' {
+			row++
+			col = 0
+		} else {
+			col++
+		}
+		remaining--
+	}
+	m.gotoLineEdit(row)
+	m.editor.SetCursor(col)
+}
+
 func (m Model) Init() tea.Cmd { return tea.Batch(textarea.Blink, autoSaveCmd()) }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -693,6 +756,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.mode == modeCommand {
 			return m.updateCommand(msg)
 		}
+		if m.mode == modeMarkdown {
+			return m.updateMarkdown(msg)
+		}
 		if m.mode == modeWebdavConfig {
 			return m.updateWebdavConfig(msg)
 		}
@@ -717,6 +783,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.editSel != nil {
 					m.editSel.end = m.cursorPos()
 				}
+			} else if msg.String() == "/" {
+				// Slash opens markdown format menu
+				m.startMarkdown()
+				return m, cmd
 			} else {
 				switch msg.Type {
 				case tea.KeyEnter:
@@ -752,6 +822,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				case tea.KeyCtrlK:
 					m.insertLink()
 					m.recordEdit(before, m.editor.Value(), beforePos, m.cursorPos())
+					return m, cmd
+				case tea.KeyCtrlE:
+					m.startMarkdown()
 					return m, cmd
 				}
 				m.editSel = nil
@@ -3628,7 +3701,7 @@ func (m *Model) insertImageRef(ref string) {
 		// Insert image ref on a new line after current, preserving cursor.
 		lines[row] = lines[row] + "\n\n![image](" + ref + ")\n"
 	} else {
-		lines = append(lines, "![image](" + ref + ")")
+		lines = append(lines, "![image]("+ref+")")
 	}
 	m.editor.SetValue(strings.Join(lines, "\n"))
 	// Move cursor to the line with the image ref.
@@ -4445,6 +4518,9 @@ func (m Model) View() string {
 	}
 	if m.mode == modeCommand {
 		return m.commandView()
+	}
+	if m.mode == modeMarkdown {
+		return m.markdownView()
 	}
 	if m.mode == modeWebdavConfig {
 		return m.webdavConfigView()
@@ -5352,6 +5428,172 @@ func (m *Model) exitCommand() {
 	m.commandQuery = ""
 	m.commandIndex = 0
 	m.restoreCommandFocus()
+}
+
+func (m *Model) startMarkdown() {
+	m.commandBeforeMode = m.mode
+	m.commandBeforeActive = m.active
+	m.mode = modeMarkdown
+	m.markdownIndex = 0
+	m.markdownQuery = ""
+	m.input.Prompt = "Format: "
+	m.input.Placeholder = "type to filter"
+	m.input.SetValue("")
+	m.input.Width = max(20, min(60, m.width-12))
+	m.input.Focus()
+	m.statusErr = false
+	m.status = ""
+}
+
+func (m *Model) exitMarkdown() {
+	m.mode = m.commandBeforeMode
+	m.active = m.commandBeforeActive
+	m.input.Blur()
+	m.input.Prompt = "› "
+	m.markdownQuery = ""
+	m.markdownIndex = 0
+	m.restoreCommandFocus()
+}
+
+func (m *Model) filteredMarkdownItems() []markdownItem {
+	q := strings.ToLower(strings.TrimSpace(m.markdownQuery))
+	var out []markdownItem
+	for _, item := range markdownItems {
+		if q == "" || strings.Contains(strings.ToLower(item.name), q) {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+func (m *Model) moveMarkdown(delta int) {
+	n := len(m.filteredMarkdownItems())
+	if n == 0 {
+		return
+	}
+	m.markdownIndex = ((m.markdownIndex+delta)%n + n) % n
+}
+
+func (m *Model) applyMarkdown(item markdownItem) {
+	m.exitMarkdown()
+	if item.prefix == "" && item.suffix == "" {
+		return
+	}
+	cur := m.editor.Value()
+	pos := m.cursorPos()
+	// Calculate byte offset from (row, col)
+	offset := 0
+	lines := strings.Split(cur, "\n")
+	for i := 0; i < pos.row && i < len(lines); i++ {
+		offset += len([]rune(lines[i])) + 1
+	}
+	offset += pos.col
+
+	prefix := item.prefix
+	suffix := item.suffix
+
+	if !item.multiLine && !strings.HasSuffix(prefix, "\n") && !strings.HasPrefix(prefix, "---") && prefix != "" {
+		// Block-level elements (headings, list items, quote): insert at line start
+		lineStart := 0
+		for i := 0; i < pos.row && i < len(lines); i++ {
+			lineStart += len([]rune(lines[i])) + 1
+		}
+		newCur := cur[:lineStart] + prefix + cur[lineStart:]
+		m.editor.SetValue(newCur)
+		newOffset := lineStart + len(prefix)
+		m.setCursorAt(newOffset)
+	} else if strings.HasPrefix(prefix, "---") {
+		// Divider: insert after current line
+		lineEnd := offset
+		if pos.row < len(lines) {
+			lineEnd += len([]rune(lines[pos.row])) - pos.col
+		}
+		newCur := cur[:lineEnd] + "\n" + prefix + cur[lineEnd:]
+		m.editor.SetValue(newCur)
+		m.setCursorAt(lineEnd + 1 + len(prefix))
+	} else if item.multiLine {
+		// Multi-line blocks (code block, table)
+		newCur := cur[:offset] + prefix + suffix + cur[offset:]
+		m.editor.SetValue(newCur)
+		m.setCursorAt(offset + len(prefix))
+	} else {
+		// Inline elements (bold, italic, link, code, strikethrough)
+		from, to := m.selectionRange()
+		if from >= 0 && to > from {
+			selected := cur[from:to]
+			wrapped := prefix + selected + suffix
+			newCur := cur[:from] + wrapped + cur[to:]
+			m.editor.SetValue(newCur)
+			m.editSel = nil
+			m.setCursorAt(from + len(wrapped))
+		} else {
+			inserted := prefix + "text" + suffix
+			newCur := cur[:offset] + inserted + cur[offset:]
+			m.editor.SetValue(newCur)
+			m.setCursorAt(offset + len(prefix))
+		}
+	}
+	m.recordEdit(m.editor.Value(), m.editor.Value(), m.cursorPos(), m.cursorPos())
+}
+
+func (m *Model) updateMarkdown(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.exitMarkdown()
+		return m, nil
+	case "enter":
+		items := m.filteredMarkdownItems()
+		if len(items) > 0 && m.markdownIndex >= 0 && m.markdownIndex < len(items) {
+			m.applyMarkdown(items[m.markdownIndex])
+		}
+		return m, m.takePending()
+	case "up":
+		m.moveMarkdown(-1)
+		return m, nil
+	case "down":
+		m.moveMarkdown(1)
+		return m, nil
+	case "home":
+		m.markdownIndex = 0
+		return m, nil
+	case "end":
+		m.markdownIndex = max(0, len(m.filteredMarkdownItems())-1)
+		return m, nil
+	}
+	var cmd tea.Cmd
+	m.input, cmd = m.input.Update(msg)
+	if q := m.input.Value(); q != m.markdownQuery {
+		m.markdownQuery = q
+		m.markdownIndex = 0
+	}
+	return m, cmd
+}
+
+func (m Model) markdownView() string {
+	items := m.filteredMarkdownItems()
+	var b strings.Builder
+	b.WriteString(brandSty.Render("Insert Format") + "\n\n")
+	b.WriteString(m.input.View() + "\n\n")
+	for i, item := range items {
+		line := "  " + item.name
+		if i == m.markdownIndex {
+			line = lipgloss.NewStyle().Foreground(accent).Bold(true).Render("▸ " + item.name)
+		}
+		b.WriteString(line + "\n")
+	}
+	if len(items) == 0 {
+		b.WriteString(errorSty.Render("No matching format") + "\n")
+	}
+	b.WriteString("\n" + mutedSty.Render("↑/↓ select · Enter insert · Esc close"))
+	dialog := lipgloss.NewStyle().
+		Background(surface).
+		Foreground(text).
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(accent).
+		Padding(1, 3).
+		Width(min(64, max(28, m.width-6))).
+		Render(b.String())
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, dialog, lipgloss.WithWhitespaceBackground(bg))
 }
 
 func (m *Model) restoreCommandFocus() {
