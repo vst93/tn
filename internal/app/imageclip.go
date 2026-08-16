@@ -72,6 +72,18 @@ func sniffExt(data []byte) string {
 // Returns raw image bytes, detected extension, and error (nil if no image).
 func readImageFromClipboard() ([]byte, string, error) {
 	switch runtime.GOOS {
+	case "android":
+		// Termux: try termux-clipboard-get; may return a file path or URI.
+		if data, err := exec.Command("termux-clipboard-get").Output(); err == nil {
+			path := strings.TrimSpace(string(data))
+			if path != "" {
+				// Try reading as a local file path.
+				if bytes, err := os.ReadFile(path); err == nil {
+					return bytes, sniffExt(bytes), nil
+				}
+			}
+		}
+		return nil, "", fmt.Errorf("no image in clipboard (Termux: save image to a file and paste the path, or install termux-api)")
 	case "linux":
 		// Try Wayland first, then X11.
 		if data, err := exec.Command("wl-paste", "--type", "image/png").Output(); err == nil {
