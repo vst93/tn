@@ -464,6 +464,9 @@ type Model struct {
 
 	history      []string
 	historyIndex int
+
+	promptPathIndex int
+	promptFolders   []string
 }
 
 func New(store *storage.Store) Model {
@@ -505,6 +508,7 @@ func New(store *storage.Store) Model {
 		status:        "Ready",
 		sessionPath:   defaultSessionPath(),
 		helpHintView:  viewport.New(60, 20),
+		promptPathIndex: -1,
 	}
 	m.preview.MouseWheelEnabled = true
 	m.preview.MouseWheelDelta = 2
@@ -2178,13 +2182,15 @@ func (m *Model) startPrompt(kind promptKind) {
 	m.mode = modePrompt
 	m.statusErr = false
 	m.input.SetValue("")
+	m.promptFolders = collectPromptFolders(m.flat)
+	m.promptPathIndex = initialPromptPathIndex(m.flat, m.selected, m.promptFolders)
 	switch kind {
 	case promptNote:
-		m.input.Placeholder = "New note:"
+		m.input.Placeholder = "Note name"
 	case promptDir:
-		m.input.Placeholder = "New folder:"
+		m.input.Placeholder = "Folder name"
 	case promptRename:
-		m.input.Placeholder = "New name:"
+		m.input.Placeholder = "New name"
 		m.input.SetValue(m.flat[m.selected].node.Name)
 	}
 	m.input.Width = max(20, min(60, m.width-12))
@@ -2200,6 +2206,12 @@ func (m Model) updatePrompt(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.mode = modeNormal
 		m.input.Blur()
 		return m, nil
+	case "tab":
+		cyclePromptPath(&m.promptPathIndex, len(m.promptFolders))
+		return m, nil
+	case "shift+tab":
+		cyclePromptPathReverse(&m.promptPathIndex, len(m.promptFolders))
+		return m, nil
 	case "enter":
 		value := m.input.Value()
 		if m.promptKind == promptRename && len(m.flat) > 0 && strings.TrimSpace(value) == m.flat[m.selected].node.Name {
@@ -2211,9 +2223,9 @@ func (m Model) updatePrompt(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		var err error
 		switch m.promptKind {
 		case promptNote:
-			path, err = m.store.CreateNote(m.selectedParent(), value)
+			path, err = m.store.CreateNote(m.promptParent(), value)
 		case promptDir:
-			path, err = m.store.CreateDir(m.selectedParent(), value)
+			path, err = m.store.CreateDir(m.promptParent(), value)
 		case promptRename:
 			path, err = m.renameSelected(value)
 		}
@@ -3750,6 +3762,82 @@ func (m *Model) selectedParent() string {
 	return parent
 }
 
+// promptParent returns the path for the current promptPathIndex.
+func (m *Model) promptParent() string {
+	if m.promptPathIndex < 0 || m.promptPathIndex >= len(m.promptFolders) {
+		return ""
+	}
+	return m.promptFolders[m.promptPathIndex]
+}
+
+// collectPromptFolders returns all folder paths from the flat list.
+func collectPromptFolders(flat []flatNode) []string {
+	var folders []string
+	for _, item := range flat {
+		if item.node.IsDir {
+			folders = append(folders, item.node.RelPath)
+		}
+	}
+	return folders
+}
+
+// initialPromptPathIndex returns the index into folders for the selected item's parent.
+func initialPromptPathIndex(flat []flatNode, selected int, folders []string) int {
+	if len(flat) == 0 || selected < 0 || selected >= len(flat) {
+		return -1
+	}
+	n := flat[selected].node
+	if n.IsDir {
+		for i, f := range folders {
+			if f == n.RelPath {
+				return i
+			}
+		}
+		return -1
+	}
+	parent := filepath.Dir(n.RelPath)
+	if parent == "." {
+		return -1
+	}
+	for i, f := range folders {
+		if f == parent {
+			return i
+		}
+	}
+	return -1
+}
+
+// cyclePromptPath advances the prompt path index forward.
+func cyclePromptPath(idx *int, folderCount int) {
+	if folderCount == 0 {
+		*idx = -1
+		return
+	}
+	*idx++
+	if *idx >= folderCount {
+		*idx = -1
+	}
+}
+
+// cyclePromptPathReverse moves the prompt path index backward.
+func cyclePromptPathReverse(idx *int, folderCount int) {
+	if folderCount == 0 {
+		*idx = -1
+		return
+	}
+	*idx--
+	if *idx < -1 {
+		*idx = folderCount - 1
+	}
+}
+
+func (m *Model) promptParentName() string {
+	if m.promptPathIndex < 0 || m.promptPathIndex >= len(m.promptFolders) {
+		return "root"
+	}
+	return m.promptFolders[m.promptPathIndex]
+}
+
 func (m *Model) ensureSelectionVisible() {
 	rows := m.treeRows()
 	if m.selected < m.treeOffset {
@@ -4727,20 +4815,20 @@ func borderedPanelPart(title, content string, width, height int, focused bool, l
 	innerWidth := max(1, width-leftOffset-rightOffset)
 	innerHeight := max(1, height-2)
 	title = truncate(title, max(1, innerWidth-2))
-	titleText := lipgloss.NewStyle().Foreground(titleColor).Bold(focused).Render(" " + title + " ")
+	border := lipgloss.NewStyle().Foreground(borderColor)
+	titleText := border.Render(" ") + lipgloss.NewStyle().Foreground(titleColor).Bold(focused).Render(title) + border.Render(" ")
 	topTail := max(0, innerWidth-lipgloss.Width(titleText))
 	top := ""
 	if leftB {
-		top += "┌"
+		top += border.Render("┌")
 	}
-	top += titleText + strings.Repeat("─", topTail)
+	top += titleText + border.Render(strings.Repeat("─", topTail))
 	if rightB {
-		top += "┐"
+		top += border.Render("┐")
 	}
 
 	content = fitBlock(content, innerWidth, innerHeight)
 	rows := strings.Split(content, "\n")
-	border := lipgloss.NewStyle().Foreground(borderColor)
 	for i, row := range rows {
 		line := ""
 		if leftB {
@@ -4754,11 +4842,11 @@ func borderedPanelPart(title, content string, width, height int, focused bool, l
 	}
 	bottom := ""
 	if leftB {
-		bottom += "└"
+		bottom += border.Render("└")
 	}
-	bottom += strings.Repeat("─", innerWidth)
+	bottom += border.Render(strings.Repeat("─", innerWidth))
 	if rightB {
-		bottom += "┘"
+		bottom += border.Render("┘")
 	}
 	return top + "\n" + strings.Join(rows, "\n") + "\n" + bottom
 }
@@ -4907,7 +4995,11 @@ func (m Model) dialogView() string {
 		case promptRename:
 			title = "Rename"
 		}
-		body = m.input.View() + "\n\n" + mutedSty.Render("Enter confirm  ·  Esc cancel")
+		body = m.input.View() + "\n\n" + mutedSty.Render("Enter confirm · Esc cancel")
+		// Show path selector for note/folder creation
+		if m.promptKind == promptNote || m.promptKind == promptDir {
+			body += "\n\n" + m.pathSelectorView(60)
+		}
 		if m.statusErr {
 			body += "\n" + errorSty.Render(m.status)
 		}
@@ -4921,6 +5013,19 @@ func (m Model) dialogView() string {
 		Width(min(64, max(28, m.width-6))).
 		Render(brandSty.Render(title) + "\n\n" + body)
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, dialog, lipgloss.WithWhitespaceBackground(bg))
+}
+
+func (m Model) pathSelectorView(width int) string {
+	var b strings.Builder
+	b.WriteString(mutedSty.Render("Create in:"))
+	// Current path indicator
+	current := m.promptParentName()
+	b.WriteString("\n")
+	b.WriteString(lipgloss.NewStyle().Foreground(accent).Bold(true).Render("▸ " + current))
+	// Hint
+	b.WriteString("\n")
+	b.WriteString(mutedSty.Render("Tab / Shift+Tab to change path"))
+	return b.String()
 }
 
 func (m *Model) startHelp() {
