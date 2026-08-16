@@ -1987,10 +1987,11 @@ func (m *Model) wrapSelection(prefix, suffix string) {
 		m.setCursorAt(from + len([]rune(wrapped)))
 	} else {
 		inserted := prefix + "text" + suffix
-		newRunes := append(runes[:from], []rune(inserted)...)
-		newRunes = append(newRunes, runes[from:]...)
+		off := m.cursorOffset()
+		newRunes := append(runes[:off], []rune(inserted)...)
+		newRunes = append(newRunes, runes[off:]...)
 		m.editor.SetValue(string(newRunes))
-		m.setCursorAt(from + len([]rune(prefix)))
+		m.setCursorAt(off + len([]rune(prefix)))
 	}
 }
 
@@ -2007,10 +2008,11 @@ func (m *Model) insertLink() {
 		m.setCursorAt(from + len([]rune(selected)) + 3)
 	} else {
 		inserted := "[text](url)"
-		newRunes := append(runes[:from], []rune(inserted)...)
-		newRunes = append(newRunes, runes[from:]...)
+		off := m.cursorOffset()
+		newRunes := append(runes[:off], []rune(inserted)...)
+		newRunes = append(newRunes, runes[off:]...)
 		m.editor.SetValue(string(newRunes))
-		m.setCursorAt(from + 1)
+		m.setCursorAt(off + 1)
 	}
 }
 
@@ -4627,36 +4629,13 @@ func (m Model) View() string {
 		bottom = m.gotoBarView()
 	case m.mode == modeTagFilter:
 		bottom = m.tagFilterBarView()
+	case m.mode == modeMarkdown:
+		bottom = m.markdownView()
 	default:
 		bottom = m.statusView()
 	}
 	view := header + "\n" + body + "\n" + bottom
-	baseView := lipgloss.NewStyle().Background(bg).Width(m.width).Height(m.height).Render(view)
-	if m.mode == modeMarkdown {
-		popup := m.markdownView()
-		baseView = overlayBottom(baseView, popup)
-	}
-	return baseView
-}
-
-// overlayBottom places a string on top of another at the bottom.
-func overlayBottom(base, top string) string {
-	baseLines := strings.Split(base, "\n")
-	topLines := strings.Split(top, "\n")
-	if len(topLines) == 0 {
-		return base
-	}
-	// Place top lines above the last lines of base
-	startRow := len(baseLines) - len(topLines)
-	if startRow < 0 {
-		startRow = 0
-	}
-	for i, line := range topLines {
-		if startRow+i < len(baseLines) {
-			baseLines[startRow+i] = line
-		}
-	}
-	return strings.Join(baseLines, "\n")
+	return lipgloss.NewStyle().Background(bg).Width(m.width).Height(m.height).Render(view)
 }
 
 func (m Model) bodyRenderHeight() int {
@@ -5650,10 +5629,10 @@ func (m Model) markdownView() string {
 	if len(items) == 0 {
 		items = append(items, markdownItem{name: "No match"})
 	}
-	// Compact horizontal list: [ filter ] ▸ Bold  Italic  Link  Code  ...
+	// Ultra-compact single line: [ filter ] ▸ Bold  Italic  Link  Code  ...
 	var b strings.Builder
 	b.WriteString(m.input.View())
-	b.WriteString("\n")
+	b.WriteString("  ")
 	// Show items in a wrapping row, highlighted one in accent
 	parts := []string{}
 	for i, item := range items {
@@ -5668,19 +5647,13 @@ func (m Model) markdownView() string {
 		}
 	}
 	b.WriteString(lipgloss.JoinHorizontal(lipgloss.Left, parts...))
-	b.WriteString("\n")
-	b.WriteString(mutedSty.Render("↑/↓ select · Enter insert · Esc close"))
-	// Render as a thin strip at bottom of screen (above status bar)
-	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Bottom,
-		lipgloss.NewStyle().
-			Background(surface).
-			Foreground(text).
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(accent).
-			Padding(0, 2).
-			Width(min(120, m.width-4)).
-			Render(b.String()),
-		lipgloss.WithWhitespaceBackground(bg))
+	// Single-line bar at the very bottom (replaces status bar)
+	return lipgloss.NewStyle().
+		Background(surface).
+		Foreground(text).
+		Width(m.width).
+		MaxHeight(1).
+		Render(" " + b.String())
 }
 
 func (m *Model) restoreCommandFocus() {
