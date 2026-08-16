@@ -4373,7 +4373,7 @@ func (m Model) View() string {
 		separator := strings.Repeat("│\n", m.bodyRenderHeight()-1) + "│"
 		body = lipgloss.JoinHorizontal(lipgloss.Top,
 			m.treeViewSides(m.treeWidth, true, false),
-			mutedSty.Render(separator),
+			lipgloss.NewStyle().Foreground(muted).Render(separator),
 			m.contentViewSides(contentW, false, true),
 		)
 	}
@@ -4402,7 +4402,7 @@ func (m Model) bodyRenderHeight() int {
 func (m Model) headerView() string {
 	brand := lipgloss.NewStyle().Foreground(accent).Bold(true).Render("◆ tn")
 	tabs := m.headerTabs()
-	left := brand + mutedSty.Render("  │  ") + tabs
+	left := brand + mutedSty.Render(" │ ") + tabs
 
 	name := "no note"
 	if m.currentPath != "" {
@@ -4413,18 +4413,20 @@ func (m Model) headerView() string {
 	}
 	var badge string
 	if m.mode == modeEdit {
-		badge = editBadge.Render(" EDIT ") + " "
+		badge = " " + editBadge.Render(" EDIT ")
 	}
-	right := badge + truncateANSI(name, max(1, m.width-lipgloss.Width(left)-lipgloss.Width(badge)-12))
+	right := badge + " " + truncateANSI(name, max(1, m.width-lipgloss.Width(left)-lipgloss.Width(badge)-12))
 	space := max(1, m.width-lipgloss.Width(left)-lipgloss.Width(right)-2)
 	line := " " + left + strings.Repeat(" ", space) + right
-	return headerSty.Width(m.width).MaxHeight(1).Render(line)
+	return lipgloss.NewStyle().Background(surface).Width(m.width).MaxHeight(1).Render(line)
 }
 
 // headerTabAt maps a header-row x-coordinate to the pane tab it hits. It
 // mirrors headerView's layout so clicks stay aligned when labels change.
 func (m Model) headerTabAt(x int) (pane, bool) {
-	notesStart := 1 + lipgloss.Width("◆ tn") + lipgloss.Width("  │  ")
+	brandWidth := lipgloss.Width("◆ tn")
+	sepWidth := lipgloss.Width(" │ ")
+	notesStart := 1 + brandWidth + sepWidth
 	if !m.treeVisible {
 		contentW := lipgloss.Width(m.contentTabLabel())
 		if x >= notesStart && x < notesStart+contentW {
@@ -4432,11 +4434,12 @@ func (m Model) headerTabAt(x int) (pane, bool) {
 		}
 		return contentPane, false
 	}
-	notesW := lipgloss.Width(" 1 Notes ")
-	contentStart := notesStart + notesW + 1
-	contentW := lipgloss.Width(" 2 Preview ")
+	notesW := lipgloss.Width(" Lists ")
+	sep2W := lipgloss.Width(" │ ")
+	contentStart := notesStart + notesW + sep2W
+	contentW := lipgloss.Width(" Preview ")
 	if m.mode == modeEdit {
-		contentW = lipgloss.Width(" 2 Edit ")
+		contentW = lipgloss.Width(" Edit ")
 	}
 	if x >= notesStart && x < notesStart+notesW {
 		return treePane, true
@@ -4454,32 +4457,34 @@ func (m Model) headerTabs() string {
 	notesStyle := lipgloss.NewStyle().Foreground(muted)
 	contentStyle := lipgloss.NewStyle().Foreground(muted)
 	if m.active == treePane {
-		notesStyle = notesStyle.Background(accent).Foreground(bg).Bold(true)
+		notesStyle = notesStyle.Background(surface).Foreground(accent).Bold(true)
 	} else {
-		contentStyle = contentStyle.Background(accent).Foreground(bg).Bold(true)
+		contentStyle = contentStyle.Background(surface).Foreground(accent).Bold(true)
 	}
-	contentLabel := "2 Preview"
+	contentLabel := "Preview"
 	if m.mode == modeEdit {
-		contentLabel = "2 Edit"
+		contentLabel = "Edit"
 	}
-	return notesStyle.Render(" 1 Notes ") + " " + contentStyle.Render(" "+contentLabel+" ")
+	return notesStyle.Render(" Lists ") + lipgloss.NewStyle().Foreground(muted).Render(" │ ") + contentStyle.Render(" "+contentLabel+" ")
 }
 
 func (m Model) contentTabLabel() string {
 	contentStyle := lipgloss.NewStyle().Foreground(muted)
 	if !m.treeVisible || m.active != treePane {
-		contentStyle = contentStyle.Background(accent).Foreground(bg).Bold(true)
+		contentStyle = contentStyle.Background(surface).Foreground(accent).Bold(true)
 	}
-	contentLabel := "2 Preview"
+	contentLabel := "Preview"
 	if m.mode == modeEdit {
-		contentLabel = "2 Edit"
+		contentLabel = "Edit"
 	}
 	return contentStyle.Render(" " + contentLabel + " ")
 }
 
 func (m Model) toolbarItems() []toolbarItem {
 	items := []toolbarItem{
-		{"? help", "help"}, {"# tag", "tagfilter"}, {"n note", "note"}, {"N folder", "folder"}, {"e edit/save", "edit"}, {"s save", "save"}, {"y copy", "copy"}, {"f find", "find"}, {"^G select", "select"}, {"r rename", "rename"}, {"x delete", "delete"}, {"q quit", "quit"},
+		{"? help", "help"}, {"# tag", "tagfilter"}, {"n note", "note"}, {"N folder", "folder"},
+		{"e edit", "edit"}, {"s save", "save"}, {"y copy", "copy"}, {"f find", "find"},
+		{"^G select", "select"}, {"r rename", "rename"}, {"x delete", "delete"}, {"q quit", "quit"},
 	}
 	if m.compact {
 		label := "→ note"
@@ -4529,13 +4534,13 @@ func (m Model) treeViewSides(width int, leftB, rightB bool) string {
 	focused := m.active == treePane
 	title := "Lists"
 	if len(m.flat) > 0 {
-		title += mutedSty.Render("  " + fmt.Sprintf("%d", len(m.flat)))
+		title += mutedSty.Render(" · " + fmt.Sprintf("%d", len(m.flat)))
 	}
 	if sel := m.selectedCount(); sel > 0 {
-		title += "  " + lipgloss.NewStyle().Foreground(accent).Bold(true).Render(fmt.Sprintf("☑ %d", sel))
+		title += " · " + lipgloss.NewStyle().Foreground(accent).Bold(true).Render(fmt.Sprintf("☑%d", sel))
 	}
 	if m.tagFilter != "" {
-		title += "  " + lipgloss.NewStyle().Foreground(accent).Bold(true).Render("#"+m.tagFilter)
+		title += " · " + lipgloss.NewStyle().Foreground(accent).Bold(true).Render("#"+m.tagFilter)
 	}
 	innerWidth := max(1, width)
 	if leftB {
@@ -4573,9 +4578,9 @@ func (m Model) treeViewSides(width int, leftB, rightB bool) string {
 				label = label + " " + lipgloss.NewStyle().Foreground(accent).Bold(true).Render(fmt.Sprintf("#%d", count))
 			}
 		}
-		row := " " + indent + label
+		row := indent + label
 		if i == m.selected {
-			row = accentText.Render("▸ ") + indent + label
+			row = accentText.Render("▸ ") + indent + strings.TrimPrefix(label, "○ ")
 			row = truncateANSI(row, innerWidth)
 			row = lipgloss.NewStyle().Background(selection).Foreground(text).Bold(true).Width(innerWidth).Render(row)
 		} else {
@@ -4587,7 +4592,7 @@ func (m Model) treeViewSides(width int, leftB, rightB bool) string {
 		lines = append(lines,
 			"  "+mutedSty.Render("No notes yet. Press n to create one."),
 			"",
-			"  "+accentText.Render("n")+mutedSty.Render(" new note")+"   "+accentText.Render("N")+mutedSty.Render(" new folder"),
+			"  "+accentText.Render("n")+mutedSty.Render(" new note · ")+accentText.Render("N")+mutedSty.Render(" new folder"),
 		)
 	}
 	return borderedPanelPart(title, strings.Join(lines, "\n"), width, m.bodyRenderHeight(), focused, leftB, rightB)
@@ -4609,7 +4614,7 @@ func (m Model) contentViewSides(width int, leftB, rightB bool) string {
 			title += " ★"
 		}
 		if m.mode == modeNormal && m.previewLineCount() > m.preview.Height {
-			title += " · " + lipgloss.NewStyle().Foreground(accent).Render(fmt.Sprintf("%d%% read", m.previewPercent()))
+			title += " · " + lipgloss.NewStyle().Foreground(accent).Render(fmt.Sprintf("%d%%", m.previewPercent()))
 		}
 	}
 
@@ -4621,7 +4626,7 @@ func (m Model) contentViewSides(width int, leftB, rightB bool) string {
 		innerWidth--
 	}
 
-	// Metadata line (replaces old Details panel)
+	// Compact metadata line
 	var meta string
 	if m.currentPath != "" {
 		state := lipgloss.NewStyle().Foreground(green).Bold(true).Render("saved")
@@ -4637,13 +4642,13 @@ func (m Model) contentViewSides(width int, leftB, rightB bool) string {
 		chars := charCount(content)
 		lines := lineCountOf(content)
 		stats := fmt.Sprintf("%d words · %d chars · %d lines · ~%s read", words, chars, lines, readingTimeEstimate(content))
-		metaLine := " " + mutedSty.Render(m.currentPath) + "   " +
+		metaLine := mutedSty.Render(m.currentPath) + "   " +
 			state + "   " +
-			mutedSty.Render(modeName) + "   " +
+			mutedSty.Render(modeName+" · ") +
 			mutedSty.Render(stats)
 		meta = truncateANSI(metaLine, max(1, innerWidth-2)) + "\n"
 		if tags := m.nodeTags[m.currentPath]; len(tags) > 0 {
-			meta += " " + m.tagsRow(tags, max(4, innerWidth-2)) + "\n"
+			meta += m.tagsRow(tags, max(4, innerWidth-2)) + "\n"
 		}
 	}
 
@@ -4655,11 +4660,6 @@ func (m Model) contentViewSides(width int, leftB, rightB bool) string {
 	} else {
 		content = m.preview.View()
 		if m.contentDragging {
-			// While a drag selection is in progress, render the selected
-			// span highlighted. The selection offsets are rune offsets into
-			// the plain text, so map them onto the ANSI-rendered content
-			// without disturbing the viewport's scroll position (line
-			// count is unchanged).
 			start, end := m.contentSelAnchor, m.contentSelEnd
 			if start > end {
 				start, end = end, start
@@ -4836,7 +4836,7 @@ func (m *Model) editShortcutBar() string {
 		mutedSty.Render(" · Esc · Ctrl+L · Ctrl+V")
 	pos := m.cursorPos()
 	total := m.editor.LineCount()
-	right := fmt.Sprintf("Line %d / %d · Column %d", pos.row+1, total, pos.col+1)
+	right := fmt.Sprintf("Line %d/%d · Col %d", pos.row+1, total, pos.col+1)
 	return m.composeBar(left, right)
 }
 
@@ -4845,14 +4845,14 @@ func (m Model) composeBar(left, right string) string {
 	rw := lipgloss.Width(right)
 	divider := ""
 	if lw > 0 && rw > 0 {
-		divider = mutedSty.Render("│") + " "
+		divider = mutedSty.Render(" │ ") + " "
 	}
 	dw := lipgloss.Width(divider)
 	pad := m.width - lw - rw - dw - 2
 	if pad < 0 {
 		pad = 0
 	}
-	return lipgloss.NewStyle().Foreground(muted).Width(m.width).MaxHeight(1).Render(" " + left + divider + strings.Repeat(" ", pad) + " " + right)
+	return lipgloss.NewStyle().Foreground(muted).Background(surface).Width(m.width).MaxHeight(1).Render(" " + left + divider + strings.Repeat(" ", pad) + " " + right)
 }
 
 func (m Model) searchBarView() string {
@@ -4892,10 +4892,10 @@ func (m Model) dialogView() string {
 			body = fmt.Sprintf("将删除 %d 个笔记", m.confirmCount)
 		} else if m.confirmDir {
 			title = "Delete folder"
-			body = "Delete “" + m.confirm + "” and all contents?"
+			body = "Delete \u201c" + m.confirm + "\u201d and all contents?"
 		} else {
 			title = "Delete note"
-			body = "Delete “" + m.confirm + "”?"
+			body = "Delete \u201c" + m.confirm + "\u201d?"
 		}
 		body += "\n\n" + dangerStyle("Enter / Y  确认删除") + "    " + mutedSty.Render("Esc / N  取消")
 	} else {
@@ -4912,7 +4912,14 @@ func (m Model) dialogView() string {
 			body += "\n" + errorSty.Render(m.status)
 		}
 	}
-	dialog := lipgloss.NewStyle().Background(surface).Foreground(text).Border(lipgloss.RoundedBorder()).BorderForeground(muted).Padding(1, 3).Width(min(64, max(28, m.width-6))).Render(brandSty.Render(title) + "\n\n" + body)
+	dialog := lipgloss.NewStyle().
+		Background(surface).
+		Foreground(text).
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(accent).
+		Padding(1, 3).
+		Width(min(64, max(28, m.width-6))).
+		Render(brandSty.Render(title) + "\n\n" + body)
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, dialog, lipgloss.WithWhitespaceBackground(bg))
 }
 

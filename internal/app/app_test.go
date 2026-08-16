@@ -124,8 +124,10 @@ func TestHeaderTabClickTargets(t *testing.T) {
 	m := New(storage.New(t.TempDir()))
 	m.resize(100, 30)
 
+	// "◆ tn │  Lists  │  Preview "
+	//    1234567890123456789012345678
 	if p, ok := m.headerTabAt(13); !ok || p != treePane {
-		t.Fatalf("expected Notes tab at x=13, got pane=%v ok=%v", p, ok)
+		t.Fatalf("expected Lists tab at x=13, got pane=%v ok=%v", p, ok)
 	}
 	if p, ok := m.headerTabAt(23); !ok || p != contentPane {
 		t.Fatalf("expected Preview tab at x=23, got pane=%v ok=%v", p, ok)
@@ -138,11 +140,12 @@ func TestHeaderTabClickTargets(t *testing.T) {
 	}
 
 	m.mode = modeEdit
-	if p, ok := m.headerTabAt(24); !ok || p != contentPane {
-		t.Fatalf("expected Edit tab at x=24, got pane=%v ok=%v", p, ok)
+	// Edit tab is shorter: " Edit " at positions 18-23
+	if p, ok := m.headerTabAt(21); !ok || p != contentPane {
+		t.Fatalf("expected Edit tab at x=21, got pane=%v ok=%v", p, ok)
 	}
-	if _, ok := m.headerTabAt(31); ok {
-		t.Fatal("expected x=31 outside the Edit tab in edit mode")
+	if _, ok := m.headerTabAt(24); ok {
+		t.Fatal("expected x=24 outside the Edit tab in edit mode")
 	}
 }
 
@@ -580,7 +583,7 @@ func TestEditStatusBarShowsPosition(t *testing.T) {
 	m.editor.SetCursor(0)
 
 	bar := stripANSI(m.editShortcutBar())
-	if !strings.Contains(bar, "Line 1 / 3 · Column 1") {
+	if !strings.Contains(bar, "Line 1/3 · Col 1") {
 		t.Fatalf("edit status bar missing position: %q", bar)
 	}
 }
@@ -2318,7 +2321,7 @@ func TestReadingProgressReflectsScroll(t *testing.T) {
 	if bar := stripANSI(m.shortcutBar()); !strings.Contains(bar, fmt.Sprintf("%d%%", pct)) {
 		t.Fatalf("expected reading percent in status bar, got %q", bar)
 	}
-	if view := stripANSI(m.contentView(100)); !strings.Contains(view, fmt.Sprintf("%d%% read", pct)) {
+	if view := stripANSI(m.contentView(100)); !strings.Contains(view, fmt.Sprintf("%d%%", pct)) {
 		t.Fatalf("expected reading percent in content title, got %q", view)
 	}
 }

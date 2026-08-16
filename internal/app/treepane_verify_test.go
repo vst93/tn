@@ -88,8 +88,8 @@ func TestTreePaneSelectedRowFullWidthHighlight(t *testing.T) {
 	}
 }
 
-// Header tabs: with the tree visible both '1 Notes' and '2 Preview/Edit'
-// tabs are drawn. When the tree is toggled off the '1 Notes' tab must
+// Header tabs: with the tree visible both 'Lists' and 'Preview/Edit'
+// tabs are drawn. When the tree is toggled off the 'Lists' tab must
 // disappear entirely from the rendered header and hit-testing must stay
 // aligned with the remaining content tab (no stale cells / artifacts).
 func TestHeaderTabsWhenTreeHidden(t *testing.T) {
@@ -98,8 +98,8 @@ func TestHeaderTabsWhenTreeHidden(t *testing.T) {
 
 	// Tree visible by default: both tabs render.
 	tabs := m.headerTabs()
-	if !strings.Contains(tabs, "1 Notes") || !strings.Contains(tabs, "2 Preview") {
-		t.Fatalf("tree visible tabs = %q, want '1 Notes' and '2 Preview'", tabs)
+	if !strings.Contains(tabs, "Lists") || !strings.Contains(tabs, "Preview") {
+		t.Fatalf("tree visible tabs = %q, want 'Lists' and 'Preview'", tabs)
 	}
 
 	// Toggle the tree off.
@@ -108,20 +108,20 @@ func TestHeaderTabsWhenTreeHidden(t *testing.T) {
 		t.Fatal("expected tree hidden after toggle")
 	}
 
-	// The '1 Notes' tab must be gone, the content tab remains.
+	// The 'Lists' tab must be gone, the content tab remains.
 	tabs = m.headerTabs()
-	if strings.Contains(tabs, "1 Notes") {
-		t.Fatalf("hidden-tree tabs = %q, must not contain '1 Notes'", tabs)
+	if strings.Contains(tabs, "Lists") {
+		t.Fatalf("hidden-tree tabs = %q, must not contain 'Lists'", tabs)
 	}
-	if !strings.Contains(tabs, "2 Preview") {
-		t.Fatalf("hidden-tree tabs = %q, want '2 Preview'", tabs)
+	if !strings.Contains(tabs, "Preview") {
+		t.Fatalf("hidden-tree tabs = %q, want 'Preview'", tabs)
 	}
 
-	// The rendered header line must be artifact-free: no stale '1 Notes',
+	// The rendered header line must be artifact-free: no stale 'Lists',
 	// padded to the full window width.
 	header := stripANSI(m.headerView())
-	if strings.Contains(header, "1 Notes") {
-		t.Fatalf("rendered header still contains '1 Notes': %q", header)
+	if strings.Contains(header, "Lists") {
+		t.Fatalf("rendered header still contains 'Lists': %q", header)
 	}
 	if lipgloss.Width(header) != 100 {
 		t.Fatalf("header width = %d, want full 100 (no trailing artifact): %q", lipgloss.Width(header), header)
@@ -129,7 +129,7 @@ func TestHeaderTabsWhenTreeHidden(t *testing.T) {
 
 	// Hit-testing must match the drawn tab: the content tab starts right
 	// after the brand separator when the tree is hidden.
-	notesStart := 1 + lipgloss.Width("◆ tn") + lipgloss.Width("  │  ")
+	notesStart := 1 + lipgloss.Width("◆ tn") + lipgloss.Width(" │ ")
 	if p, ok := m.headerTabAt(notesStart); !ok || p != contentPane {
 		t.Fatalf("hidden-tree x=%d: pane=%v ok=%v, want contentPane hit", notesStart, p, ok)
 	}
@@ -137,14 +137,14 @@ func TestHeaderTabsWhenTreeHidden(t *testing.T) {
 		t.Fatalf("hidden-tree x=%d (brand area) must not hit a tab", notesStart-1)
 	}
 
-	// Edit mode with the tree hidden: only '2 Edit' renders.
+	// Edit mode with the tree hidden: only 'Edit' renders.
 	m.mode = modeEdit
 	tabs = m.headerTabs()
-	if strings.Contains(tabs, "1 Notes") || !strings.Contains(tabs, "2 Edit") {
-		t.Fatalf("hidden-tree edit tabs = %q, want only '2 Edit'", tabs)
+	if strings.Contains(tabs, "Lists") || !strings.Contains(tabs, "Edit") {
+		t.Fatalf("hidden-tree edit tabs = %q, want only 'Edit'", tabs)
 	}
-	if strings.Contains(tabs, "2 Preview") {
-		t.Fatalf("hidden-tree edit tabs = %q, must not contain '2 Preview'", tabs)
+	if strings.Contains(tabs, "Preview") {
+		t.Fatalf("hidden-tree edit tabs = %q, must not contain 'Preview'", tabs)
 	}
 	m.mode = modeNormal
 
@@ -154,7 +154,7 @@ func TestHeaderTabsWhenTreeHidden(t *testing.T) {
 		t.Fatal("expected tree visible after second toggle")
 	}
 	tabs = m.headerTabs()
-	if !strings.Contains(tabs, "1 Notes") || !strings.Contains(tabs, "2 Preview") {
-		t.Fatalf("restored tabs = %q, want '1 Notes' and '2 Preview' again", tabs)
+	if !strings.Contains(tabs, "Lists") || !strings.Contains(tabs, "Preview") {
+		t.Fatalf("restored tabs = %q, want 'Lists' and 'Preview' again", tabs)
 	}
 }
