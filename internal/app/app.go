@@ -4587,35 +4587,37 @@ func (m Model) treeViewSides(width int, leftB, rightB bool) string {
 	var lines []string
 	rows := m.treeRows()
 	end := min(len(m.flat), m.treeOffset+rows)
-	accentText := lipgloss.NewStyle().Foreground(accent)
 	for i := m.treeOffset; i < end; i++ {
 		item := m.flat[i]
-		indent := strings.Repeat("  ", item.depth)
-		textName := lipgloss.NewStyle().Foreground(text).Bold(true)
 		var label string
 		if item.node.IsDir {
+			// Folder: ▸/▾ + 📁 + name in accent
 			marker := "▸ "
 			if m.expanded[item.node.RelPath] {
 				marker = "▾ "
 			}
-			label = accentText.Render(marker) + textName.Render(item.node.Name)
+			label = lipgloss.NewStyle().Foreground(accent).Render(marker) + lipgloss.NewStyle().Foreground(accent).Bold(true).Render("📁 "+item.node.Name)
 		} else {
-			mark := "○ "
-			if m.selectedItems[item.node.RelPath] {
-				mark = "☑ "
-			}
+			// Note: ○ + name in muted, pinned ★ before name, tag count after
 			name := strings.TrimSuffix(item.node.Name, filepath.Ext(item.node.Name))
-			label = mark + mutedSty.Render(name)
-			if m.nodePinned[item.node.RelPath] {
-				label = mark + accentText.Render("★ ") + mutedSty.Render(name)
+			marker := mutedSty.Render("○ ")
+			if m.selectedItems[item.node.RelPath] {
+				marker = lipgloss.NewStyle().Foreground(accent).Render("☑ ")
 			}
+			label = marker
+			if m.nodePinned[item.node.RelPath] {
+				label += lipgloss.NewStyle().Foreground(accent).Render("★ ")
+			}
+			label += mutedSty.Render(name)
 			if count := len(m.nodeTags[item.node.RelPath]); count > 0 {
-				label = label + " " + lipgloss.NewStyle().Foreground(accent).Bold(true).Render(fmt.Sprintf("#%d", count))
+				label += " " + lipgloss.NewStyle().Foreground(accent).Bold(true).Render(fmt.Sprintf("#%d", count))
 			}
 		}
+		// Indent with depth guides
+		indent := strings.Repeat("  ", item.depth)
 		row := indent + label
 		if i == m.selected {
-			row = accentText.Render("▸ ") + indent + strings.TrimPrefix(label, "○ ")
+			// Selection: background highlight, NO extra marker prepended
 			row = truncateANSI(row, innerWidth)
 			row = lipgloss.NewStyle().Background(selection).Foreground(text).Bold(true).Width(innerWidth).Render(row)
 		} else {
@@ -4627,7 +4629,7 @@ func (m Model) treeViewSides(width int, leftB, rightB bool) string {
 		lines = append(lines,
 			"  "+mutedSty.Render("No notes yet. Press n to create one."),
 			"",
-			"  "+accentText.Render("n")+mutedSty.Render(" new note · ")+accentText.Render("N")+mutedSty.Render(" new folder"),
+			"  "+lipgloss.NewStyle().Foreground(accent).Render("n")+mutedSty.Render(" new note · ")+lipgloss.NewStyle().Foreground(accent).Render("N")+mutedSty.Render(" new folder"),
 		)
 	}
 	return borderedPanelPart(title, strings.Join(lines, "\n"), width, m.bodyRenderHeight(), focused, leftB, rightB)
