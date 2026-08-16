@@ -386,12 +386,12 @@ detect_platform() {
 
 get_download_info() {
     case "${OS}-${ARCH}" in
-        darwin-arm64)  FILENAME="${BINARY_NAME}-${VERSION}-darwin-arm64" ;;
-        darwin-amd64)  FILENAME="${BINARY_NAME}-${VERSION}-darwin-amd64" ;;
-        linux-arm64)   FILENAME="${BINARY_NAME}-${VERSION}-linux-arm64" ;;
-        linux-amd64)   FILENAME="${BINARY_NAME}-${VERSION}-linux-amd64" ;;
-        android-arm64) FILENAME="${BINARY_NAME}-${VERSION}-android-arm64" ;;
-        android-amd64) FILENAME="${BINARY_NAME}-${VERSION}-android-amd64" ;;
+        darwin-arm64)  FILENAME="${BINARY_NAME}-${VERSION}-darwin-arm64.tar.gz" ;;
+        darwin-amd64)  FILENAME="${BINARY_NAME}-${VERSION}-darwin-amd64.tar.gz" ;;
+        linux-arm64)   FILENAME="${BINARY_NAME}-${VERSION}-linux-arm64.tar.gz" ;;
+        linux-amd64)   FILENAME="${BINARY_NAME}-${VERSION}-linux-amd64.tar.gz" ;;
+        android-arm64) FILENAME="${BINARY_NAME}-${VERSION}-android-arm64.tar.gz" ;;
+        android-amd64) FILENAME="${BINARY_NAME}-${VERSION}-android-amd64.tar.gz" ;;
         *) log_error "$(t "No package for ${OS}-${ARCH}" "无适用于 ${OS}-${ARCH} 的包")"; exit 1 ;;
     esac
     DOWNLOAD_URL="${REPO_URL}/releases/download/${VERSION}/${FILENAME}"
@@ -464,26 +464,53 @@ ensure_dir_exists() {
 }
 
 install_binary() {
-    local binary_file="$1" install_dir="$2"
+    local archive_file="$1" install_dir="$2" extracted_dir="$TEMP_DIR/extracted" binary_path
 
-    chmod +x "$binary_file"
+    mkdir -p "$extracted_dir"
+
+    spinner_start "$(t "Extracting" "解压中")"
+    case "$archive_file" in
+        *.tar.gz)
+            tar xzf "$archive_file" -C "$extracted_dir"
+            ;;
+        *.zip)
+            unzip -q "$archive_file" -d "$extracted_dir"
+            ;;
+        *)
+            # Assume raw binary
+            cp "$archive_file" "$extracted_dir/$BINARY_NAME"
+            ;;
+    esac
+    spinner_stop
+
+    # Find binary (bare name or .exe)
+    binary_path="$extracted_dir/$BINARY_NAME"
+    if [ ! -f "$binary_path" ] && [ -f "${binary_path}.exe" ]; then
+        binary_path="${binary_path}.exe"
+    fi
+    [ -f "$binary_path" ] || {
+        log_error "$(t "Binary not found in archive" "压缩包中未找到程序")"
+        exit 1
+    }
+
+    chmod +x "$binary_path"
     ensure_dir_exists "$install_dir"
 
     if [ -w "$install_dir" ]; then
         spinner_start "$(t "Installing to $install_dir" "安装到 $install_dir")"
         if has_cmd install; then
-            install -m 0755 "$binary_file" "$install_dir/$BINARY_NAME"
+            install -m 0755 "$binary_path" "$install_dir/$BINARY_NAME"
         else
-            cp "$binary_file" "$install_dir/$BINARY_NAME"
+            cp "$binary_path" "$install_dir/$BINARY_NAME"
             chmod 0755 "$install_dir/$BINARY_NAME"
         fi
         spinner_stop
     elif ! is_termux && has_cmd sudo; then
         log_info "$(t "Need sudo to install to $install_dir" "需要 sudo 权限安装到 $install_dir")"
         if has_cmd install; then
-            sudo install -m 0755 "$binary_file" "$install_dir/$BINARY_NAME" || { log_error "sudo install failed"; exit 1; }
+            sudo install -m 0755 "$binary_path" "$install_dir/$BINARY_NAME" || { log_error "sudo install failed"; exit 1; }
         else
-            sudo cp "$binary_file" "$install_dir/$BINARY_NAME" || { log_error "sudo cp failed"; exit 1; }
+            sudo cp "$binary_path" "$install_dir/$BINARY_NAME" || { log_error "sudo cp failed"; exit 1; }
             sudo chmod 0755 "$install_dir/$BINARY_NAME" || { log_error "sudo chmod failed"; exit 1; }
         fi
     else
@@ -513,6 +540,7 @@ main() {
 
     log_step "$(t "Dependencies" "检查依赖")"
     require_download_tool
+    require_extract_tool
 
     log_step "$(t "Version" "获取版本")"
     fetch_latest_version
@@ -526,8 +554,8 @@ main() {
     get_download_info
     log_info "$DOWNLOAD_URL"
 
-    local binary_file="$TEMP_DIR/$FILENAME"
-    download_with_mirrors "$DOWNLOAD_URL" "$binary_file" || {
+    local archive_file="$TEMP_DIR/$FILENAME"
+    download_with_mirrors "$DOWNLOAD_URL" "$archive_file" || {
         log_error "$(t "Download failed" "下载失败")"; exit 1
     }
 
@@ -535,19 +563,19 @@ main() {
     local checksum_url="${REPO_URL}/releases/download/${VERSION}/checksums.txt"
     local checksum_file="$TEMP_DIR/checksums.txt"
     if download_with_mirrors "$checksum_url" "$checksum_file" 2>/dev/null; then
-        # Extract expected hash for our specific binary
+        # Extract expected hash for our specific archive
         local expected_sha
-        expected_sha="$(grep "$FILENAME" "$checksum_file" | awk '{print $1}' | tr -d '\r\n')"
+        expected_sha="$(grep "$(basename "$FILENAME")" "$checksum_file" | awk '{print $1}' | tr -d '\r\n')"
         if [ -n "$expected_sha" ]; then
-            if ! verify_sha256 "$binary_file" "$expected_sha"; then
+            if ! verify_sha256 "$archive_file" "$expected_sha"; then
                 prompt_continue_or_abort "$(t \
                     "Checksum mismatch, file may be corrupted or tampered" \
                     "校验不匹配，文件可能已损坏或被篡改")"
             fi
         else
             prompt_continue_or_abort "$(t \
-                "Cannot find checksum for $FILENAME, file integrity unknown" \
-                "未找到 $FILENAME 的校验信息，文件完整性未知")"
+                "Cannot find checksum for $(basename "$FILENAME"), file integrity unknown" \
+                "未找到 $(basename "$FILENAME") 的校验信息，文件完整性未知")"
         fi
     else
         prompt_continue_or_abort "$(t \
@@ -556,7 +584,7 @@ main() {
     fi
 
     log_step "$(t "Install" "安装")"
-    install_binary "$binary_file" "$INSTALL_PATH"
+    install_binary "$archive_file" "$INSTALL_PATH"
 
     printf "\n${GRN}${B}✔ %s${R}\n\n" "$(t "Done!" "安装完成!")"
 }

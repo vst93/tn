@@ -35,13 +35,38 @@ jobs:
         run: |
           VERSION="${{ github.event.inputs.version }}"
           LDFLAGS="-s -w -X main.version=${VERSION}"
+          mkdir -p raw
+          GOOS=linux   GOARCH=amd64 go build -ldflags "$LDFLAGS" -o raw/tn-${VERSION}-linux-amd64       .
+          GOOS=linux   GOARCH=arm64 go build -ldflags "$LDFLAGS" -o raw/tn-${VERSION}-linux-arm64       .
+          GOOS=darwin  GOARCH=amd64 go build -ldflags "$LDFLAGS" -o raw/tn-${VERSION}-darwin-amd64      .
+          GOOS=darwin  GOARCH=arm64 go build -ldflags "$LDFLAGS" -o raw/tn-${VERSION}-darwin-arm64      .
+          GOOS=windows GOARCH=amd64 go build -ldflags "$LDFLAGS" -o raw/tn-${VERSION}-windows-amd64.exe .
+          GOOS=windows GOARCH=arm64 go build -ldflags "$LDFLAGS" -o raw/tn-${VERSION}-windows-arm64.exe .
+
+      - name: Package all platforms
+        run: |
+          VERSION="${{ github.event.inputs.version }}"
           mkdir -p dist
-          GOOS=linux   GOARCH=amd64 go build -ldflags "$LDFLAGS" -o dist/tn-${VERSION}-linux-amd64       .
-          GOOS=linux   GOARCH=arm64 go build -ldflags "$LDFLAGS" -o dist/tn-${VERSION}-linux-arm64       .
-          GOOS=darwin  GOARCH=amd64 go build -ldflags "$LDFLAGS" -o dist/tn-${VERSION}-darwin-amd64      .
-          GOOS=darwin  GOARCH=arm64 go build -ldflags "$LDFLAGS" -o dist/tn-${VERSION}-darwin-arm64      .
-          GOOS=windows GOARCH=amd64 go build -ldflags "$LDFLAGS" -o dist/tn-${VERSION}-windows-amd64.exe .
-          GOOS=windows GOARCH=arm64 go build -ldflags "$LDFLAGS" -o dist/tn-${VERSION}-windows-arm64.exe .
+          for f in tn-${VERSION}-linux-amd64 tn-${VERSION}-linux-arm64 tn-${VERSION}-darwin-amd64 tn-${VERSION}-darwin-arm64 tn-${VERSION}-windows-amd64.exe tn-${VERSION}-windows-arm64.exe; do
+            if [ -f "raw/${f}" ]; then
+              # Use bare binary name inside archive
+              suffix="${f#tn-${VERSION}-}"
+              case "$f" in
+                *.exe)
+                  cp "raw/${f}" "raw/tn.exe"
+                  zip "dist/tn-${VERSION}-${suffix%.exe}.zip" "raw/tn.exe"
+                  rm "raw/tn.exe"
+                  ;;
+                *)
+                  cp "raw/${f}" "raw/tn"
+                  tar czf "dist/tn-${VERSION}-${suffix}.tar.gz" -C raw "tn"
+                  rm "raw/tn"
+                  ;;
+              esac
+            fi
+          done
+          rm -rf raw
+          ls -lh dist/
 
       - name: Generate checksums
         run: |
