@@ -532,20 +532,27 @@ main() {
     }
 
     log_step "$(t "Verify" "校验")"
-    local sha_url="${DOWNLOAD_URL}.sha256"
-    local sha_file="$TEMP_DIR/${FILENAME}.sha256"
-    if download_with_mirrors "$sha_url" "$sha_file" 2>/dev/null; then
+    local checksum_url="${REPO_URL}/releases/download/${VERSION}/checksums.txt"
+    local checksum_file="$TEMP_DIR/checksums.txt"
+    if download_with_mirrors "$checksum_url" "$checksum_file" 2>/dev/null; then
+        # Extract expected hash for our specific binary
         local expected_sha
-        expected_sha="$(awk '{print $1}' "$sha_file" | tr -d '\r\n')"
+        expected_sha="$(grep "$FILENAME" "$checksum_file" | awk '{print $1}' | tr -d '\r\n')"
         if [ -n "$expected_sha" ]; then
             if ! verify_sha256 "$binary_file" "$expected_sha"; then
                 prompt_continue_or_abort "$(t \
                     "Checksum mismatch, file may be corrupted or tampered" \
                     "校验不匹配，文件可能已损坏或被篡改")"
             fi
+        else
+            prompt_continue_or_abort "$(t \
+                "Cannot find checksum for $FILENAME, file integrity unknown" \
+                "未找到 $FILENAME 的校验信息，文件完整性未知")"
         fi
     else
-        log_warn "$(t "No checksum file available, skipping" "无校验文件，跳过")"
+        prompt_continue_or_abort "$(t \
+            "Cannot fetch checksum file, file integrity unknown" \
+            "无法获取校验信息，文件完整性未知")"
     fi
 
     log_step "$(t "Install" "安装")"
