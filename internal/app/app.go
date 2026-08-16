@@ -465,8 +465,8 @@ type Model struct {
 	history      []string
 	historyIndex int
 
-	promptPathIndex int
-	promptFolders   []string
+	targetPath  string
+	pathFocused bool
 }
 
 func New(store *storage.Store) Model {
@@ -508,7 +508,6 @@ func New(store *storage.Store) Model {
 		status:        "Ready",
 		sessionPath:   defaultSessionPath(),
 		helpHintView:  viewport.New(60, 20),
-		promptPathIndex: -1,
 	}
 	m.preview.MouseWheelEnabled = true
 	m.preview.MouseWheelDelta = 2
@@ -2182,8 +2181,8 @@ func (m *Model) startPrompt(kind promptKind) {
 	m.mode = modePrompt
 	m.statusErr = false
 	m.input.SetValue("")
-	m.promptFolders = collectPromptFolders(m.flat)
-	m.promptPathIndex = initialPromptPathIndex(m.flat, m.selected, m.promptFolders)
+	m.input.Prompt = "› "
+	m.pathFocused = false
 	switch kind {
 	case promptNote:
 		m.input.Placeholder = "Note name"
@@ -2195,22 +2194,32 @@ func (m *Model) startPrompt(kind promptKind) {
 	}
 	m.input.Width = max(20, min(60, m.width-12))
 	m.input.Focus()
+	// Initialize target path from selection
+	if kind == promptNote || kind == promptDir {
+		m.targetPath = m.selectedParent()
+	} else {
+		m.targetPath = ""
+	}
 }
 
 func (m Model) updatePrompt(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.promptKind == promptGotoLine {
 		return m.updateGotoLinePrompt(msg)
 	}
+	// Handle Tab to switch between name and path fields
+	if msg.String() == "tab" && (m.promptKind == promptNote || m.promptKind == promptDir) {
+		m.pathFocused = !m.pathFocused
+		if m.pathFocused {
+			m.input.Blur()
+		} else {
+			m.input.Focus()
+		}
+		return m, nil
+	}
 	switch msg.String() {
 	case "esc":
 		m.mode = modeNormal
 		m.input.Blur()
-		return m, nil
-	case "tab":
-		cyclePromptPath(&m.promptPathIndex, len(m.promptFolders))
-		return m, nil
-	case "shift+tab":
-		cyclePromptPathReverse(&m.promptPathIndex, len(m.promptFolders))
 		return m, nil
 	case "enter":
 		value := m.input.Value()
@@ -2223,9 +2232,9 @@ func (m Model) updatePrompt(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		var err error
 		switch m.promptKind {
 		case promptNote:
-			path, err = m.store.CreateNote(m.promptParent(), value)
+			path, err = m.store.CreateNote(m.targetPath, value)
 		case promptDir:
-			path, err = m.store.CreateDir(m.promptParent(), value)
+			path, err = m.store.CreateDir(m.targetPath, value)
 		case promptRename:
 			path, err = m.renameSelected(value)
 		}
@@ -2254,7 +2263,21 @@ func (m Model) updatePrompt(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, m.takePending()
 	}
 	var cmd tea.Cmd
-	m.input, cmd = m.input.Update(msg)
+	if m.pathFocused {
+		// Edit target path as a simple string
+		switch msg.String() {
+		case "backspace":
+			if len(m.targetPath) > 0 {
+				m.targetPath = m.targetPath[:len(m.targetPath)-1]
+			}
+		default:
+			if len(msg.Runes) == 1 && msg.Runes[0] >= 32 {
+				m.targetPath += string(msg.Runes[0])
+			}
+		}
+	} else {
+		m.input, cmd = m.input.Update(msg)
+	}
 	return m, cmd
 }
 
@@ -3762,82 +3785,6 @@ func (m *Model) selectedParent() string {
 	return parent
 }
 
-// promptParent returns the path for the current promptPathIndex.
-func (m *Model) promptParent() string {
-	if m.promptPathIndex < 0 || m.promptPathIndex >= len(m.promptFolders) {
-		return ""
-	}
-	return m.promptFolders[m.promptPathIndex]
-}
-
-// collectPromptFolders returns all folder paths from the flat list.
-func collectPromptFolders(flat []flatNode) []string {
-	var folders []string
-	for _, item := range flat {
-		if item.node.IsDir {
-			folders = append(folders, item.node.RelPath)
-		}
-	}
-	return folders
-}
-
-// initialPromptPathIndex returns the index into folders for the selected item's parent.
-func initialPromptPathIndex(flat []flatNode, selected int, folders []string) int {
-	if len(flat) == 0 || selected < 0 || selected >= len(flat) {
-		return -1
-	}
-	n := flat[selected].node
-	if n.IsDir {
-		for i, f := range folders {
-			if f == n.RelPath {
-				return i
-			}
-		}
-		return -1
-	}
-	parent := filepath.Dir(n.RelPath)
-	if parent == "." {
-		return -1
-	}
-	for i, f := range folders {
-		if f == parent {
-			return i
-		}
-	}
-	return -1
-}
-
-// cyclePromptPath advances the prompt path index forward.
-func cyclePromptPath(idx *int, folderCount int) {
-	if folderCount == 0 {
-		*idx = -1
-		return
-	}
-	*idx++
-	if *idx >= folderCount {
-		*idx = -1
-	}
-}
-
-// cyclePromptPathReverse moves the prompt path index backward.
-func cyclePromptPathReverse(idx *int, folderCount int) {
-	if folderCount == 0 {
-		*idx = -1
-		return
-	}
-	*idx--
-	if *idx < -1 {
-		*idx = folderCount - 1
-	}
-}
-
-func (m *Model) promptParentName() string {
-	if m.promptPathIndex < 0 || m.promptPathIndex >= len(m.promptFolders) {
-		return "root"
-	}
-	return m.promptFolders[m.promptPathIndex]
-}
-
 func (m *Model) ensureSelectionVisible() {
 	rows := m.treeRows()
 	if m.selected < m.treeOffset {
@@ -4996,9 +4943,9 @@ func (m Model) dialogView() string {
 			title = "Rename"
 		}
 		body = m.input.View() + "\n\n" + mutedSty.Render("Enter confirm · Esc cancel")
-		// Show path selector for note/folder creation
+		// Show editable target path for note/folder creation
 		if m.promptKind == promptNote || m.promptKind == promptDir {
-			body += "\n\n" + m.pathSelectorView(60)
+			body += "\n\n" + m.targetPathView()
 		}
 		if m.statusErr {
 			body += "\n" + errorSty.Render(m.status)
@@ -5015,16 +4962,22 @@ func (m Model) dialogView() string {
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, dialog, lipgloss.WithWhitespaceBackground(bg))
 }
 
-func (m Model) pathSelectorView(width int) string {
+func (m Model) targetPathView() string {
 	var b strings.Builder
-	b.WriteString(mutedSty.Render("Create in:"))
-	// Current path indicator
-	current := m.promptParentName()
+	b.WriteString(mutedSty.Render("保存到: "))
+	// Display path: "/" for root, otherwise the folder path
+	display := m.targetPath
+	if display == "" {
+		display = "/"
+	}
+	if m.pathFocused {
+		// Show editable field with cursor
+		b.WriteString(lipgloss.NewStyle().Foreground(accent).Bold(true).Render(display + "▎"))
+	} else {
+		b.WriteString(lipgloss.NewStyle().Foreground(text).Render(display))
+	}
 	b.WriteString("\n")
-	b.WriteString(lipgloss.NewStyle().Foreground(accent).Bold(true).Render("▸ " + current))
-	// Hint
-	b.WriteString("\n")
-	b.WriteString(mutedSty.Render("Tab / Shift+Tab to change path"))
+	b.WriteString(mutedSty.Render("Tab 切换编辑路径"))
 	return b.String()
 }
 
