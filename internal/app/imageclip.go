@@ -175,33 +175,35 @@ func imagePlaceholder(alt, path string) string {
 	return fmt.Sprintf("[📷 %s]", base)
 }
 
+// imageLinePlaceholder converts a line that holds nothing but an image
+// reference into a terminal-safe placeholder. Other lines are left alone.
+func imageLinePlaceholder(line string) (string, bool) {
+	trimmed := strings.TrimSpace(line)
+	if !strings.HasPrefix(trimmed, "![") {
+		return "", false
+	}
+	start := strings.Index(trimmed, "](")
+	if start < 0 {
+		return "", false
+	}
+	rest := trimmed[start+2:]
+	end := strings.Index(rest, ")")
+	if end < 0 {
+		return "", false
+	}
+	return imagePlaceholder(trimmed[2:start], strings.TrimSpace(rest[:end])), true
+}
+
 // renderImagesInMarkdown replaces image syntax with terminal-safe placeholders
 // for display in the preview pane. Only processes lines that are markdown images.
 func renderImagesInMarkdown(content string) string {
-	var b strings.Builder
-	for _, line := range strings.Split(content, "\n") {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "![") {
-			start := strings.Index(trimmed, "]( ")
-			if start < 0 {
-				start = strings.Index(trimmed, "](")
-			}
-			if start >= 0 {
-				alt := trimmed[2:start]
-				rest := trimmed[start+2:]
-				end := strings.Index(rest, ")")
-				if end >= 0 {
-					path := rest[:end]
-					b.WriteString(imagePlaceholder(alt, path))
-					b.WriteString("\n")
-					continue
-				}
-			}
+	lines := strings.Split(content, "\n")
+	for i, line := range lines {
+		if placeholder, ok := imageLinePlaceholder(line); ok {
+			lines[i] = placeholder
 		}
-		b.WriteString(line)
-		b.WriteString("\n")
 	}
-	return strings.TrimRight(b.String(), "\n")
+	return strings.TrimRight(strings.Join(lines, "\n"), "\n")
 }
 
 // decodeImage decodes image bytes for validation.

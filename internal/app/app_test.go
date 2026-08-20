@@ -75,10 +75,22 @@ func TestSplitViewSeparatorVisible(t *testing.T) {
 	m.selectPath(note)
 	m.openSelectedNote()
 	lines := strings.Split(stripANSI(m.View()), "\n")
+	// The separator column joins the two panel frames: a tee on the frame
+	// rows, a vertical everywhere between them.
 	for i := 1; i <= m.bodyHeight; i++ {
 		runes := []rune(lines[i])
-		if m.treeWidth >= len(runes) || string(runes[m.treeWidth]) != "│" {
-			t.Fatalf("line %d missing separator at col %d: %q", i, m.treeWidth, lines[i])
+		if m.treeWidth >= len(runes) {
+			t.Fatalf("line %d is too short for a separator at col %d: %q", i, m.treeWidth, lines[i])
+		}
+		want := "│"
+		switch i {
+		case 1:
+			want = "┬"
+		case m.bodyHeight:
+			want = "┴"
+		}
+		if got := string(runes[m.treeWidth]); got != want {
+			t.Fatalf("line %d has %q at col %d, want %q: %q", i, got, m.treeWidth, want, lines[i])
 		}
 	}
 }
@@ -371,11 +383,15 @@ func TestNoNoteStatusBarShowsHint(t *testing.T) {
 	if !strings.Contains(bar, "TN") {
 		t.Fatalf("no-note status bar missing app name: %q", bar)
 	}
-	if !strings.Contains(bar, "select a note") {
-		t.Fatalf("no-note status bar missing hint: %q", bar)
-	}
 	if !strings.Contains(bar, "[n] note") {
 		t.Fatalf("no-note status bar missing toolbar shortcuts: %q", bar)
+	}
+	// The "how do I start" hint lives in the empty note pane, not the bar.
+	pane := stripANSI(m.contentView(100))
+	for _, want := range []string{"No note open", "new note", "new folder"} {
+		if !strings.Contains(pane, want) {
+			t.Fatalf("empty note pane missing %q: %q", want, pane)
+		}
 	}
 }
 
@@ -415,9 +431,12 @@ func TestRenderMarkdownCachesRendererAndStylesCodeBlocks(t *testing.T) {
 		t.Fatal("expected renderer to be rebuilt when width changes")
 	}
 
-	title := regexp.MustCompile(`(?m)^\s*BIG TITLE`).FindString(stripANSI(m.preview.View()))
+	title := regexp.MustCompile(`(?m)^\s*Big Title\s*$`).FindString(stripANSI(m.preview.View()))
 	if title == "" {
-		t.Fatalf("expected uppercased H1 title in preview: %q", stripANSI(m.preview.View()))
+		t.Fatalf("expected H1 title in preview: %q", stripANSI(m.preview.View()))
+	}
+	if !strings.Contains(stripANSI(m.preview.View()), "━━━━") {
+		t.Fatalf("expected a rule under the H1: %q", stripANSI(m.preview.View()))
 	}
 }
 
@@ -923,7 +942,7 @@ func TestFocusModeTogglesAndRendersFullScreen(t *testing.T) {
 		t.Fatal("expected focus mode to be enabled")
 	}
 	view := m.View()
-	if !strings.Contains(view, "Esc 退出专注") {
+	if !strings.Contains(view, "Esc leave focus") {
 		t.Fatalf("expected focus hint in view, got %q", view)
 	}
 	if strings.Contains(view, "◆ TN") {
@@ -1308,7 +1327,7 @@ func TestEditTagsWritesFrontMatter(t *testing.T) {
 		t.Fatalf("expected node tags recorded, got %v", m.nodeTags[note])
 	}
 	view := stripANSI(m.contentView(100))
-	if !strings.Contains(view, "▍ work") || !strings.Contains(view, "▍ meeting") {
+	if !strings.Contains(view, "#work") || !strings.Contains(view, "#meeting") {
 		t.Fatalf("expected tags in metadata row, got %q", view)
 	}
 }
@@ -1461,7 +1480,7 @@ func TestBatchDelete(t *testing.T) {
 	if m.mode != modeConfirm || m.confirmCount != 2 {
 		t.Fatalf("expected batch delete confirm, mode=%v count=%d", m.mode, m.confirmCount)
 	}
-	if view := stripANSI(m.dialogView()); !strings.Contains(view, "将删除 2 个笔记") {
+	if view := stripANSI(m.dialogView()); !strings.Contains(view, "Delete 2 notes?") {
 		t.Fatalf("expected batch delete message, got %q", view)
 	}
 
@@ -2034,7 +2053,7 @@ func TestFocusModeCanOpenOtherNoteViaGlobalSearch(t *testing.T) {
 	if !m.focusing {
 		t.Fatal("expected focus mode to persist after opening another note")
 	}
-	if view := m.View(); !strings.Contains(view, "Esc 退出专注") {
+	if view := m.View(); !strings.Contains(view, "Esc leave focus") {
 		t.Fatalf("expected focus view after opening another note, got %q", view)
 	}
 }

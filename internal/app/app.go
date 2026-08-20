@@ -20,8 +20,6 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/glamour"
-	glamansi "github.com/charmbracelet/glamour/ansi"
 	"github.com/charmbracelet/lipgloss"
 	termansi "github.com/charmbracelet/x/ansi"
 	"github.com/microcosm-cc/bluemonday"
@@ -471,8 +469,9 @@ type Model struct {
 	nodeTags   map[string][]string
 	nodePinned map[string]bool
 
-	renderer      *glamour.TermRenderer
+	renderer      *mdRenderer
 	rendererWidth int
+	rendererTheme int
 
 	status     string
 	statusErr  bool
@@ -548,7 +547,7 @@ func New(store *storage.Store) Model {
 		input:         input,
 		copier:        copyText,
 		status:        "Ready",
-		sessionPath:   defaultSessionPath(),
+		sessionPath:   sessionPathFor(store.Root),
 		helpHintView:  viewport.New(60, 20),
 	}
 	m.preview.MouseWheelEnabled = true
@@ -570,6 +569,25 @@ func defaultSessionPath() string {
 		return ""
 	}
 	return filepath.Join(home, ".tn", "session.json")
+}
+
+// sessionPathFor returns the session file for a note root. The session lives
+// inside the root as a hidden file so every note directory keeps its own
+// state and a different -dir never restores another root's open note or tree.
+func sessionPathFor(root string) string {
+	if root == "" {
+		return defaultSessionPath()
+	}
+	return filepath.Join(root, ".tn-session.json")
+}
+
+// loadNoteContent puts disk content into the editor and takes the editor's
+// canonical form as the clean baseline. The textarea normalizes input (tabs
+// become spaces), so comparing against the raw file would report a note with
+// tabs as unsaved the moment it is opened.
+func (m *Model) loadNoteContent(content string) {
+	m.editor.SetValue(content)
+	m.original = m.editor.Value()
 }
 
 func (m Model) restoreSession() Model {
@@ -604,8 +622,7 @@ func (m Model) restoreSession() Model {
 		content, err := m.store.Read(s.CurrentPath)
 		if err == nil {
 			m.currentPath = s.CurrentPath
-			m.original = content
-			m.editor.SetValue(content)
+			m.loadNoteContent(content)
 			m.undoStack = nil
 			m.redoStack = nil
 			m.editSel = nil
@@ -1329,9 +1346,10 @@ func (m Model) contentOffsetAt(x, y int) int {
 	if m.mode != modeNormal || m.currentPath == "" || m.renderedPlain == "" {
 		return -1
 	}
-	left := 1
+	// Panels pad their content by one column inside the border.
+	left := 2
 	if !m.compact && m.treeVisible {
-		left = m.treeWidth + 1
+		left = m.treeWidth + 2
 	}
 	if x < left || x >= m.width-1 || y < 2 || y >= m.bodyHeight {
 		return -1
@@ -1956,14 +1974,14 @@ func (m Model) exportDialogView() string {
 		if m.exportHTML {
 			format = "HTML"
 		}
-		body = m.input.View() + "\n\n" + mutedSty.Render("Format: "+format) + "\n" + mutedSty.Render("Enter 导出  ·  Esc 取消")
+		body = m.input.View() + "\n\n" + mutedSty.Render("Format: "+format) + "\n" + mutedSty.Render("Enter export  ·  Esc cancel")
 		if m.statusErr {
 			body += "\n" + errorSty.Render(m.status)
 		}
 	} else if m.batchExport {
-		body = "1  Markdown\n2  HTML\n\n" + mutedSty.Render("Esc 取消")
+		body = "1  Markdown\n2  HTML\n\n" + mutedSty.Render("Esc cancel")
 	} else {
-		body = "1  复制到剪贴板\n2  另存为\n3  导出 HTML\n\n" + mutedSty.Render("Esc 取消")
+		body = "1  Copy to clipboard\n2  Save as\n3  Export HTML\n\n" + mutedSty.Render("Esc cancel")
 	}
 	dialog := lipgloss.NewStyle().Background(surface).Foreground(text).Border(lipgloss.RoundedBorder()).BorderForeground(muted).Padding(1, 3).Width(min(64, max(28, m.width-6))).Render(brandSty.Render(title) + "\n\n" + body)
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, dialog, lipgloss.WithWhitespaceBackground(bg))
@@ -2223,8 +2241,7 @@ func (m *Model) openPath(path string) bool {
 		return false
 	}
 	m.currentPath = path
-	m.original = content
-	m.editor.SetValue(content)
+	m.loadNoteContent(content)
 	m.undoStack = nil
 	m.redoStack = nil
 	m.editSel = nil
@@ -2340,8 +2357,7 @@ func (m *Model) togglePinned() {
 		return
 	}
 	if path == m.currentPath {
-		m.editor.SetValue(newContent)
-		m.original = newContent
+		m.loadNoteContent(newContent)
 		m.renderMarkdown()
 	}
 	m.nodePinned[path] = meta.Pinned
@@ -2589,8 +2605,7 @@ func (m *Model) saveBatchTags(raw string) {
 	m.active = treePane
 	if m.currentPath != "" && m.selectedItems[m.currentPath] {
 		if content, err := m.store.Read(m.currentPath); err == nil {
-			m.original = content
-			m.editor.SetValue(content)
+			m.loadNoteContent(content)
 			m.renderMarkdown()
 		}
 	}
@@ -2612,12 +2627,11 @@ func (m *Model) saveTags(raw string) {
 	}
 	meta.Tags = parseTagsInput(raw)
 	content := writeFrontMatter(body, meta)
-	m.editor.SetValue(content)
 	if err := m.store.Write(m.currentPath, content); err != nil {
 		m.setStatus("Save tags failed: "+err.Error(), true)
 		return
 	}
-	m.original = content
+	m.loadNoteContent(content)
 	m.redoStack = m.redoStack[:0]
 	m.mode = modeEdit
 	m.renderMarkdown()
@@ -2632,7 +2646,7 @@ func (m Model) tagEditView() string {
 	if m.batchTag {
 		title = fmt.Sprintf("Tag %d notes", m.selectedCount())
 	}
-	body := m.input.View() + "\n\n" + mutedSty.Render("Enter 保存 · Esc 取消")
+	body := m.input.View() + "\n\n" + mutedSty.Render("Enter save · Esc cancel")
 	if m.statusErr {
 		body += "\n" + errorSty.Render(m.status)
 	}
@@ -2998,7 +3012,7 @@ func (m Model) focusView() string {
 		top = "≡ " + truncate(m.currentPath, max(1, m.width-6))
 	}
 	topLine := lipgloss.NewStyle().Foreground(muted).Width(m.width).MaxHeight(1).Render(" " + top)
-	bottomLine := lipgloss.NewStyle().Foreground(muted).Width(m.width).MaxHeight(1).Render("  Esc 退出专注")
+	bottomLine := lipgloss.NewStyle().Foreground(muted).Width(m.width).MaxHeight(1).Render("  Esc leave focus")
 
 	var body string
 	if m.mode == modeEdit {
@@ -3941,7 +3955,7 @@ func (m Model) tagsRow(tags []string, width int) string {
 	var lines []string
 	var b strings.Builder
 	for i, tag := range tags {
-		chip := lipgloss.NewStyle().Foreground(accent).Render("▍ " + tag)
+		chip := lipgloss.NewStyle().Foreground(accent).Background(surface).Render(" #" + tag + " ")
 		sep := 0
 		if i > 0 {
 			sep = 1
@@ -4046,13 +4060,18 @@ func (m *Model) resize(width, height int) {
 		m.treeWidth = max(28, min(36, m.width/3))
 	}
 
+	// Panels pad their content by one column inside each border they draw; in
+	// the split layout the content pane leans on the shared separator instead
+	// of a left border, so it gets one column more.
 	contentWidth := m.width
+	innerWidth := max(10, contentWidth-4)
 	if !m.compact && m.treeVisible {
 		contentWidth = max(1, m.width-m.treeWidth-1)
+		innerWidth = max(10, contentWidth-3)
 	}
-	m.editor.SetWidth(max(10, contentWidth-4))
+	m.editor.SetWidth(innerWidth)
 	m.editor.SetHeight(max(1, m.contentHeight()-2))
-	m.preview.Width = max(10, contentWidth-4)
+	m.preview.Width = innerWidth
 	m.adjustPreviewHeight()
 	m.ensureSelectionVisible()
 	m.renderMarkdown()
@@ -4067,28 +4086,15 @@ func (m *Model) renderMarkdown() {
 		m.renderedContent = ""
 		return
 	}
-	width := max(20, m.preview.Width-1)
-	// Glamour renderers are expensive to construct; reuse one until the wrap
-	// width (the only dynamic rendering input) changes.
-	if m.renderer == nil || m.rendererWidth != width {
-		renderer, err := glamour.NewTermRenderer(
-			glamour.WithStyles(markdownStyle()),
-			glamour.WithWordWrap(width),
-		)
-		if err != nil {
-			m.setStatus("Markdown renderer: "+err.Error(), true)
-			m.preview.SetContent(m.editor.Value())
-			m.renderedContent = m.editor.Value()
-			m.renderedPlain = m.editor.Value()
-			return
-		}
-		m.renderer = renderer
+	width := max(20, m.preview.Width)
+	// Renderers are expensive to construct; reuse one until the wrap width or
+	// the theme (which the style config bakes in) changes.
+	if m.renderer == nil || m.rendererWidth != width || m.rendererTheme != activeThemeIndex {
+		m.renderer = newMdRenderer(width)
 		m.rendererWidth = width
+		m.rendererTheme = activeThemeIndex
 	}
-	// Pre-process: replace image syntax with terminal-safe placeholders before
-	// glamour renders it (glamour would otherwise emit unhelpful alt text).
-	preprocessed := renderImagesInMarkdown(m.editor.Value())
-	rendered, err := m.renderer.Render(preprocessed)
+	content, err := m.renderer.render(m.editor.Value())
 	if err != nil {
 		m.setStatus("Markdown preview: "+err.Error(), true)
 		m.preview.SetContent(m.editor.Value())
@@ -4096,140 +4102,22 @@ func (m *Model) renderMarkdown() {
 		m.renderedPlain = m.editor.Value()
 		return
 	}
-	content := strings.Trim(decorateCodeBlocks(rendered, width), "\n")
 	m.preview.SetContent(content)
 	m.renderedContent = content
 	m.renderedPlain = extractPlainText(content)
 }
-
-func markdownStyle() glamansi.StyleConfig {
-	return glamansi.StyleConfig{
-		Document: glamansi.StyleBlock{
-			StylePrimitive: glamansi.StylePrimitive{Color: stringPtr(textColor)},
-			Margin:         uintPtr(1),
-		},
-		BlockQuote: glamansi.StyleBlock{
-			StylePrimitive: glamansi.StylePrimitive{
-				Color:  stringPtr(mutedColor),
-				Italic: boolPtr(true),
-			},
-			Indent:      uintPtr(1),
-			IndentToken: stringPtr("│ "),
-		},
-		List: glamansi.StyleList{LevelIndent: 2},
-		Heading: glamansi.StyleBlock{
-			StylePrimitive: glamansi.StylePrimitive{
-				Color: stringPtr(accentColor), Bold: boolPtr(true), BlockSuffix: "\n",
-			},
-		},
-		H1: glamansi.StyleBlock{
-			StylePrimitive: glamansi.StylePrimitive{
-				Color: stringPtr(accentColor), Bold: boolPtr(true), Upper: boolPtr(true),
-				BlockSuffix: "\n────────",
-			},
-		},
-		H2: glamansi.StyleBlock{
-			StylePrimitive: glamansi.StylePrimitive{
-				Color: stringPtr(accentColor), Bold: boolPtr(true), Prefix: "## ",
-			},
-		},
-		H3: glamansi.StyleBlock{
-			StylePrimitive: glamansi.StylePrimitive{
-				Color: stringPtr(textColor), Bold: boolPtr(true), Prefix: "### ",
-			},
-		},
-		H4: glamansi.StyleBlock{
-			StylePrimitive: glamansi.StylePrimitive{
-				Color: stringPtr(mutedColor), Bold: boolPtr(true), Prefix: "#### ",
-			},
-		},
-		H5: glamansi.StyleBlock{
-			StylePrimitive: glamansi.StylePrimitive{
-				Color: stringPtr(mutedColor), Bold: boolPtr(true), Prefix: "##### ",
-			},
-		},
-		H6: glamansi.StyleBlock{
-			StylePrimitive: glamansi.StylePrimitive{
-				Color: stringPtr(mutedColor), Bold: boolPtr(true), Prefix: "###### ",
-			},
-		},
-		Strong: glamansi.StylePrimitive{Bold: boolPtr(true)},
-		Emph:   glamansi.StylePrimitive{Italic: boolPtr(true)},
-		HorizontalRule: glamansi.StylePrimitive{
-			Color: stringPtr(mutedColor), Format: "\n────────\n",
-		},
-		Item:        glamansi.StylePrimitive{BlockPrefix: "• "},
-		Enumeration: glamansi.StylePrimitive{BlockPrefix: ". "},
-		Task:        glamansi.StyleTask{Ticked: "[✓] ", Unticked: "[ ] "},
-		Link:        glamansi.StylePrimitive{Color: stringPtr(accentColor), Underline: boolPtr(true)},
-		LinkText:    glamansi.StylePrimitive{Color: stringPtr(accentColor)},
-		Code: glamansi.StyleBlock{StylePrimitive: glamansi.StylePrimitive{
-			Prefix: " ", Suffix: " ", Color: stringPtr(textColor), BackgroundColor: stringPtr(surfaceColor),
-		}},
-		CodeBlock: glamansi.StyleCodeBlock{StyleBlock: glamansi.StyleBlock{
-			StylePrimitive: glamansi.StylePrimitive{
-				Color: stringPtr(textColor), BackgroundColor: stringPtr(surfaceColor),
-				BlockPrefix: codeBlockStart + "\n", BlockSuffix: codeBlockEnd,
-			},
-			Margin: uintPtr(1),
-		}, Chroma: &glamansi.Chroma{
-			Text:                glamansi.StylePrimitive{Color: stringPtr(textColor)},
-			Background:          glamansi.StylePrimitive{BackgroundColor: stringPtr(surfaceColor)},
-			Comment:             glamansi.StylePrimitive{Color: stringPtr(mutedColor), Italic: boolPtr(true)},
-			CommentPreproc:      glamansi.StylePrimitive{Color: stringPtr(warningColor)},
-			Keyword:             glamansi.StylePrimitive{Color: stringPtr(accentColor)},
-			KeywordType:         glamansi.StylePrimitive{Color: stringPtr(accentColor)},
-			Name:                glamansi.StylePrimitive{Color: stringPtr(textColor)},
-			NameBuiltin:         glamansi.StylePrimitive{Color: stringPtr(accentColor)},
-			NameTag:             glamansi.StylePrimitive{Color: stringPtr(accentColor)},
-			NameAttribute:       glamansi.StylePrimitive{Color: stringPtr(greenColor)},
-			NameClass:           glamansi.StylePrimitive{Color: stringPtr(textColor), Bold: boolPtr(true)},
-			NameConstant:        glamansi.StylePrimitive{Color: stringPtr(textColor)},
-			NameFunction:        glamansi.StylePrimitive{Color: stringPtr(accentColor)},
-			Literal:             glamansi.StylePrimitive{Color: stringPtr(textColor)},
-			LiteralNumber:       glamansi.StylePrimitive{Color: stringPtr(warningColor)},
-			LiteralString:       glamansi.StylePrimitive{Color: stringPtr(greenColor)},
-			LiteralStringEscape: glamansi.StylePrimitive{Color: stringPtr(warningColor)},
-			Operator:            glamansi.StylePrimitive{Color: stringPtr(warningColor)},
-			Punctuation:         glamansi.StylePrimitive{Color: stringPtr(mutedColor)},
-			GenericDeleted:      glamansi.StylePrimitive{Color: stringPtr(dangerColor)},
-			GenericInserted:     glamansi.StylePrimitive{Color: stringPtr(greenColor)},
-			GenericEmph:         glamansi.StylePrimitive{Italic: boolPtr(true)},
-			GenericStrong:       glamansi.StylePrimitive{Bold: boolPtr(true)},
-			GenericSubheading:   glamansi.StylePrimitive{Color: stringPtr(mutedColor)},
-		}},
-		Table: glamansi.StyleTable{
-			StyleBlock: glamansi.StyleBlock{
-				StylePrimitive: glamansi.StylePrimitive{
-					Color: stringPtr(accentColor),
-				},
-				Margin: uintPtr(1),
-			},
-			CenterSeparator: stringPtr("│"),
-			ColumnSeparator: stringPtr("│"),
-			RowSeparator:    stringPtr("─"),
-		},
-	}
-}
-
-const (
-	codeBlockStart = "\x01CKSTART\x01"
-	codeBlockEnd   = "\x01CKEND\x01"
-)
 
 var ansiRegexp = regexp.MustCompile("\x1b\\[[0-9;]*m")
 
 func stripANSI(s string) string { return ansiRegexp.ReplaceAllString(s, "") }
 
 // extractPlainText converts a rendered ANSI string into clean copyable text:
-// ANSI escapes are removed along with code-block markers and other control
+// ANSI escapes are removed along with layout markers and other control
 // characters, and trailing padding added to code lines is trimmed.
 // Whitespace control characters (\n, 	, \r) are preserved so multi-line text
 // stays readable when pasted.
 func extractPlainText(rendered string) string {
-	s := stripANSI(rendered)
-	s = strings.ReplaceAll(s, codeBlockStart, "")
-	s = strings.ReplaceAll(s, codeBlockEnd, "")
+	s := mdMarkRe.ReplaceAllString(stripANSI(rendered), "")
 	var b strings.Builder
 	for _, r := range s {
 		if (r < 0x20 && r != '\n' && r != '	' && r != '\r') || r == 0x7f {
@@ -4318,19 +4206,6 @@ func highlightSearchContent(content, query string) string {
 // offsets into content) using reverse video, leaving all other text untouched.
 // Out-of-range or inverted offsets are clamped; a zero-length span returns the
 // content unchanged.
-func highlightSelection(content string, start, end int) string {
-	if start < 0 {
-		start = 0
-	}
-	if end > len(content) {
-		end = len(content)
-	}
-	if end <= start {
-		return content
-	}
-	return content[:start] + "\x1b[7m" + content[start:end] + "\x1b[27m" + content[end:]
-}
-
 func applyHighlightRanges(line string, ranges []matchPos, hi, hiEnd string) string {
 	if len(ranges) == 0 {
 		return line
@@ -4506,52 +4381,6 @@ func listContinuation(line string) string {
 	return indent + marker
 }
 
-// decorateCodeBlocks restores a solid surface background behind code blocks.
-// Glamour's chroma formatter intentionally strips the block background, so we
-// mark code block boundaries, then re-apply the background after every ANSI
-// reset inside each code line.
-func decorateCodeBlocks(rendered string, width int) string {
-	lines := strings.Split(rendered, "\n")
-	var out []string
-	inCode := false
-	codeBg := termansi.Style{}.BackgroundColor(termansi.TrueColor(surfaceRGB)).String()
-	border := mutedSty.Render(strings.Repeat("─", width))
-	for _, line := range lines {
-		plain := stripANSI(line)
-		if !inCode {
-			if strings.Contains(plain, codeBlockStart) {
-				inCode = true
-				out = append(out, border)
-				continue
-			}
-			out = append(out, line)
-			continue
-		}
-		if strings.Contains(plain, codeBlockEnd) {
-			if i := strings.Index(line, codeBlockEnd); i >= 0 {
-				code := line[:i]
-				if strings.TrimSpace(stripANSI(code)) != "" {
-					out = append(out, styleCodeLine(code, codeBg, width))
-				}
-			}
-			inCode = false
-			continue
-		}
-		out = append(out, styleCodeLine(line, codeBg, width))
-	}
-	return strings.Join(out, "\n")
-}
-
-func styleCodeLine(line, bg string, width int) string {
-	line = strings.ReplaceAll(line, "\x1b[0m", "\x1b[0m"+bg)
-	line = strings.ReplaceAll(line, termansi.ResetStyle, termansi.ResetStyle+bg)
-	fill := width - lipgloss.Width(line)
-	if fill < 0 {
-		fill = 0
-	}
-	return bg + line + strings.Repeat(" ", fill) + termansi.ResetStyle
-}
-
 func stringPtr(value string) *string { return &value }
 func boolPtr(value bool) *bool       { return &value }
 func uintPtr(value uint) *uint       { return &value }
@@ -4623,10 +4452,13 @@ func (m Model) View() string {
 		body = m.contentView(m.width)
 	} else {
 		contentW := max(1, m.width-m.treeWidth-1)
-		separator := strings.Repeat("│\n", m.bodyRenderHeight()-1) + "│"
+		// The separator column joins both panel frames, so its first and last
+		// cells are tees rather than plain verticals.
+		rows := max(2, m.bodyRenderHeight())
+		separator := "┬\n" + strings.Repeat("│\n", rows-2) + "┴"
 		body = lipgloss.JoinHorizontal(lipgloss.Top,
 			m.treeViewSides(m.treeWidth, true, false),
-			lipgloss.NewStyle().Foreground(muted).Render(separator),
+			lipgloss.NewStyle().Foreground(rule).Render(separator),
 			m.contentViewSides(contentW, false, true),
 		)
 	}
@@ -4709,24 +4541,23 @@ func (m Model) headerTabs() string {
 	if !m.treeVisible {
 		return m.contentTabLabel()
 	}
-	notesStyle := lipgloss.NewStyle().Foreground(muted)
-	contentStyle := lipgloss.NewStyle().Foreground(muted)
+	idle := lipgloss.NewStyle().Foreground(muted)
+	active := lipgloss.NewStyle().Background(selection).Foreground(accent).Bold(true)
+	notesStyle, contentStyle := idle, active
 	if m.active == treePane {
-		notesStyle = notesStyle.Background(surface).Foreground(accent).Bold(true)
-	} else {
-		contentStyle = contentStyle.Background(surface).Foreground(accent).Bold(true)
+		notesStyle, contentStyle = active, idle
 	}
 	contentLabel := "Preview"
 	if m.mode == modeEdit {
 		contentLabel = "Edit"
 	}
-	return notesStyle.Render(" Lists ") + lipgloss.NewStyle().Foreground(muted).Render(" │ ") + contentStyle.Render(" "+contentLabel+" ")
+	return notesStyle.Render(" Lists ") + idle.Render(" │ ") + contentStyle.Render(" "+contentLabel+" ")
 }
 
 func (m Model) contentTabLabel() string {
 	contentStyle := lipgloss.NewStyle().Foreground(muted)
 	if !m.treeVisible || m.active != treePane {
-		contentStyle = contentStyle.Background(surface).Foreground(accent).Bold(true)
+		contentStyle = lipgloss.NewStyle().Background(selection).Foreground(accent).Bold(true)
 	}
 	contentLabel := "Preview"
 	if m.mode == modeEdit {
@@ -4777,10 +4608,6 @@ func (m Model) toolbarActionAt(x int) string {
 	return m.footerActionAt(x)
 }
 
-func (m Model) toolbarView() string {
-	return m.shortcutBar()
-}
-
 func (m Model) treeView(width int) string {
 	return m.treeViewSides(width, true, true)
 }
@@ -4789,67 +4616,71 @@ func (m Model) treeViewSides(width int, leftB, rightB bool) string {
 	focused := m.active == treePane
 	title := "Lists"
 	if len(m.flat) > 0 {
-		title += mutedSty.Render(" · " + fmt.Sprintf("%d", len(m.flat)))
+		title += mutedSty.Render(fmt.Sprintf(" · %d", len(m.flat)))
 	}
 	if sel := m.selectedCount(); sel > 0 {
-		title += " · " + lipgloss.NewStyle().Foreground(accent).Bold(true).Render(fmt.Sprintf("☑%d", sel))
+		title += " · " + lipgloss.NewStyle().Foreground(accent).Render(fmt.Sprintf("☑%d", sel))
 	}
 	if m.tagFilter != "" {
-		title += " · " + lipgloss.NewStyle().Foreground(accent).Bold(true).Render("#"+m.tagFilter)
+		title += " · " + lipgloss.NewStyle().Foreground(accent).Render("#"+m.tagFilter)
 	}
-	innerWidth := max(1, width)
-	if leftB {
-		innerWidth--
-	}
-	if rightB {
-		innerWidth--
-	}
+	innerWidth := panelInnerWidth(width, leftB, rightB)
 	var lines []string
 	rows := m.treeRows()
 	end := min(len(m.flat), m.treeOffset+rows)
 	for i := m.treeOffset; i < end; i++ {
 		item := m.flat[i]
+		selected := i == m.selected
+		// Every run of a selected row needs the highlight baked in: an inner
+		// ANSI reset would otherwise end the background mid-row.
+		paint := func(color lipgloss.TerminalColor, bold bool) lipgloss.Style {
+			style := lipgloss.NewStyle().Foreground(color).Bold(bold)
+			if selected {
+				style = style.Background(selection).Bold(true)
+			}
+			return style
+		}
 		var label string
 		if item.node.IsDir {
-			// Folder: ▸/▾ + 📁 + name in accent
+			// Folder: a dim disclosure arrow, then the name as the row's subject.
 			marker := "▸ "
 			if m.expanded[item.node.RelPath] {
 				marker = "▾ "
 			}
-			label = lipgloss.NewStyle().Foreground(accent).Render(marker) + lipgloss.NewStyle().Foreground(accent).Bold(true).Render("📁 "+item.node.Name)
+			label = paint(muted, false).Render(marker) + paint(text, true).Render(item.node.Name)
 		} else {
-			// Note: ○ + name in muted, pinned ★ before name, tag count after
+			// Note: dim bullet, name in the text color so titles stay legible,
+			// pin and tag count as quiet trailing metadata.
 			name := strings.TrimSuffix(item.node.Name, filepath.Ext(item.node.Name))
-			marker := mutedSty.Render("○ ")
+			marker := paint(muted, false).Render("○ ")
 			if m.selectedItems[item.node.RelPath] {
-				marker = lipgloss.NewStyle().Foreground(accent).Render("☑ ")
+				marker = paint(accent, false).Render("☑ ")
 			}
 			label = marker
 			if m.nodePinned[item.node.RelPath] {
-				label += lipgloss.NewStyle().Foreground(accent).Render("★ ")
+				label += paint(warning, false).Render("★ ")
 			}
-			label += mutedSty.Render(name)
+			label += paint(text, false).Render(name)
 			if count := len(m.nodeTags[item.node.RelPath]); count > 0 {
-				label += " " + lipgloss.NewStyle().Foreground(accent).Bold(true).Render(fmt.Sprintf("#%d", count))
+				label += paint(muted, false).Render(fmt.Sprintf(" #%d", count))
 			}
 		}
-		// Indent with depth guides
-		indent := strings.Repeat("  ", item.depth)
-		row := indent + label
-		if i == m.selected {
-			// Selection: background highlight, NO extra marker prepended
-			row = truncateANSI(row, innerWidth)
-			row = lipgloss.NewStyle().Background(selection).Foreground(text).Bold(true).Width(innerWidth).Render(row)
-		} else {
-			row = truncateANSI(row, innerWidth)
+		// Depth guides keep deep trees readable without extra chrome.
+		indent := strings.Repeat(paint(rule, false).Render("│")+paint(muted, false).Render(" "), item.depth)
+		row := truncateANSI(indent+label, innerWidth)
+		if selected {
+			gap := max(0, innerWidth-lipgloss.Width(row))
+			row += lipgloss.NewStyle().Background(selection).Render(strings.Repeat(" ", gap))
 		}
 		lines = append(lines, row)
 	}
 	if len(m.flat) == 0 {
+		key := lipgloss.NewStyle().Foreground(text)
 		lines = append(lines,
-			"  "+mutedSty.Render("No notes yet. Press n to create one."),
+			mutedSty.Render("No notes yet"),
 			"",
-			"  "+lipgloss.NewStyle().Foreground(accent).Render("n")+mutedSty.Render(" new note · ")+lipgloss.NewStyle().Foreground(accent).Render("N")+mutedSty.Render(" new folder"),
+			key.Render("n")+mutedSty.Render("  new note"),
+			key.Render("N")+mutedSty.Render("  new folder"),
 		)
 	}
 	return borderedPanelPart(title, strings.Join(lines, "\n"), width, m.bodyRenderHeight(), focused, leftB, rightB)
@@ -4862,56 +4693,41 @@ func (m Model) contentView(width int) string {
 func (m Model) contentViewSides(width int, leftB, rightB bool) string {
 	focused := m.active == contentPane || m.mode == modeEdit
 	title := "Note"
-	if m.mode == modeEdit {
-		title = "Markdown"
-	}
 	if m.currentPath != "" {
-		title += " · " + filepath.Base(m.currentPath)
+		title = filepath.Base(m.currentPath)
 		if m.nodePinned[m.currentPath] {
-			title += " ★"
+			title += lipgloss.NewStyle().Foreground(warning).Render(" ★")
 		}
 		if m.mode == modeNormal && m.previewLineCount() > m.preview.Height {
-			title += " · " + lipgloss.NewStyle().Foreground(accent).Render(fmt.Sprintf("%d%%", m.previewPercent()))
+			if pct := m.previewPercent(); pct > 0 {
+				title += mutedSty.Render(fmt.Sprintf(" · %d%%", pct))
+			}
 		}
 	}
 
-	innerWidth := max(1, width)
-	if leftB {
-		innerWidth--
-	}
-	if rightB {
-		innerWidth--
-	}
+	innerWidth := panelInnerWidth(width, leftB, rightB)
 
-	// Compact metadata line
+	// One quiet metadata line: the header already carries the path and the
+	// dirty flag, so this row only adds what nothing else shows.
 	var meta string
 	if m.currentPath != "" {
-		state := lipgloss.NewStyle().Foreground(green).Bold(true).Render("saved")
-		if m.dirty() {
-			state = lipgloss.NewStyle().Foreground(danger).Bold(true).Render("unsaved")
-		}
-		modeName := "preview"
-		if m.mode == modeEdit {
-			modeName = "edit"
-		}
 		content := m.editor.Value()
-		words := wordCount(content)
-		chars := charCount(content)
-		lines := lineCountOf(content)
-		stats := fmt.Sprintf("%d words · %d chars · %d lines · ~%s read", words, chars, lines, readingTimeEstimate(content))
-		metaLine := mutedSty.Render(m.currentPath) + "   " +
-			state + "   " +
-			mutedSty.Render(modeName+" · ") +
-			mutedSty.Render(stats)
-		meta = truncateANSI(metaLine, max(1, innerWidth-2)) + "\n"
+		stats := fmt.Sprintf("%d words · %d chars · %d lines · ~%s read",
+			wordCount(content), charCount(content), lineCountOf(content), readingTimeEstimate(content))
+		metaLine := mutedSty.Render(stats)
+		if m.dirty() {
+			metaLine += mutedSty.Render(" · ") +
+				lipgloss.NewStyle().Foreground(warning).Render("unsaved")
+		}
+		meta = truncateANSI(metaLine, innerWidth) + "\n"
 		if tags := m.nodeTags[m.currentPath]; len(tags) > 0 {
-			meta += m.tagsRow(tags, max(4, innerWidth-2)) + "\n"
+			meta += m.tagsRow(tags, max(4, innerWidth)) + "\n"
 		}
 	}
 
 	var content string
 	if m.currentPath == "" {
-		content = "\n" + mutedSty.Render("  Select a note from the tree, or press n to create one.")
+		content = m.emptyContentView()
 	} else if m.mode == modeEdit {
 		content = m.editor.View()
 	} else {
@@ -4939,54 +4755,47 @@ func (m Model) contentHeight() int {
 	return max(6, m.bodyHeight-3)
 }
 
-func (m Model) detailsView(width int) string {
-	if m.currentPath == "" {
-		return mutedSty.Render(" No note selected")
-	}
-	state := lipgloss.NewStyle().Foreground(green).Render("saved")
-	if m.dirty() {
-		state = lipgloss.NewStyle().Foreground(danger).Render("unsaved")
-	}
-	modeName := "preview"
-	if m.mode == modeEdit {
-		modeName = "edit"
-	}
-	content := m.editor.Value()
-	words := len(strings.Fields(content))
-	lines := 0
-	if content != "" {
-		lines = strings.Count(content, "\n") + 1
-	}
-	line1 := " path  " + truncate(m.currentPath, max(1, width-8))
-	line2 := " state " + state + mutedSty.Render("   mode ") + modeName + mutedSty.Render("   words ") + fmt.Sprintf("%d", words) + mutedSty.Render("   lines ") + fmt.Sprintf("%d", lines)
-	return line1 + "\n" + line2
+// emptyContentView is what the note pane shows before anything is open: the
+// two keys that get a note on screen, and nothing else.
+func (m Model) emptyContentView() string {
+	key := lipgloss.NewStyle().Foreground(text)
+	return "\n" + mutedSty.Render("No note open") + "\n\n" +
+		key.Render("n") + mutedSty.Render("  new note") + "\n" +
+		key.Render("N") + mutedSty.Render("  new folder") + "\n" +
+		key.Render("?") + mutedSty.Render("  shortcuts")
 }
 
-func borderedPanel(title, content string, width, height int, focused bool) string {
-	return borderedPanelPart(title, content, width, height, focused, true, true)
+// panelInnerWidth is the text width available inside a panel: the border on
+// each requested side plus one column of padding.
+func panelInnerWidth(width int, leftB, rightB bool) int {
+	inner := max(4, width) - 2
+	if leftB {
+		inner--
+	}
+	if rightB {
+		inner--
+	}
+	return max(1, inner)
 }
 
+// borderedPanelPart draws one pane: a titled top border, padded content rows
+// and a bottom border. leftB/rightB select which vertical borders are drawn so
+// two panes can share a single separator column between them.
 func borderedPanelPart(title, content string, width, height int, focused bool, leftB, rightB bool) string {
 	width, height = max(4, width), max(3, height)
-	borderColor := muted
+	borderColor := rule
 	titleColor := muted
 	if focused {
 		borderColor = accent
 		titleColor = accent
 	}
-	leftOffset, rightOffset := 0, 0
-	if leftB {
-		leftOffset = 1
-	}
-	if rightB {
-		rightOffset = 1
-	}
-	innerWidth := max(1, width-leftOffset-rightOffset)
+	inner := panelInnerWidth(width, leftB, rightB)
+	frameWidth := inner + 2
 	innerHeight := max(1, height-2)
-	title = truncate(title, max(1, innerWidth-2))
+	title = truncateANSI(title, max(1, inner))
 	border := lipgloss.NewStyle().Foreground(borderColor)
 	titleText := border.Render(" ") + lipgloss.NewStyle().Foreground(titleColor).Bold(focused).Render(title) + border.Render(" ")
-	topTail := max(0, innerWidth-lipgloss.Width(titleText))
+	topTail := max(0, frameWidth-lipgloss.Width(titleText))
 	top := ""
 	if leftB {
 		top += border.Render("┌")
@@ -4996,14 +4805,14 @@ func borderedPanelPart(title, content string, width, height int, focused bool, l
 		top += border.Render("┐")
 	}
 
-	content = fitBlock(content, innerWidth, innerHeight)
+	content = fitBlock(content, inner, innerHeight)
 	rows := strings.Split(content, "\n")
 	for i, row := range rows {
 		line := ""
 		if leftB {
 			line += border.Render("│")
 		}
-		line += truncateANSI(row, innerWidth) + strings.Repeat(" ", max(0, innerWidth-lipgloss.Width(row)))
+		line += " " + truncateANSI(row, inner) + strings.Repeat(" ", max(0, inner-lipgloss.Width(row))) + " "
 		if rightB {
 			line += border.Render("│")
 		}
@@ -5013,7 +4822,7 @@ func borderedPanelPart(title, content string, width, height int, focused bool, l
 	if leftB {
 		bottom += border.Render("└")
 	}
-	bottom += border.Render(strings.Repeat("─", innerWidth))
+	bottom += border.Render(strings.Repeat("─", frameWidth))
 	if rightB {
 		bottom += border.Render("┘")
 	}
@@ -5044,16 +4853,19 @@ func (m Model) statusView() string {
 	return m.shortcutBar()
 }
 
+// toolbarShortcut renders the footer hints. The key is the part worth reading,
+// so it carries the text color while brackets and labels stay quiet.
 func (m Model) toolbarShortcut(budget int) string {
 	var b strings.Builder
+	keySty := lipgloss.NewStyle().Foreground(text)
 	for _, item := range m.toolbarItems() {
 		key, label, _ := strings.Cut(item.label, " ")
 		chunk := "[" + key + "] " + label + "  "
 		if lipgloss.Width(b.String())+lipgloss.Width(chunk) > budget {
 			break
 		}
-		b.WriteString(mutedSty.Render("[" + key + "]"))
-		b.WriteString(" " + mutedSty.Render(label) + "  ")
+		b.WriteString(mutedSty.Render("[") + keySty.Render(key) + mutedSty.Render("] "))
+		b.WriteString(mutedSty.Render(label) + "  ")
 	}
 	return b.String()
 }
@@ -5099,19 +4911,13 @@ func (m *Model) editShortcutBar() string {
 	return m.composeBar(left, right)
 }
 
+// composeBar lays out the footer: hints on the left, status on the right, with
+// the gap between them as the only separator.
 func (m Model) composeBar(left, right string) string {
-	lw := lipgloss.Width(left)
-	rw := lipgloss.Width(right)
-	divider := ""
-	if lw > 0 && rw > 0 {
-		divider = mutedSty.Render(" │ ") + " "
-	}
-	dw := lipgloss.Width(divider)
-	pad := m.width - lw - rw - dw - 2
-	if pad < 0 {
-		pad = 0
-	}
-	return lipgloss.NewStyle().Foreground(muted).Background(surface).Width(m.width).MaxHeight(1).Render(" " + left + divider + strings.Repeat(" ", pad) + " " + right)
+	pad := max(1, m.width-lipgloss.Width(left)-lipgloss.Width(right)-2)
+	return lipgloss.NewStyle().Foreground(muted).Background(surface).
+		Width(m.width).MaxHeight(1).
+		Render(" " + left + strings.Repeat(" ", pad) + right + " ")
 }
 
 func (m Model) searchBarView() string {
@@ -5148,7 +4954,7 @@ func (m Model) dialogView() string {
 	if m.mode == modeConfirm {
 		if m.confirmCount > 0 {
 			title = "Delete notes"
-			body = fmt.Sprintf("将删除 %d 个笔记", m.confirmCount)
+			body = fmt.Sprintf("Delete %d notes?", m.confirmCount)
 		} else if m.confirmDir {
 			title = "Delete folder"
 			body = "Delete \u201c" + m.confirm + "\u201d and all contents?"
@@ -5156,7 +4962,7 @@ func (m Model) dialogView() string {
 			title = "Delete note"
 			body = "Delete \u201c" + m.confirm + "\u201d?"
 		}
-		body += "\n\n" + dangerStyle("Enter / Y  确认删除") + "    " + mutedSty.Render("Esc / N  取消")
+		body += "\n\n" + dangerStyle("Enter / Y  delete") + "    " + mutedSty.Render("Esc / N  cancel")
 	} else {
 		switch m.promptKind {
 		case promptNote:
@@ -5188,7 +4994,7 @@ func (m Model) dialogView() string {
 
 func (m Model) targetPathView() string {
 	var b strings.Builder
-	b.WriteString(mutedSty.Render("保存到: "))
+	b.WriteString(mutedSty.Render("Save to: "))
 	// Display path: "/" for root, otherwise the folder path
 	display := m.targetPath
 	if display == "" {
@@ -5201,7 +5007,7 @@ func (m Model) targetPathView() string {
 		b.WriteString(lipgloss.NewStyle().Foreground(text).Render(display))
 	}
 	b.WriteString("\n")
-	b.WriteString(mutedSty.Render("Tab 切换编辑路径"))
+	b.WriteString(mutedSty.Render("Tab  edit the folder path"))
 	return b.String()
 }
 
@@ -5254,35 +5060,52 @@ func (m Model) updateHelp(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// renderHelpContent lays the shortcut list into the help viewport. The height
+// leaves room for the box frame, padding, title, search field and footer hint,
+// so the overlay always fits on screen and scrolls instead of overflowing.
 func (m *Model) renderHelpContent() {
 	w := m.helpBoxWidth()
 	m.helpHintView.Width = max(10, w-6)
-	m.helpHintView.Height = max(3, m.height-6)
+	m.helpHintView.Height = max(3, m.height-helpBoxChrome)
 	m.helpHintView.SetContent(m.helpContent())
 }
+
+// helpBoxChrome counts the rows the help overlay spends on anything but the
+// shortcut list itself.
+const helpBoxChrome = 11
 
 func (m Model) helpBoxWidth() int {
 	return min(82, max(28, m.width-4))
 }
 
+// helpContent renders the shortcut list, keys in an aligned column so the
+// descriptions read as a single list rather than ragged pairs.
 func (m Model) helpContent() string {
-	var b strings.Builder
 	q := strings.ToLower(strings.TrimSpace(m.helpHintQ))
-	total := 0
-	for _, g := range helpGroupsData {
-		var rows []helpRow
+	groups := make([][]helpRow, len(helpGroupsData))
+	keyWidth, total := 0, 0
+	for i, g := range helpGroupsData {
 		for _, r := range g.rows {
-			if q == "" || strings.Contains(strings.ToLower(r.keys), q) || strings.Contains(strings.ToLower(r.desc), q) {
-				rows = append(rows, r)
+			if q != "" && !strings.Contains(strings.ToLower(r.keys), q) && !strings.Contains(strings.ToLower(r.desc), q) {
+				continue
 			}
+			groups[i] = append(groups[i], r)
+			keyWidth = max(keyWidth, lipgloss.Width(r.keys))
+			total++
 		}
+	}
+	keyWidth = min(keyWidth, max(8, m.helpHintView.Width/2))
+	var b strings.Builder
+	keySty := lipgloss.NewStyle().Foreground(text)
+	for i, rows := range groups {
 		if len(rows) == 0 {
 			continue
 		}
-		b.WriteString(lipgloss.NewStyle().Foreground(accent).Bold(true).Render(g.title) + "\n")
+		b.WriteString(mutedSty.Render(helpGroupsData[i].title) + "\n")
 		for _, r := range rows {
-			total++
-			b.WriteString("  " + lipgloss.NewStyle().Foreground(accent).Render(r.keys) + "  " + mutedSty.Render(r.desc) + "\n")
+			pad := max(1, keyWidth-lipgloss.Width(r.keys)+2)
+			b.WriteString("  " + keySty.Render(r.keys) + strings.Repeat(" ", pad) +
+				mutedSty.Render(r.desc) + "\n")
 		}
 		b.WriteString("\n")
 	}
@@ -5294,20 +5117,28 @@ func (m Model) helpContent() string {
 
 func (m Model) helpView() string {
 	var b strings.Builder
-	b.WriteString("\n")
-	b.WriteString(brandSty.Render("  TN 快捷键") + "\n\n")
-	b.WriteString("  " + m.input.View() + "\n\n")
-	b.WriteString(m.helpContent())
-	b.WriteString("\n\n" + mutedSty.Render("  ↑/↓ 滚动 · Esc 关闭"))
+	b.WriteString(brandSty.Render("TN shortcuts") + "\n\n")
+	b.WriteString(m.input.View() + "\n\n")
+	b.WriteString(m.helpHintView.View())
+	hint := "↑/↓ scroll · Esc close"
+	if total := m.helpHintView.TotalLineCount(); total > m.helpHintView.Height {
+		hint = fmt.Sprintf("%d%% · %s", m.helpScrollPercent(), hint)
+	}
+	b.WriteString("\n" + mutedSty.Render(hint))
 	box := lipgloss.NewStyle().
 		Background(surface).
 		Foreground(text).
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(accent).
 		Padding(1, 3).
-		Width(min(80, max(30, m.width-4))).
+		Width(m.helpBoxWidth() - 8).
 		Render(b.String())
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box, lipgloss.WithWhitespaceBackground(bg))
+}
+
+// helpScrollPercent reports how far the shortcut list is scrolled.
+func (m Model) helpScrollPercent() int {
+	return int(math.Round(m.helpHintView.ScrollPercent() * 100))
 }
 
 func (m *Model) startCommand() {
@@ -5829,7 +5660,7 @@ func progressBar(percent int) string {
 
 func (m Model) readingStatus() string {
 	if m.currentPath == "" {
-		return mutedSty.Render("TN · select a note from the tree, or press n to create one")
+		return mutedSty.Render("TN")
 	}
 	var parts []string
 	if m.mode == modeNormal && m.previewLineCount() > m.preview.Height {

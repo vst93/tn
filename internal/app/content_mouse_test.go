@@ -52,8 +52,9 @@ func TestContentDragSelectCopies(t *testing.T) {
 	}
 
 	// The pane's top border is at Y=1 and the metadata line at Y=2 (no
-	// tags), so the first preview line renders at Y=3. The content inner
-	// area starts at X = treeWidth+1 (no left border).
+	// tags), so the first preview line renders at Y=3. The content area
+	// starts at X = treeWidth+2: the separator column plus the one column of
+	// padding the panel adds inside its frame.
 	startX := m.treeWidth + 2
 	m.handleMouse(tea.MouseEvent{X: startX, Y: 3, Button: tea.MouseButtonLeft, Action: tea.MouseActionPress})
 	if !m.contentDragging {
@@ -177,6 +178,7 @@ func TestContentDragMultiLineSelection(t *testing.T) {
 		t.Fatalf("expected multi-line copied text, got %q", copied)
 	}
 }
+
 // TestContentDragAfterScroll verifies selection mapping accounts for the
 // preview viewport's scrolled offset: dragging near the top of the pane
 // after scrolling selects later text, not the first rendered line.

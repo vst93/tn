@@ -7,6 +7,7 @@ A quiet, keyboard-first terminal note. TN stores every note as a normal Markdown
 - Compact, bordered workbench layout with unified focus styling: active panels use the accent border, inactive panels and dialogs use muted borders
 - Multi-level folder tree with mouse clicks, wheel scrolling, and touch-friendly targets
 - Live Markdown editing with rendered preview, smart list continuation, and auto-indent
+- Typeset Markdown preview: heading rules, hanging-indent lists, framed code cards with syntax highlighting, right-sized tables, task lists, footnotes and definition lists
 - Undo/redo with cursor preservation, plus auto-save after two seconds of idle typing
 - One-key clipboard copy plus native terminal text selection mode
 - In-note search with highlighted matches, global search across all notes, and jump-to-line
@@ -36,7 +37,7 @@ Options: `--install-dir <dir>`, `--force`, `--skip-github`, `--lang <en|zh>`
 curl -fsSL https://raw.githubusercontent.com/vst93/tn/main/cmd/install.sh | bash -s -- --skip-github
 ```
 
-**go install (requires Go 1.23+):**
+**go install (requires Go 1.24+):**
 
 ```bash
 go install github.com/vst93/tn@latest

@@ -26,7 +26,7 @@ var themeList = []Theme{
 		Selection: "#282D42",
 		Text:      "#C4CBE3",
 		Muted:     "#68708C",
-		Rule:      "#3E4E78",
+		Rule:      "#333A57",
 		Accent:    "#7FA9FF",
 		Green:     "#9CCB65",
 		Warning:   "#E5B76B",

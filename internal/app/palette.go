@@ -10,7 +10,7 @@ var (
 	selectionColor = "#282D42"
 	textColor      = "#C4CBE3"
 	mutedColor     = "#68708C"
-	ruleColor      = "#3E4E78"
+	ruleColor      = "#333A57"
 	accentColor    = "#7FA9FF"
 	greenColor     = "#9CCB65"
 	warningColor   = "#E5B76B"
