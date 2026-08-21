@@ -68,13 +68,13 @@ type webdavRemoteFile struct {
 
 // webdavPROPFINDResponse parses WebDAV XML responses.
 type webdavPROPFINDResponse struct {
-	XMLName  xml.Name                `xml:"multistatus"`
-	Responses []webdavResponse       `xml:"response"`
+	XMLName   xml.Name         `xml:"multistatus"`
+	Responses []webdavResponse `xml:"response"`
 }
 
 type webdavResponse struct {
-	Href         string              `xml:"href"`
-	PropStat     webdavPropStat      `xml:"propstat"`
+	Href     string         `xml:"href"`
+	PropStat webdavPropStat `xml:"propstat"`
 }
 
 type webdavPropStat struct {
@@ -83,9 +83,9 @@ type webdavPropStat struct {
 }
 
 type webdavProp struct {
-	LastModified string `xml:"getlastmodified"`
+	LastModified  string `xml:"getlastmodified"`
 	ContentLength string `xml:"getcontentlength"`
-	ETag         string `xml:"getetag"`
+	ETag          string `xml:"getetag"`
 }
 
 // httpTimeout for WebDAV operations.

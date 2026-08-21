@@ -73,6 +73,7 @@ func (r *mdRenderer) render(src string) (string, error) {
 	for i, line := range lines {
 		lines[i] = mdTrimRight(line)
 	}
+	lines = mdJoinGroups(lines)
 	lines = mdReflowLists(lines, r.width)
 	lines = mdSplice(lines, blocks, r.width)
 	lines = mdCollapseBlanks(lines)
@@ -134,7 +135,75 @@ func mdPrepare(src string) (string, mdBlocks) {
 		}
 		out = append(out, notes.rewrite(lines[i]))
 	}
-	return strings.Join(out, "\n"), blocks
+	return strings.Join(mdInsertGroupMarks(out), "\n"), blocks
+}
+
+// mdGroupMark stands between two lines the author typed as consecutive rows.
+// glamour merges soft line breaks inside a paragraph into one flowed block,
+// so after rendering mdJoinGroups uses the marker to stitch those blocks back
+// together without the blank line — the preview then mirrors the author's
+// line breaks instead of reflowing prose into a wall of text.
+var mdGroupMark = "\x01g\x01"
+
+// mdInsertGroupMarks places the group mark between adjacent plain text lines.
+// Anything that is its own block type (lists, quotes, headings, tables,
+// fences, rules) is left alone: those follow standard Markdown flow.
+func mdInsertGroupMarks(lines []string) []string {
+	out := make([]string, 0, len(lines)+16)
+	for i, line := range lines {
+		out = append(out, line)
+		if i+1 < len(lines) && mdPlainLine(line) && mdPlainLine(lines[i+1]) {
+			out = append(out, "", mdGroupMark, "")
+		}
+	}
+	return out
+}
+
+// srcListRe matches list items as they appear in note source (dash, star,
+// plus, ordered and task markers), at any indent.
+var srcListRe = regexp.MustCompile(`^ *([-*+] |\d+[.)] |\[[ x✓]\] )`)
+
+// mdPlainLine reports whether a source line is ordinary paragraph text that
+// participates in author line breaks.
+func mdPlainLine(s string) bool {
+	t := strings.TrimSpace(s)
+	switch {
+	case t == "", mdMarkRe.MatchString(t):
+		return false
+	case strings.HasPrefix(t, "#"), strings.HasPrefix(t, ">"), strings.HasPrefix(t, "|"):
+		return false
+	case strings.HasPrefix(t, "```"), strings.HasPrefix(t, "~~~"):
+		return false
+	case srcListRe.MatchString(s), mdItemRe.MatchString(t):
+		return false
+	case strings.Trim(t, "=-") == "": // rules and setext underlines
+		return false
+	}
+	return true
+}
+
+// mdJoinGroups stitches marked paragraphs together: the marker line and one
+// neighboring blank disappear so consecutive typed lines render tightly.
+func mdJoinGroups(lines []string) []string {
+	out := make([]string, 0, len(lines))
+	skipBlank := false
+	for _, line := range lines {
+		plain := strings.TrimSpace(stripANSI(line))
+		if plain == mdGroupMark {
+			if n := len(out); n > 0 && strings.TrimSpace(stripANSI(out[n-1])) == "" {
+				out = out[:n-1]
+			}
+			skipBlank = true
+			continue
+		}
+		if skipBlank && strings.TrimSpace(stripANSI(line)) == "" {
+			skipBlank = false
+			continue
+		}
+		skipBlank = false
+		out = append(out, line)
+	}
+	return out
 }
 
 var (
@@ -240,6 +309,24 @@ func mdReflowLists(lines []string, width int) []string {
 		}
 		i = j - 1
 		out = append(out, mdWrapItem(indent, marker, content, width)...)
+		// Lines the author broke off themselves stay on their own row, hung
+		// under the item text instead of sitting flush at column zero.
+		_, cells := mdItemMarker(indent, marker)
+		hang := strings.Repeat(" ", indent+cells)
+		for ; j < len(lines); j++ {
+			plain := stripANSI(lines[j])
+			if strings.TrimSpace(plain) == "" || mdItemRe.MatchString(plain) {
+				break
+			}
+			if mdMarkRe.MatchString(plain) {
+				break
+			}
+			if len(plain)-len(strings.TrimLeft(plain, " ")) != indent {
+				break
+			}
+			out = append(out, hang+termansi.TruncateLeft(lines[j], indent, ""))
+		}
+		i = j - 1
 	}
 	return out
 }

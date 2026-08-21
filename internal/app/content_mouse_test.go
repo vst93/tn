@@ -55,7 +55,7 @@ func TestContentDragSelectCopies(t *testing.T) {
 	// tags), so the first preview line renders at Y=3. The content area
 	// starts at X = treeWidth+2: the separator column plus the one column of
 	// padding the panel adds inside its frame.
-	startX := m.treeWidth + 1 // borderless pane: text starts right after the divider
+	startX := m.treeWidth + 2
 	m.handleMouse(tea.MouseEvent{X: startX, Y: 3, Button: tea.MouseButtonLeft, Action: tea.MouseActionPress})
 	if !m.contentDragging {
 		t.Fatal("expected contentDragging after press on preview text")
@@ -157,7 +157,7 @@ func TestContentDragMultiLineSelection(t *testing.T) {
 		copied = s
 		return nil
 	}
-	startX := m.treeWidth + 1 // borderless pane: text starts right after the divider
+	startX := m.treeWidth + 2 // separator column + panel padding inside the frame
 	// Each paragraph renders one row: first at Y=3 (below the metadata
 	// line), second at Y=4, third at Y=5.
 	m.handleMouse(tea.MouseEvent{X: startX, Y: 3, Button: tea.MouseButtonLeft, Action: tea.MouseActionPress})
@@ -201,7 +201,7 @@ func TestContentDragAfterScroll(t *testing.T) {
 		copied = s
 		return nil
 	}
-	startX := m.treeWidth + 1 // borderless pane: text starts right after the divider
+	startX := m.treeWidth + 2 // separator column + panel padding inside the frame
 	// The first visible line is renderedPlain line 10 (each paragraph is
 	// one line); it must map to an offset starting at that line, not line
 	// 0. The anchor should therefore sit inside paragraph 10's text.
@@ -238,7 +238,7 @@ func TestContentDragAfterScroll(t *testing.T) {
 func TestSelectionHighlightClosesAtLineEnd(t *testing.T) {
 	m := openNoteForDrag(t, "line one\n\nline two\n\nline three")
 	m.copier = func(s string) error { return nil }
-	startX := m.treeWidth + 1 // borderless pane: text starts right after the divider
+	startX := m.treeWidth + 2 // separator column + panel padding inside the frame
 	m.handleMouse(tea.MouseEvent{X: startX, Y: 3, Button: tea.MouseButtonLeft, Action: tea.MouseActionPress})
 	m.handleMouse(tea.MouseEvent{X: startX + 100, Y: 3, Button: tea.MouseButtonNone, Action: tea.MouseActionMotion})
 	// Capture offsets before release clears them.

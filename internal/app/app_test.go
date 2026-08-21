@@ -77,14 +77,23 @@ func TestSplitViewSeparatorVisible(t *testing.T) {
 	m.selectPath(note)
 	m.openSelectedNote()
 	lines := strings.Split(stripANSI(m.View()), "\n")
-	// The separator is a plain vertical column between the borderless panes.
+	// The separator is a shared vertical column between the two bordered
+	// panes: tees at the top and bottom, plain verticals in between.
 	for i := 1; i <= m.bodyHeight; i++ {
 		runes := []rune(lines[i])
 		if m.treeWidth >= len(runes) {
 			t.Fatalf("line %d is too short for a separator at col %d: %q", i, m.treeWidth, lines[i])
 		}
-		if got := string(runes[m.treeWidth]); got != "│" {
-			t.Fatalf("line %d has %q at col %d, want a vertical: %q", i, got, m.treeWidth, lines[i])
+		got := string(runes[m.treeWidth])
+		want := "│"
+		if i == 1 {
+			want = "┬"
+		}
+		if i == m.bodyHeight {
+			want = "┴"
+		}
+		if got != want {
+			t.Fatalf("line %d has %q at col %d, want %q: %q", i, got, m.treeWidth, want, lines[i])
 		}
 	}
 }
@@ -929,7 +938,7 @@ func TestFocusModeTogglesAndRendersFullScreen(t *testing.T) {
 	m := New(storage.New(t.TempDir()))
 	m.resize(100, 30)
 
-	if handled, _ := m.globalKey("ctrl+shift+f"); !handled {
+	if handled, _ := m.globalKey("ctrl+shift+l"); !handled {
 		t.Fatal("expected Ctrl+Shift+F to be handled")
 	}
 	if !m.focusing {
@@ -964,7 +973,7 @@ func TestFocusModeKeepsEditControls(t *testing.T) {
 	m.toggleEdit()
 	before := m.editor.Width()
 
-	if handled, _ := m.globalKey("ctrl+shift+f"); !handled {
+	if handled, _ := m.globalKey("ctrl+shift+l"); !handled {
 		t.Fatal("expected Ctrl+Shift+F to be handled in edit mode")
 	}
 	if !m.focusing || m.mode != modeEdit || !m.editor.Focused() {
@@ -2783,15 +2792,24 @@ func TestSeparatorHighlightsWithTreeFocus(t *testing.T) {
 	m.openSelectedNote()
 
 	const accentFg = "\x1b[38;2;127;169;255m"
+	// Focus is marked by the pane frame: the active pane's border lights up
+	// in the accent color while the inactive pane stays dim. The tree pane
+	// owns a left border (┌), the content pane a right border (┐).
 	m.active = treePane
-	withAccent := m.View()
+	treeFocused := m.View()
 	m.active = contentPane
-	withoutAccent := m.View()
-	if !strings.Contains(withAccent, accentFg+"│") {
-		t.Fatal("separator should carry the accent color when the tree pane is focused")
+	contentFocused := m.View()
+	if !strings.Contains(treeFocused, accentFg+"┌") {
+		t.Fatal("focused tree pane should have an accent left border")
 	}
-	if strings.Contains(withoutAccent, accentFg+"│") {
-		t.Fatal("separator should be dim when the content pane is focused")
+	if strings.Contains(treeFocused, accentFg+"┐") {
+		t.Fatal("inactive content pane should not have an accent border")
+	}
+	if !strings.Contains(contentFocused, accentFg+"┐") {
+		t.Fatal("focused content pane should have an accent right border")
+	}
+	if strings.Contains(contentFocused, accentFg+"┌") {
+		t.Fatal("inactive tree pane should not have an accent border")
 	}
 }
 
@@ -2903,33 +2921,35 @@ func TestPreviewScrollbarAppearsWhenContentOverflows(t *testing.T) {
 	m.editor.SetValue(long)
 	m.renderMarkdown()
 
-	overlay := stripANSI(m.overlayScrollbar(m.preview.View()))
-	rows := strings.Split(overlay, "\n")
-	if len(rows) != m.preview.Height {
-		t.Fatalf("overlay should keep one row per viewport row: %d vs %d", len(rows), m.preview.Height)
-	}
+	const paneW = 64
+	// The thumb lives on the right border: overflowing content must show ▐
+	// glyphs in place of the border on some rows.
+	panel := stripANSI(m.contentViewSides(paneW, false, true))
+	rows := strings.Split(panel, "\n")
 	thumbRows := 0
 	for _, r := range rows {
-		if strings.HasSuffix(r, "▐") {
+		if strings.HasSuffix(r, "┃") {
 			thumbRows++
 		}
 	}
 	if thumbRows == 0 {
-		t.Fatal("overflowing content should show the thumb hugging the right edge")
+		t.Fatal("overflowing content should show the thumb inside the right border:\n" + panel)
 	}
-	if lipgloss.Width(rows[0]) != m.preview.Width {
-		t.Fatalf("overlay must not widen the preview beyond %d, got %d", m.preview.Width, lipgloss.Width(rows[0]))
+	for i, r := range rows {
+		if w := lipgloss.Width(r); w != paneW {
+			t.Fatalf("row %d width %d, want %d: %q", i, w, paneW, r)
+		}
 	}
 
-	// Short content: returned unchanged, no thumb.
+	// Short content: no thumb anywhere.
 	short, _ := store.CreateNote("", "short")
 	m.selectPath(short)
 	m.openSelectedNote()
 	m.editor.SetValue("tiny\n")
 	m.renderMarkdown()
-	before := m.preview.View()
-	if m.overlayScrollbar(before) != before {
-		t.Fatal("fitting content should be returned unchanged")
+	shortPanel := stripANSI(m.contentViewSides(paneW, false, true))
+	if strings.Contains(shortPanel, "┃") {
+		t.Fatal("fitting content should not show a thumb")
 	}
 }
 

@@ -14,11 +14,11 @@ import (
 
 // backupManifest is stored inside each backup zip to describe its contents.
 type backupManifest struct {
-	Version   string            `json:"version"`
-	CreatedAt string            `json:"createdAt"`
-	Notes     []backupNoteEntry `json:"notes"`
+	Version   string              `json:"version"`
+	CreatedAt string              `json:"createdAt"`
+	Notes     []backupNoteEntry   `json:"notes"`
 	Tags      map[string][]string `json:"tags,omitempty"`
-	Pinned    map[string]bool   `json:"pinned,omitempty"`
+	Pinned    map[string]bool     `json:"pinned,omitempty"`
 }
 
 type backupNoteEntry struct {
@@ -29,11 +29,11 @@ type backupNoteEntry struct {
 
 // backupStats summarizes all notes for the status bar.
 type backupStats struct {
-	NoteCount  int
+	NoteCount   int
 	FolderCount int
-	ImageCount int
-	TotalWords int
-	TotalChars int
+	ImageCount  int
+	TotalWords  int
+	TotalChars  int
 }
 
 // collectBackupStats walks the store and produces summary statistics.

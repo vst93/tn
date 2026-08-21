@@ -77,8 +77,8 @@ func TestTreePaneSelectedRowFullWidthHighlight(t *testing.T) {
 	m.resize(100, 30)
 	m.selectPath(note)
 
-	// Build the borderless tree pane lines.
-	raw := truncateToHeight(m.treePaneLines(100), m.bodyHeight)
+	// Build the bordered tree pane.
+	raw := m.treeViewSides(100, true, true)
 
 	// Print the raw selected row for inspection
 	for _, l := range strings.Split(raw, "\n") {

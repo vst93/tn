@@ -62,6 +62,8 @@ const (
 	modeBackup
 	modeImport
 	modeMarkdown
+	modeGitConfig
+	modeGitHistory
 )
 
 type promptKind int
@@ -281,7 +283,7 @@ var helpGroupsData = []helpGroup{
 			{"Ctrl+O", "Quick open note"},
 			{"Tab", "Switch panel"},
 			{"t", "Toggle tree visibility"},
-			{"Alt+← / Alt+→", "Back / forward history"},
+			{"Ctrl+← / Ctrl+→", "Back / forward history"},
 			{"F / B", "Page preview down / up"},
 			{"f", "Find in note"},
 		},
@@ -301,7 +303,7 @@ var helpGroupsData = []helpGroup{
 			{"Ctrl+Shift+Z / Ctrl+Y", "Redo"},
 			{"Ctrl+Shift+T", "Edit tags"},
 			{"#", "Filter by tag"},
-			{"Ctrl+Shift+P", "Command palette"},
+			{"Ctrl+P", tr("Command palette", "命令面板")},
 		},
 	},
 	{
@@ -309,32 +311,46 @@ var helpGroupsData = []helpGroup{
 		rows: []helpRow{
 			{"y", "Copy note (preview)"},
 			{"Ctrl+C", "Copy selection (edit) / quit"},
+			{"Ctrl+X", "Cut selection (edit)"},
+			{"Ctrl+V", "Paste"},
+			{"Ctrl+A", "Select all (edit)"},
+			{"Shift+Arrows", "Select text (edit)"},
+			{"Mouse drag", "Select text (edit/preview)"},
 			{"Ctrl+L", "Copy current line (edit)"},
-			{"Ctrl+G", "Select terminal text"},
+			{"Ctrl+Shift+X", "Select terminal text"},
 		},
 	},
 	{
 		title: "Search",
 		rows: []helpRow{
 			{"Ctrl+F", "Search note"},
-			{"Ctrl+Shift+O", "Search everywhere"},
-			{"Alt+G", "Go to line"},
+			{"Ctrl+Shift+F", "Search everywhere"},
+			{"Ctrl+Shift+J", "Go to line"},
 		},
 	},
 	{
 		title: "Data",
 		rows: []helpRow{
 			{"Ctrl+Shift+E", "Export note"},
-			{"Alt+H", "Export as HTML"},
+			{"Ctrl+Shift+H", "Export as HTML"},
 			{"Ctrl+Shift+B", "Backup notes"},
 			{"Ctrl+Shift+I", "Import from backup"},
+		},
+	},
+	{
+		title: "Git 同步",
+		rows: []helpRow{
+			{"Ctrl+Shift+G", "同步设置（远程/分支/自动）"},
+			{"P", "推送"},
+			{"L", "拉取"},
+			{"H", "笔记历史版本 / 回退"},
 		},
 	},
 	{
 		title: "App",
 		rows: []helpRow{
 			{"Ctrl+Shift+F", "Focus mode"},
-			{"Alt+T", "Switch theme"},
+			{"Ctrl+Shift+S", "Switch theme"},
 			{"Ctrl+R", "Refresh"},
 			{"Ctrl+Q / Ctrl+C", "Quit (dirty: Ctrl+C twice force-quits)"},
 			{"?", "Help"},
@@ -490,6 +506,9 @@ type Model struct {
 	lastEditTime time.Time
 
 	helpHintView viewport.Model
+	helpIndex    int
+	helpVisible  []helpRow
+	helpSelLine  int
 	helpHintQ    string
 
 	commandBeforeMode   mode
@@ -498,6 +517,16 @@ type Model struct {
 	commandQuery        string
 	markdownIndex       int
 	markdownQuery       string
+	markdownFromSlash   bool
+
+	gitConfig      GitSyncConfig
+	gitConfigStep  int
+	gitVersions    []GitVersion
+	gitHistoryIdx  int
+	gitViewing     bool
+	gitViewContent string
+	gitViewScroll  int
+	lastGitSync    time.Time
 
 	webdavInputStep int
 	webdavConfig    WebDAVConfig
@@ -508,6 +537,8 @@ type Model struct {
 
 	lastCtrlC time.Time
 
+	editDragging bool
+
 	targetPath  string
 	pathFocused bool
 }
@@ -517,6 +548,11 @@ func New(store *storage.Store) Model {
 	editor.Placeholder = "Write Markdown here…"
 	editor.ShowLineNumbers = true
 	editor.CharLimit = 0
+	// bubbles defaults MaxHeight to 99 rows, after which Enter silently stops
+	// inserting newlines and multi-line pastes get truncated. Lift the cap:
+	// the editor viewport height is controlled by SetHeight, MaxHeight only
+	// limits content growth.
+	editor.MaxHeight = 0
 	editor.SetWidth(60)
 	editor.SetHeight(20)
 	editor.FocusedStyle.Base = lipgloss.NewStyle().Foreground(text).Background(bg)
@@ -548,10 +584,12 @@ func New(store *storage.Store) Model {
 		preview:       viewport.New(60, 20),
 		input:         input,
 		copier:        copyText,
-		status:        "Ready",
+		status:        tr("Ready", "就绪"),
 		sessionPath:   sessionPathFor(store.Root),
 		helpHintView:  viewport.New(60, 20),
 	}
+	loadUiPrefs(sessionPathFor(store.Root))
+	m.status = tr("Ready", "就绪")
 	m.preview.MouseWheelEnabled = true
 	m.preview.MouseWheelDelta = 2
 	// Preview paging: Space page down, B page up (Shift+F / Shift+B also work).
@@ -657,6 +695,7 @@ func (m Model) saveSession() {
 	if m.sessionPath == "" {
 		return
 	}
+	saveUiPrefs(m.sessionPath)
 	s := SessionState{
 		CurrentPath: m.currentPath,
 		CursorRow:   m.cursorPos().row,
@@ -721,7 +760,7 @@ func (m *Model) setCursorAt(offset int) {
 	m.editor.SetCursor(col)
 }
 
-func (m Model) Init() tea.Cmd { return tea.Batch(textarea.Blink, autoSaveCmd()) }
+func (m Model) Init() tea.Cmd { return tea.Batch(textarea.Blink, autoSaveCmd(), gitSyncTickCmd()) }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
@@ -827,6 +866,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.mode == modeWebdavConfig {
 			return m.updateWebdavConfig(msg)
 		}
+		if m.mode == modeGitConfig {
+			return m.updateGitConfig(msg)
+		}
+		if m.mode == modeGitHistory {
+			return m.updateGitHistory(msg)
+		}
 
 		if handled, quit := m.globalKey(key); handled {
 			if quit {
@@ -854,6 +899,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// or after a blank) so typing paths, URLs or dates mid-word keeps
 				// every key — Enter included — flowing into the editor.
 				m.startMarkdown()
+				m.markdownFromSlash = true
 				// Continue to let the slash be inserted into editor below
 				m.editSel = nil
 				m.editor, cmd = m.editor.Update(msg)
@@ -873,6 +919,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.recordEdit(before, m.editor.Value(), beforePos, m.cursorPos())
 						return m, cmd
 					}
+					if m.editSel != nil {
+						// Paste replaces the selection like a normal text editor.
+						m.deleteSelection()
+					}
+				case tea.KeyCtrlX:
+					m.cutSelection()
+					return m, m.takePending()
+				case tea.KeyCtrlA:
+					m.selectAll()
+					return m, nil
 				case tea.KeyCtrlLeft:
 					m.wordLeft()
 					m.editSel = nil
@@ -951,7 +1007,28 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 		}
-		return m, tea.Batch(webdavSyncCmd(), m.takePending())
+		return m, tea.Batch(webdavSyncCmd(), gitSyncTickCmd(), m.takePending())
+	case gitSyncTickMsg:
+		// Auto-sync: push in the background when enabled and due. Never fires
+		// while the user is mid-edit to avoid yanking the buffer.
+		config := loadGitSyncConfig(m.store.Root)
+		if config.AutoSync && config.AutoMins > 0 && m.mode != modeEdit && !m.dirty() {
+			now := time.Now()
+			if !m.lastGitSync.IsZero() && now.Sub(m.lastGitSync) < time.Duration(config.AutoMins)*time.Minute {
+				return m, gitSyncTickCmd()
+			}
+			m.lastGitSync = now
+			root, cfg := m.store.Root, config
+			return m, tea.Batch(gitActionCmd("自动同步", func() (string, error) { return gitPush(root, cfg) }), gitSyncTickCmd(), m.takePending())
+		}
+		return m, gitSyncTickCmd()
+	case gitResultMsg:
+		if msg.err != nil {
+			m.flashStatus(msg.action+"失败: "+msg.err.Error(), true, 4*time.Second)
+		} else {
+			m.flashStatus(msg.detail, false, 3*time.Second)
+		}
+		return m, m.takePending()
 	}
 
 	if m.mode == modeEdit {
@@ -1011,7 +1088,7 @@ func (m *Model) globalKey(key string) (handled, quit bool) {
 		}
 		m.startExport()
 		return true, false
-	case "alt+h":
+	case "ctrl+shift+h", "alt+h":
 		if m.mode == modeEdit {
 			return false, false
 		}
@@ -1082,14 +1159,14 @@ func (m *Model) globalKey(key string) (handled, quit bool) {
 		}
 		m.saveSession()
 		return true, true
-	case "alt+left":
-		if m.mode == modeEdit {
+	case "alt+left", "ctrl+left":
+		if m.mode != modeNormal {
 			return false, false
 		}
 		m.goBack()
 		return true, false
-	case "alt+right":
-		if m.mode == modeEdit {
+	case "alt+right", "ctrl+right":
+		if m.mode != modeNormal {
 			return false, false
 		}
 		m.goForward()
@@ -1097,13 +1174,13 @@ func (m *Model) globalKey(key string) (handled, quit bool) {
 	case "*":
 		m.togglePinned()
 		return true, false
-	case "ctrl+shift+o":
+	case "ctrl+shift+f", "ctrl+shift+o":
 		m.startGlobalSearch()
 		return true, false
 	case "ctrl+o":
 		m.startQuickOpen()
 		return true, false
-	case "ctrl+shift+f":
+	case "ctrl+shift+l":
 		m.toggleFocus()
 		return true, false
 	case "ctrl+shift+t":
@@ -1140,7 +1217,13 @@ func (m *Model) globalKey(key string) (handled, quit bool) {
 			return true, false
 		}
 		return false, false
-	case "ctrl+g":
+	case "ctrl+g", "ctrl+shift+j":
+		if m.mode == modeEdit {
+			return false, false
+		}
+		m.startGotoLine()
+		return true, false
+	case "ctrl+shift+x":
 		if m.mode == modeEdit {
 			return false, false
 		}
@@ -1170,7 +1253,7 @@ func (m *Model) globalKey(key string) (handled, quit bool) {
 	case "#":
 		m.startTagFilter()
 		return true, false
-	case "ctrl+shift+p":
+	case "ctrl+p", "ctrl+shift+p":
 		m.startCommand()
 		return true, false
 	case "ctrl+shift+b":
@@ -1178,6 +1261,30 @@ func (m *Model) globalKey(key string) (handled, quit bool) {
 			return false, false
 		}
 		m.startBackup()
+		return true, false
+	case "ctrl+shift+g":
+		if m.mode == modeEdit {
+			return false, false
+		}
+		m.startGitConfig()
+		return true, false
+	case "P":
+		if m.mode != modeNormal {
+			return false, false
+		}
+		m.gitPushNow()
+		return true, false
+	case "L":
+		if m.mode != modeNormal {
+			return false, false
+		}
+		m.gitPullNow()
+		return true, false
+	case "H":
+		if m.mode != modeNormal || m.currentPath == "" {
+			return false, false
+		}
+		m.startGitHistory()
 		return true, false
 	case "ctrl+shift+i":
 		if m.mode == modeEdit {
@@ -1188,7 +1295,7 @@ func (m *Model) globalKey(key string) (handled, quit bool) {
 	case "ctrl+shift+w":
 		m.syncWebdavNow()
 		return true, false
-	case "alt+t":
+	case "ctrl+shift+s", "alt+t":
 		nextTheme()
 		m.refresh(m.currentPath)
 		m.flashStatus("Theme: "+currentTheme().Name, false, 1500*time.Millisecond)
@@ -1314,10 +1421,27 @@ func (m *Model) handleMouse(msg tea.MouseEvent) {
 		}
 		return
 	}
+	if m.editDragging {
+		// Editor drag selection: extend toward the pointer, end on release.
+		switch msg.Action {
+		case tea.MouseActionMotion:
+			if pos, ok := m.editorPosAt(msg.X, msg.Y); ok {
+				m.editSel.end = pos
+			}
+		case tea.MouseActionRelease:
+			m.editDragging = false
+		}
+		return
+	}
 	if msg.Action != tea.MouseActionPress && !msg.IsWheel() {
 		return
 	}
 	if msg.Y == 0 && msg.Button == tea.MouseButtonLeft {
+		if !m.treeVisible && msg.X <= 3 {
+			// ❯ glyph: reopen the closed list pane.
+			m.toggleTree()
+			return
+		}
 		if p, ok := m.headerTabAt(msg.X); ok {
 			if p == treePane {
 				m.switchToTree()
@@ -1334,6 +1458,11 @@ func (m *Model) handleMouse(msg tea.MouseEvent) {
 		return
 	}
 	if msg.Y < 1 || msg.Y >= 1+m.bodyHeight {
+		return
+	}
+	// « in the tree pane's top border closes the list pane.
+	if m.treeVisible && msg.Y == 1 && msg.X >= m.treeWidth-4 && msg.X <= m.treeWidth-2 && msg.Button == tea.MouseButtonLeft {
+		m.toggleTree()
 		return
 	}
 
@@ -1369,6 +1498,29 @@ func (m *Model) handleMouse(msg tea.MouseEvent) {
 	}
 
 	m.switchToContent()
+	if m.mode == modeEdit {
+		// Editor interactions: wheel scrolls, click places the cursor and
+		// starts a drag selection.
+		if msg.IsWheel() {
+			key := tea.KeyUp
+			if msg.Button == tea.MouseButtonWheelDown {
+				key = tea.KeyDown
+			}
+			for i := 0; i < 3; i++ {
+				m.editor, _ = m.editor.Update(tea.KeyMsg{Type: key})
+			}
+			return
+		}
+		if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
+			if pos, ok := m.editorPosAt(msg.X, msg.Y); ok {
+				m.setCursor(pos.row, pos.col)
+				m.editSel = &editorSel{anchor: pos, end: pos}
+				m.editDragging = true
+			}
+			return
+		}
+		return
+	}
 	if m.mode == modeNormal && msg.Button == tea.MouseButtonLeft {
 		if off := m.contentOffsetAt(msg.X, msg.Y); off >= 0 {
 			m.contentSelAnchor = off
@@ -1392,11 +1544,10 @@ func (m Model) contentOffsetAt(x, y int) int {
 	if m.mode != modeNormal || m.currentPath == "" || m.renderedPlain == "" {
 		return -1
 	}
-	// Borderless panes: content text starts right after the divider column
-	// (or at the screen edge in compact mode).
-	left := 0
+	// Panels pad their content by one column inside the border.
+	left := 2
 	if !m.compact && m.treeVisible {
-		left = m.treeWidth + 1
+		left = m.treeWidth + 2
 	}
 	if x < left || x >= left+m.preview.Width || y < 2 || y >= m.bodyHeight {
 		return -1
@@ -2117,6 +2268,227 @@ func (m *Model) selectionRange() (int, int) {
 	}
 	return from, to
 }
+
+// editorRowMap describes one visual row of the rendered editor: the logical
+// line it belongs to, the rune column where this visual row starts inside that
+// line, and the gutter width (bar + line number + padding) in cells.
+type editorRowMap struct {
+	line     int
+	startCol int
+	gutter   int
+	numbered bool
+}
+
+// parseEditorRows maps every visual row of a rendered editor view to its
+// logical position. Numbered rows start a logical line; unnumbered non-blank
+// rows are soft-wrap continuations of the previous line; blank filler rows at
+// the bottom are skipped.
+func parseEditorRows(view string) []editorRowMap {
+	rows := strings.Split(view, "\n")
+	out := make([]editorRowMap, 0, len(rows))
+	gutter := 0
+	line, startCol := -1, 0
+	for _, raw := range rows {
+		plain := stripANSI(raw)
+		if plain == "" {
+			break // past the last content row
+		}
+		num, hasNum := editorRowNumber(plain)
+		if hasNum {
+			line = num - 1 // rendered numbers are 1-based
+			startCol = 0
+			if g := editorGutterOf(plain); g > 0 {
+				gutter = g
+			}
+		} else if line < 0 || gutter <= 0 {
+			continue // wrapped continuation before any numbered row
+		}
+		out = append(out, editorRowMap{line: line, startCol: startCol, gutter: gutter})
+		content := []rune(plain)
+		if hasNum && len(content) <= gutter {
+			// Numbered row with empty content: nothing to advance.
+			continue
+		}
+		if !hasNum && strings.TrimSpace(string(content[min(gutter, len(content)):])) == "" {
+			// Blank unnumbered row: wrap continuation of an empty segment or
+			// bottom filler; nothing to advance.
+			continue
+		}
+		startCol += max(0, len(content)-gutter)
+	}
+	return out
+}
+
+// editorRowNumber extracts the 0-based logical line number from a rendered
+// editor row, if this row carries one.
+func editorRowNumber(plain string) (int, bool) {
+	runes := []rune(plain)
+	i := 1 // skip the bar character
+	for i < len(runes) && runes[i] == ' ' {
+		i++
+	}
+	digitStart := i
+	for i < len(runes) && runes[i] >= '0' && runes[i] <= '9' {
+		i++
+	}
+	if i == digitStart || i >= len(runes) || runes[i] != ' ' {
+		return 0, false
+	}
+	n := 0
+	for _, d := range runes[digitStart:i] {
+		n = n*10 + int(d-'0')
+	}
+	return n, true
+}
+
+// editorGutterOf returns the cell width of the gutter on a numbered row:
+// bar + right-aligned number + separating space.
+func editorGutterOf(plain string) int {
+	runes := []rune(plain)
+	i := 1
+	for i < len(runes) && runes[i] == ' ' {
+		i++
+	}
+	for i < len(runes) && runes[i] >= '0' && runes[i] <= '9' {
+		i++
+	}
+	if i >= len(runes) || runes[i] != ' ' {
+		return 0
+	}
+	return i + 1
+}
+
+// editorOrigin is the screen coordinate of the first editor content cell.
+func (m Model) editorOrigin() (int, int) {
+	x0, y0 := 2, 2 // border + padding, top border + meta row
+	if !m.compact && m.treeVisible {
+		x0 = m.treeWidth + 2 // separator column + padding (no left border)
+	}
+	if len(m.nodeTags[m.currentPath]) > 0 {
+		y0 = 3 // extra tags row
+	}
+	return x0, y0
+}
+
+// editorPosAt maps a screen position to an editor cursor position. It uses
+// the editor's current rendering, so it stays valid while scrolled.
+func (m Model) editorPosAt(x, y int) (cursorPos, bool) {
+	x0, y0 := m.editorOrigin()
+	rows := parseEditorRows(m.editor.View())
+	visual := y - y0
+	if visual < 0 || visual >= len(rows) {
+		return cursorPos{}, false
+	}
+	rm := rows[visual]
+	lines := strings.Split(m.editor.Value(), "\n")
+	if rm.line < 0 || rm.line >= len(lines) {
+		return cursorPos{}, false
+	}
+	col := x - x0 - rm.gutter
+	maxCol := len([]rune(lines[rm.line]))
+	if col < 0 {
+		col = 0
+	}
+	if rm.startCol+col > maxCol {
+		col = maxCol - rm.startCol
+	}
+	if col < 0 {
+		col = 0
+	}
+	return cursorPos{row: rm.line, col: rm.startCol + col}, true
+}
+
+// editorView renders the editor with the active selection highlighted.
+func (m Model) editorView() string {
+	view := m.editor.View()
+	if m.editSel == nil || m.mode != modeEdit {
+		return view
+	}
+	start, end := m.editSel.anchor, m.editSel.end
+	if start.row > end.row || (start.row == end.row && start.col > end.col) {
+		start, end = end, start
+	}
+	rows := strings.Split(view, "\n")
+	maps := parseEditorRows(view)
+	for i := range rows {
+		if i >= len(maps) {
+			break
+		}
+		rm := maps[i]
+		if rm.line < start.row || rm.line > end.row {
+			continue
+		}
+		plain := stripANSI(rows[i])
+		if _, hasNum := editorRowNumber(plain); !hasNum && strings.TrimSpace(plain) == "" {
+			continue // bottom filler
+		}
+		lines := strings.Split(m.editor.Value(), "\n")
+		if rm.line >= len(lines) {
+			continue
+		}
+		rows[i] = lipgloss.NewStyle().Background(selection).Render(plain)
+	}
+	return strings.Join(rows, "\n")
+}
+
+// selectAll selects the entire document.
+func (m *Model) selectAll() {
+	lines := strings.Split(m.editor.Value(), "\n")
+	end := cursorPos{row: len(lines) - 1, col: len([]rune(lines[len(lines)-1]))}
+	m.editSel = &editorSel{anchor: cursorPos{row: 0, col: 0}, end: end}
+}
+
+// deleteSelection removes the selected span and leaves the cursor at its start.
+func (m *Model) deleteSelection() {
+	from, to := m.selectionRange()
+	if from < 0 || to <= from {
+		return
+	}
+	before := m.editor.Value()
+	runes := []rune(before)
+	val := string(runes[:from]) + string(runes[to:])
+	beforePos := m.cursorPos()
+	m.editor.SetValue(val)
+	row, col := offsetToCursorPos(val, from)
+	m.setCursor(row, col)
+	m.editSel = nil
+	m.recordEdit(before, val, beforePos, m.cursorPos())
+}
+
+// cutSelection copies the selection to the clipboard and deletes it.
+func (m *Model) cutSelection() {
+	if m.editSel == nil {
+		return
+	}
+	text := m.selectionText()
+	if text == "" {
+		return
+	}
+	m.deleteSelection()
+	m.startCopy(text)
+}
+
+// offsetToCursorPos converts a rune offset into a logical cursor position.
+func offsetToCursorPos(s string, offset int) (int, int) {
+	if offset < 0 {
+		return 0, 0
+	}
+	runes := []rune(s)
+	if offset > len(runes) {
+		offset = len(runes)
+	}
+	row, col := 0, 0
+	for _, r := range runes[:offset] {
+		if r == '\n' {
+			row++
+			col = 0
+		} else {
+			col++
+		}
+	}
+	return row, col
+}
+
 func (m Model) selectionText() string {
 	if m.editSel == nil {
 		return ""
@@ -2222,6 +2594,7 @@ func (m *Model) toggleTree() {
 	m.treeVisible = !m.treeVisible
 	if !m.treeVisible {
 		m.active = contentPane
+		m.setStatus(tr("List closed · click » (top-left) to reopen", "列表已关闭 · 点击左上角 » 重新打开"), false)
 	}
 	m.resize(m.width, m.height)
 }
@@ -2270,7 +2643,7 @@ func (m *Model) openSelectedNote() {
 		return
 	}
 	m.pushHistory(path)
-	m.flashStatus("Opened "+path, false, 2*time.Second)
+	m.flashStatus(tr("Opened ", "已打开")+path, false, 2*time.Second)
 }
 
 // openPath loads a note into the editor and preview without recording history.
@@ -2916,9 +3289,9 @@ func (m *Model) leaveEdit() {
 	m.setEditorBackground(bg)
 	m.renderMarkdown()
 	if m.dirty() {
-		m.setStatus("Unsaved changes · Ctrl+S to save", false)
+		m.setStatus(tr("Unsaved changes · Ctrl+S to save", "有未保存更改 · Ctrl+S 保存"), false)
 	} else {
-		m.setStatus("Preview mode", false)
+		m.setStatus(tr("Preview mode", "预览模式"), false)
 	}
 }
 
@@ -3063,7 +3436,7 @@ func (m Model) focusView() string {
 
 	var body string
 	if m.mode == modeEdit {
-		body = m.editor.View()
+		body = m.editorView()
 	} else {
 		body = m.preview.View()
 	}
@@ -3675,11 +4048,18 @@ func (m *Model) scrollPreviewToLine(line0 int) {
 }
 
 func (m *Model) adjustPreviewHeight() {
-	base := max(1, m.bodyHeight-2) // title + meta rows
+	base := max(1, m.contentHeight()-2) // meta row + panel frame
 	if m.mode == modeSearch {
 		base = max(1, base-1)
 	}
+	if m.preview.Height == base {
+		return
+	}
 	m.preview.Height = base
+	// Growing the viewport shrinks the maximum scroll offset; re-clamp so a
+	// bottom-anchored view (restored session or resized terminal) follows the
+	// content instead of scrolling past it and leaving blank rows below.
+	m.preview.SetYOffset(m.preview.YOffset)
 }
 
 func (m *Model) startGotoLine() {
@@ -4075,7 +4455,7 @@ func (m *Model) ensureSelectionVisible() {
 	m.treeOffset = max(0, m.treeOffset)
 }
 
-func (m *Model) treeRows() int { return max(1, m.bodyHeight-1) } // title row takes one
+func (m *Model) treeRows() int { return max(1, m.bodyHeight-2) } // title sits in the top border
 
 func (m *Model) resize(width, height int) {
 	m.width, m.height = max(1, width), max(1, height)
@@ -4107,16 +4487,17 @@ func (m *Model) resize(width, height int) {
 		m.treeWidth = max(28, min(36, m.width/3))
 	}
 
-	// Borderless layout: the content pane owns every column right of the
-	// divider, and its rows are title + meta + content.
+	// Panels pad their content by one column inside each border they draw; in
+	// the split layout the content pane leans on the shared separator instead
+	// of a left border, so it gets one column more.
 	contentWidth := m.width
-	innerWidth := max(10, contentWidth)
+	innerWidth := max(10, contentWidth-4)
 	if !m.compact && m.treeVisible {
 		contentWidth = max(1, m.width-m.treeWidth-1)
-		innerWidth = max(10, contentWidth)
+		innerWidth = max(10, contentWidth-3)
 	}
 	m.editor.SetWidth(innerWidth)
-	m.editor.SetHeight(max(1, m.bodyHeight-2))
+	m.editor.SetHeight(max(1, m.contentHeight()-2))
 	m.preview.Width = innerWidth
 	m.adjustPreviewHeight()
 	m.ensureSelectionVisible()
@@ -4457,6 +4838,10 @@ func (m Model) View() string {
 		view = m.commandView()
 	case m.mode == modeWebdavConfig:
 		view = m.webdavConfigView()
+	case m.mode == modeGitConfig:
+		view = m.gitConfigView()
+	case m.mode == modeGitHistory:
+		view = m.gitHistoryView()
 	case m.mode == modeExport:
 		view = m.exportDialogView()
 	case m.mode == modeBackup:
@@ -4517,6 +4902,7 @@ func paintBackground(view string, width, height int) string {
 }
 
 // sgrRe matches ANSI SGR escape sequences.
+
 var sgrRe = regexp.MustCompile(`\x1b\[[0-9;]*m`)
 
 // repaintLineBackgrounds re-arms backgrounds after every SGR reset using a
@@ -4590,18 +4976,17 @@ func (m Model) workbenchView() string {
 		body = m.contentView(m.width)
 	} else {
 		contentW := max(1, m.width-m.treeWidth-1)
-		// A single divider column separates the panes; it reads as the tree
-		// pane's inner edge, so it lights up with the tree's focus color.
-		sepColor := rule
-		if m.active == treePane {
-			sepColor = accent
-		}
-		separator := lipgloss.NewStyle().Foreground(sepColor).Render(
-			strings.Repeat("│\n", max(1, m.bodyHeight-1))+"│")
+		// Two bordered panes share a single separator column; the first and
+		// last cells are tees that join the panes' top and bottom borders.
+		// The separator is the active pane's inner edge, so it always lights
+		// up with the focus color — whichever side is active, its frame reads
+		// as complete instead of dying into a dim line mid-screen.
+		rows := max(2, m.bodyRenderHeight())
+		separator := "┬\n" + strings.Repeat("│\n", rows-2) + "┴"
 		body = lipgloss.JoinHorizontal(lipgloss.Top,
-			truncateToHeight(m.treePaneLines(m.treeWidth), m.bodyHeight),
-			separator,
-			truncateToHeight(m.contentPaneLines(contentW), m.bodyHeight),
+			m.treeViewSides(m.treeWidth, true, false),
+			lipgloss.NewStyle().Foreground(accent).Render(separator),
+			m.contentViewSides(contentW, false, true),
 		)
 	}
 	var bottom string
@@ -4612,8 +4997,6 @@ func (m Model) workbenchView() string {
 		bottom = m.gotoBarView()
 	case m.mode == modeTagFilter:
 		bottom = m.tagFilterBarView()
-	case m.mode == modeMarkdown:
-		bottom = m.markdownView()
 	default:
 		bottom = m.statusView()
 	}
@@ -4637,8 +5020,14 @@ func (m Model) headerView() string {
 		badge = " " + editBadge.Render(" EDIT ")
 	}
 	right := badge + " " + truncateANSI(name, max(1, m.width-lipgloss.Width(left)-lipgloss.Width(badge)-12))
-	space := max(1, m.width-lipgloss.Width(left)-lipgloss.Width(right)-2)
-	line := " " + left + strings.Repeat(" ", space) + right
+	// When the list pane is closed, a ❯ glyph in the top-left corner reopens
+	// it; clicking that cell lands in handleMouse's hit zone.
+	lead := " "
+	if !m.treeVisible {
+		lead = " " + lipgloss.NewStyle().Background(selection).Foreground(accent).Bold(true).Render(" » ") + " "
+	}
+	space := max(1, m.width-lipgloss.Width(left)-lipgloss.Width(right)-lipgloss.Width(lead)-1)
+	line := lead + left + strings.Repeat(" ", space) + right
 	return lipgloss.NewStyle().Background(surface).Width(m.width).MaxHeight(1).Render(line)
 }
 
@@ -4655,12 +5044,12 @@ func (m Model) headerTabAt(x int) (pane, bool) {
 		}
 		return contentPane, false
 	}
-	notesW := lipgloss.Width(" Lists ")
+	notesW := lipgloss.Width(" " + tr("Lists", "列表") + " ")
 	sep2W := lipgloss.Width(" │ ")
 	contentStart := notesStart + notesW + sep2W
-	contentW := lipgloss.Width(" Preview ")
+	contentW := lipgloss.Width(" " + tr("Preview", "预览") + " ")
 	if m.mode == modeEdit {
-		contentW = lipgloss.Width(" Edit ")
+		contentW = lipgloss.Width(" " + tr("Edit", "编辑") + " ")
 	}
 	if x >= notesStart && x < notesStart+notesW {
 		return treePane, true
@@ -4681,11 +5070,11 @@ func (m Model) headerTabs() string {
 	if m.active == treePane {
 		notesStyle, contentStyle = active, idle
 	}
-	contentLabel := "Preview"
+	contentLabel := tr("Preview", "预览")
 	if m.mode == modeEdit {
-		contentLabel = "Edit"
+		contentLabel = tr("Edit", "编辑")
 	}
-	return notesStyle.Render(" Lists ") + idle.Render(" │ ") + contentStyle.Render(" "+contentLabel+" ")
+	return notesStyle.Render(" "+tr("Lists", "列表")+" ") + idle.Render(" │ ") + contentStyle.Render(" "+contentLabel+" ")
 }
 
 func (m Model) contentTabLabel() string {
@@ -4693,23 +5082,26 @@ func (m Model) contentTabLabel() string {
 	if !m.treeVisible || m.active != treePane {
 		contentStyle = lipgloss.NewStyle().Background(selection).Foreground(accent).Bold(true)
 	}
-	contentLabel := "Preview"
+	contentLabel := tr("Preview", "预览")
 	if m.mode == modeEdit {
-		contentLabel = "Edit"
+		contentLabel = tr("Edit", "编辑")
 	}
 	return contentStyle.Render(" " + contentLabel + " ")
 }
 
 func (m Model) toolbarItems() []toolbarItem {
 	items := []toolbarItem{
-		{"? help", "help"}, {"# tag", "tagfilter"}, {"n note", "note"}, {"N folder", "folder"},
-		{"e edit", "edit"}, {"s save", "save"}, {"y copy", "copy"}, {"f find", "find"},
-		{"^G select", "select"}, {"r rename", "rename"}, {"x delete", "delete"}, {"q quit", "quit"},
+		{"? " + tr("help", "帮助"), "help"}, {"# " + tr("tag", "标签"), "tagfilter"},
+		{"n " + tr("note", "笔记"), "note"}, {"N " + tr("folder", "文件夹"), "folder"},
+		{"e " + tr("edit", "编辑"), "edit"}, {"s " + tr("save", "保存"), "save"},
+		{"y " + tr("copy", "复制"), "copy"}, {"f " + tr("find", "查找"), "find"},
+		{"^⇧X " + tr("select", "选择"), "select"}, {"r " + tr("rename", "重命名"), "rename"},
+		{"x " + tr("delete", "删除"), "delete"}, {"q " + tr("quit", "退出"), "quit"},
 	}
 	if m.compact {
-		label := "→ note"
+		label := "→ " + tr("note", "笔记")
 		if m.active == contentPane {
-			label = "← lists"
+			label = "← " + tr("lists", "列表")
 		}
 		items = append(items, toolbarItem{label, "pane"})
 	} else if m.treeVisible {
@@ -4743,18 +5135,19 @@ func (m Model) toolbarActionAt(x int) string {
 }
 
 func (m Model) treeView(width int) string {
-	return truncateToHeight(m.treePaneLines(width), m.bodyHeight)
+	return m.treeViewSides(width, true, true)
 }
 
-// treePaneLines renders the borderless tree pane: a title row followed by the
-// visible items, exactly bodyHeight rows so it joins the separator column.
-func (m Model) treePaneLines(width int) []string {
-	focused := m.active == treePane
-	titleStyle := lipgloss.NewStyle().Foreground(muted)
-	if focused {
-		titleStyle = lipgloss.NewStyle().Foreground(accent).Bold(true)
+func (m Model) bodyRenderHeight() int {
+	if m.mode == modeSearch {
+		return max(1, m.bodyHeight-1)
 	}
-	title := titleStyle.Render("Lists")
+	return m.bodyHeight
+}
+
+func (m Model) treeViewSides(width int, leftB, rightB bool) string {
+	focused := m.active == treePane
+	title := tr("Lists", "列表")
 	if len(m.flat) > 0 {
 		title += mutedSty.Render(fmt.Sprintf(" · %d", len(m.flat)))
 	}
@@ -4764,8 +5157,10 @@ func (m Model) treePaneLines(width int) []string {
 	if m.tagFilter != "" {
 		title += " · " + lipgloss.NewStyle().Foreground(accent).Render("#"+m.tagFilter)
 	}
-	lines := []string{truncateANSI(title, width)}
-	end := min(len(m.flat), m.treeOffset+m.treeRows())
+	innerWidth := panelInnerWidth(width, leftB, rightB)
+	var lines []string
+	rows := m.treeRows()
+	end := min(len(m.flat), m.treeOffset+rows)
 	for i := m.treeOffset; i < end; i++ {
 		item := m.flat[i]
 		selected := i == m.selected
@@ -4805,9 +5200,9 @@ func (m Model) treePaneLines(width int) []string {
 		}
 		// Depth guides keep deep trees readable without extra chrome.
 		indent := strings.Repeat(paint(rule, false).Render("│")+paint(muted, false).Render(" "), item.depth)
-		row := truncateANSI(indent+label, width)
+		row := truncateANSI(indent+label, innerWidth)
 		if selected {
-			gap := max(0, width-lipgloss.Width(row))
+			gap := max(0, innerWidth-lipgloss.Width(row))
 			row += lipgloss.NewStyle().Background(selection).Render(strings.Repeat(" ", gap))
 		}
 		lines = append(lines, row)
@@ -4815,13 +5210,28 @@ func (m Model) treePaneLines(width int) []string {
 	if len(m.flat) == 0 {
 		key := lipgloss.NewStyle().Foreground(text)
 		lines = append(lines,
-			mutedSty.Render("No notes yet"),
+			mutedSty.Render(tr("No notes yet", "还没有笔记")),
 			"",
-			key.Render("n")+mutedSty.Render("  new note"),
-			key.Render("N")+mutedSty.Render("  new folder"),
+			key.Render("n")+mutedSty.Render("  "+tr("new note", "新建笔记")),
+			key.Render("N")+mutedSty.Render("  "+tr("new folder", "新建文件夹")),
 		)
 	}
-	return lines
+	panel := borderedPanelPart(title, strings.Join(lines, "\n"), width, m.bodyRenderHeight(), focused, leftB, rightB)
+	// A « button set into the top border's right corner closes the list pane;
+	// clicking it lands in handleMouse's hit zone below. The replacement is
+	// done on the raw row (the trailing dash run carries no styling), swapping
+	// two dashes for the two-cell button so the width never changes.
+	borderRows := strings.Split(panel, "\n")
+	rr := []rune(borderRows[0])
+	for j := len(rr) - 2; j >= 1; j-- {
+		if rr[j] == '─' && rr[j+1] == '─' {
+			btn := lipgloss.NewStyle().Foreground(accent).Bold(true).Render("« ")
+			borderRows[0] = string(rr[:j]) + btn + string(rr[j+2:])
+			break
+		}
+	}
+	panel = strings.Join(borderRows, "\n")
+	return panel
 }
 
 // truncateToHeight pads or clips lines to exactly n rows.
@@ -4833,34 +5243,29 @@ func truncateToHeight(lines []string, n int) string {
 }
 
 func (m Model) contentView(width int) string {
-	return truncateToHeight(m.contentPaneLines(width), m.bodyHeight)
+	return m.contentViewSides(width, true, true)
 }
 
-// contentPaneLines renders the borderless note pane: title row, one metadata
-// row, then the editor or preview content.
-func (m Model) contentPaneLines(width int) []string {
+func (m Model) contentViewSides(width int, leftB, rightB bool) string {
 	focused := m.active == contentPane || m.mode == modeEdit
-	titleStyle := lipgloss.NewStyle().Foreground(muted)
-	if focused {
-		titleStyle = lipgloss.NewStyle().Foreground(accent).Bold(true)
-	}
-	title := titleStyle.Render("Note")
+	title := tr("Note", "笔记")
 	if m.currentPath != "" {
-		name := filepath.Base(m.currentPath)
+		title = filepath.Base(m.currentPath)
 		if m.nodePinned[m.currentPath] {
-			name += lipgloss.NewStyle().Foreground(warning).Render(" ★")
+			title += lipgloss.NewStyle().Foreground(warning).Render(" ★")
 		}
 		if m.mode == modeNormal && m.previewLineCount() > m.preview.Height {
 			if pct := m.previewPercent(); pct > 0 {
-				name += mutedSty.Render(fmt.Sprintf(" · %d%%", pct))
+				title += mutedSty.Render(fmt.Sprintf(" · %d%%", pct))
 			}
 		}
-		title = titleStyle.Render(truncateANSI(name, max(4, width)))
 	}
-	lines := []string{title}
 
-	// One quiet metadata row: the header already carries the path and the
+	innerWidth := panelInnerWidth(width, leftB, rightB)
+
+	// One quiet metadata line: the header already carries the path and the
 	// dirty flag, so this row only adds what nothing else shows.
+	var meta string
 	if m.currentPath != "" {
 		content := m.editor.Value()
 		stats := fmt.Sprintf("%d words · %d chars · %d lines · ~%s read",
@@ -4870,18 +5275,22 @@ func (m Model) contentPaneLines(width int) []string {
 			metaLine += mutedSty.Render(" · ") +
 				lipgloss.NewStyle().Foreground(warning).Render("unsaved")
 		}
-		lines = append(lines, truncateANSI(metaLine, width))
+		meta = truncateANSI(metaLine, innerWidth) + "\n"
 		if tags := m.nodeTags[m.currentPath]; len(tags) > 0 {
-			lines = append(lines, m.tagsRow(tags, max(4, width)))
+			meta += m.tagsRow(tags, max(4, innerWidth)) + "\n"
 		}
 	}
 
+	var content string
 	if m.currentPath == "" {
-		lines = append(lines, strings.Split(m.emptyContentView(), "\n")...)
+		content = m.emptyContentView()
+	} else if m.mode == modeMarkdown {
+		// The slash menu floats over the editor, so the editor stays visible.
+		content = m.overlaySlashPopup(m.editorView(), innerWidth)
 	} else if m.mode == modeEdit {
-		lines = append(lines, strings.Split(m.editor.View(), "\n")...)
+		content = m.editorView()
 	} else {
-		preview := m.preview.View()
+		content = m.preview.View()
 		if m.contentDragging {
 			start, end := m.contentSelAnchor, m.contentSelEnd
 			if start > end {
@@ -4890,24 +5299,117 @@ func (m Model) contentPaneLines(width int) []string {
 			if end > start {
 				highlighted := renderSelectionContent(m.renderedContent, m.renderedPlain, start, end)
 				m.preview.SetContent(highlighted)
-				preview = m.preview.View()
+				content = m.preview.View()
 			}
 		}
-		lines = append(lines, strings.Split(m.overlayScrollbar(preview), "\n")...)
 	}
-	return lines
+
+	panel := borderedPanelPart(title, meta+content, width, m.bodyRenderHeight(), focused, leftB, rightB)
+	if m.mode == modeNormal && rightB && m.currentPath != "" {
+		// The scroll thumb lives on the right border itself and costs the
+		// content no columns at all.
+		metaLines := 1
+		if len(m.nodeTags[m.currentPath]) > 0 {
+			metaLines = 2
+		}
+		panel = m.paintScrollbarIntoBorder(panel, metaLines)
+	}
+	return panel
 }
 
-// overlayScrollbar paints the scroll thumb directly onto the preview's last
-// column, so the indicator hugs the panel edge without reserving any width.
-// Content that fits without scrolling is returned unchanged.
-func (m Model) overlayScrollbar(preview string) string {
+// panelInnerWidth is the text width available inside a panel: the border on
+// each requested side plus one column of padding.
+func panelInnerWidth(width int, leftB, rightB bool) int {
+	inner := max(4, width) - 2
+	if leftB {
+		inner--
+	}
+	if rightB {
+		inner--
+	}
+	return max(1, inner)
+}
+
+// borderedPanelPart draws one pane: a titled top border, padded content rows
+// and a bottom border. leftB/rightB select which vertical borders are drawn so
+// two panes can share a single separator column between them. Focus is marked
+// by the frame itself: the active pane's border lights up in the accent color
+// while the inactive pane stays dim.
+func borderedPanelPart(title, content string, width, height int, focused bool, leftB, rightB bool) string {
+	width, height = max(4, width), max(3, height)
+	borderColor := rule
+	titleColor := muted
+	if focused {
+		borderColor = accent
+		titleColor = accent
+	}
+	inner := panelInnerWidth(width, leftB, rightB)
+	frameWidth := inner + 2
+	innerHeight := max(1, height-2)
+	title = truncateANSI(title, max(1, inner))
+	border := lipgloss.NewStyle().Foreground(borderColor)
+	titleText := border.Render(" ") + lipgloss.NewStyle().Foreground(titleColor).Bold(focused).Render(title) + border.Render(" ")
+	topTail := max(0, frameWidth-lipgloss.Width(titleText))
+	top := ""
+	if leftB {
+		top += border.Render("┌")
+	}
+	top += titleText + border.Render(strings.Repeat("─", topTail))
+	if rightB {
+		top += border.Render("┐")
+	}
+
+	content = fitBlock(content, inner, innerHeight)
+	rows := strings.Split(content, "\n")
+	for i, row := range rows {
+		line := ""
+		if leftB {
+			line += border.Render("│")
+		}
+		line += " " + truncateANSI(row, inner) + strings.Repeat(" ", max(0, inner-lipgloss.Width(row))) + " "
+		if rightB {
+			line += border.Render("│")
+		}
+		rows[i] = line
+	}
+	bottom := ""
+	if leftB {
+		bottom += border.Render("└")
+	}
+	bottom += border.Render(strings.Repeat("─", frameWidth))
+	if rightB {
+		bottom += border.Render("┘")
+	}
+	return top + "\n" + strings.Join(rows, "\n") + "\n" + bottom
+}
+
+// fitBlock clips or pads a block to exactly width×height cells.
+func fitBlock(content string, width, height int) string {
+	lines := strings.Split(content, "\n")
+	if len(lines) > height {
+		lines = lines[:height]
+	}
+	for len(lines) < height {
+		lines = append(lines, "")
+	}
+	for i, line := range lines {
+		lines[i] = truncateANSI(line, width)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// paintScrollbarIntoBorder draws the preview scroll thumb directly on the
+// panel's right border: thumb rows swap the thin dim border glyph for a heavy
+// accent one. The stroke sits in the exact center of the border cell, so the
+// indicator stays symmetric with the frame instead of hanging off its outer
+// edge, and it costs the content zero columns. metaLines is the number of
+// metadata rows sitting between the top border and the first preview row.
+func (m Model) paintScrollbarIntoBorder(panel string, metaLines int) string {
 	total := m.previewLineCount()
 	visible := max(1, m.preview.Height)
 	if total <= visible {
-		return preview
+		return panel // content fits: nothing to indicate
 	}
-	thumb := lipgloss.NewStyle().Foreground(accent).Render("▐")
 	thumbSize := max(1, visible*visible/total)
 	if thumbSize > visible {
 		thumbSize = visible
@@ -4916,17 +5418,15 @@ func (m Model) overlayScrollbar(preview string) string {
 	if maxOffset := total - visible; maxOffset > 0 {
 		pos = m.preview.YOffset * (visible - thumbSize) / maxOffset
 	}
-	rows := strings.Split(preview, "\n")
-	for i := 0; i < len(rows) && i < visible; i++ {
-		if i < pos || i >= pos+thumbSize {
-			continue
+	thumb := lipgloss.NewStyle().Foreground(accent).Bold(true).Render("┃")
+	rows := strings.Split(panel, "\n")
+	for k := 0; k < thumbSize; k++ {
+		idx := 1 + metaLines + pos + k // top border, then meta rows, then preview
+		if idx <= 0 || idx >= len(rows)-1 {
+			continue // never touch the top/bottom border rows
 		}
-		// Pad to one cell short of the viewport, then replace the final cell
-		// with the thumb so it sits flush against the panel border.
-		if pad := m.preview.Width - 1 - termansi.StringWidth(rows[i]); pad > 0 {
-			rows[i] += strings.Repeat(" ", pad)
-		}
-		rows[i] = termansi.Truncate(rows[i], m.preview.Width-1, "") + thumb
+		w := lipgloss.Width(rows[idx])
+		rows[idx] = termansi.Truncate(rows[idx], w-1, "") + thumb
 	}
 	return strings.Join(rows, "\n")
 }
@@ -4942,10 +5442,10 @@ func (m Model) contentHeight() int {
 // two keys that get a note on screen, and nothing else.
 func (m Model) emptyContentView() string {
 	key := lipgloss.NewStyle().Foreground(text)
-	return "\n" + mutedSty.Render("No note open") + "\n\n" +
-		key.Render("n") + mutedSty.Render("  new note") + "\n" +
-		key.Render("N") + mutedSty.Render("  new folder") + "\n" +
-		key.Render("?") + mutedSty.Render("  shortcuts")
+	return "\n" + mutedSty.Render(tr("No note open", "未打开笔记")) + "\n\n" +
+		key.Render("n") + mutedSty.Render("  "+tr("new note", "新建笔记")) + "\n" +
+		key.Render("N") + mutedSty.Render("  "+tr("new folder", "新建文件夹")) + "\n" +
+		key.Render("?") + mutedSty.Render("  "+tr("shortcuts", "快捷键"))
 }
 
 func (m Model) statusView() string {
@@ -5007,7 +5507,9 @@ func (m *Model) editShortcutBar() string {
 		undoSty.Render("Ctrl+Z") +
 		mutedSty.Render(" · ") +
 		redoSty.Render("Ctrl+Shift+Z") +
-		mutedSty.Render(" · Esc · Ctrl+L · Ctrl+V")
+		mutedSty.Render(" · ") +
+		lipgloss.NewStyle().Foreground(accent).Render("Ctrl+X/C/V") +
+		mutedSty.Render(" · Esc · Ctrl+L")
 	mdHints := mutedSty.Render(" · B/I/K")
 	left += mdHints
 	pos := m.cursorPos()
@@ -5122,8 +5624,9 @@ func (m *Model) startHelp() {
 	m.beforeHelp = m.mode
 	m.mode = modeHelp
 	m.helpHintQ = ""
-	m.input.Prompt = "Search: "
-	m.input.Placeholder = "filter shortcuts"
+	m.helpIndex = 0
+	m.input.Prompt = tr("Search: ", "搜索: ")
+	m.input.Placeholder = tr("filter shortcuts", "过滤快捷键")
 	m.input.SetValue("")
 	m.input.Width = max(10, min(50, m.width-12))
 	m.input.Focus()
@@ -5141,30 +5644,170 @@ func (m Model) updateHelp(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case tea.KeyMsg:
 		key := msg.String()
-		if key == "esc" || key == "?" || key == "enter" {
+		if key == "esc" || key == "?" {
 			m.mode = m.beforeHelp
 			m.input.Blur()
 			m.input.Prompt = "› "
 			m.helpHintQ = ""
+			m.helpIndex = 0
 			m.renderHelpContent()
 			m.restoreEditFocus()
 			return m, nil
 		}
 		switch msg.Type {
-		case tea.KeyUp, tea.KeyDown, tea.KeyPgUp, tea.KeyPgDown, tea.KeyHome, tea.KeyEnd:
+		case tea.KeyUp:
+			m.helpIndex = max(0, m.helpIndex-1)
+			m.renderHelpContent()
+			m.scrollHelpToSelection()
+			return m, nil
+		case tea.KeyDown:
+			m.helpIndex = min(len(m.helpVisible)-1, m.helpIndex+1)
+			m.renderHelpContent()
+			m.scrollHelpToSelection()
+			return m, nil
+		case tea.KeyPgUp, tea.KeyPgDown, tea.KeyHome, tea.KeyEnd:
 			updated, _ := m.helpHintView.Update(msg)
 			m.helpHintView = updated
+			return m, nil
+		case tea.KeyEnter:
+			if m.helpIndex >= 0 && m.helpIndex < len(m.helpVisible) {
+				row := m.helpVisible[m.helpIndex]
+				if row.keys == "" {
+					return m, nil
+				}
+				token := firstKeyToken(row.keys)
+				if m.runHelpAction(token) {
+					// The action may open its own dialog; help always closes.
+					m.mode = m.beforeHelp
+					m.input.Blur()
+					m.input.Prompt = "› "
+					m.helpHintQ = ""
+					m.helpIndex = 0
+					m.renderHelpContent()
+					m.restoreEditFocus()
+					return m, m.takePending()
+				}
+			}
 			return m, nil
 		}
 		var cmd tea.Cmd
 		m.input, cmd = m.input.Update(msg)
 		if q := m.input.Value(); q != m.helpHintQ {
 			m.helpHintQ = q
+			m.helpIndex = 0
 			m.renderHelpContent()
 		}
 		return m, cmd
 	}
 	return m, nil
+}
+
+// firstKeyToken extracts the primary key of a help row: the part before the
+// first "/"-separated alternative or "or"-listed variant.
+func firstKeyToken(keys string) string {
+	t := keys
+	if i := strings.Index(t, " / "); i >= 0 {
+		t = t[:i]
+	}
+	if i := strings.Index(t, " or "); i >= 0 {
+		t = t[:i]
+	}
+	return strings.TrimSpace(t)
+}
+
+// runHelpAction dispatches a help row's primary key to the matching command.
+// Only unambiguous global commands are executable from the help overlay.
+func (m *Model) runHelpAction(token string) bool {
+	switch token {
+	case "n", "Ctrl+N":
+		m.startPrompt(promptNote)
+	case "N", "Ctrl+D":
+		m.startPrompt(promptDir)
+	case "F2", "R":
+		m.startPrompt(promptRename)
+	case "Delete", "X":
+		m.startDelete()
+	case "*":
+		m.togglePinned()
+	case "Ctrl+E", "e":
+		m.toggleEdit()
+	case "Ctrl+S", "s":
+		m.save()
+	case "Ctrl+Z":
+		m.undo()
+	case "Ctrl+Shift+Z", "Ctrl+Y":
+		m.redo()
+	case "Ctrl+O":
+		m.startQuickOpen()
+	case "Ctrl+Shift+F", "Ctrl+Shift+O":
+		m.startGlobalSearch()
+	case "f", "Ctrl+F":
+		m.startSearch()
+	case "y":
+		m.copyCurrent()
+	case "Ctrl+L":
+		m.copyCurrentLine()
+	case "t":
+		m.toggleTree()
+	case "Ctrl+Shift+L":
+		m.toggleFocus()
+	case "Ctrl+Shift+P":
+		m.startCommand()
+	case "#":
+		m.startTagFilter()
+	case "Ctrl+Shift+E":
+		if m.currentPath == "" {
+			m.flashStatus(tr("Open a note first", "请先打开笔记"), true, 2*time.Second)
+			return false
+		}
+		m.startExport()
+	case "Ctrl+Shift+H":
+		if m.currentPath == "" {
+			m.flashStatus(tr("Open a note first", "请先打开笔记"), true, 2*time.Second)
+			return false
+		}
+		m.startHTMLExport()
+	case "Ctrl+Shift+B":
+		m.startBackup()
+	case "Ctrl+Shift+I":
+		m.startImport()
+	case "Ctrl+Shift+G":
+		m.startGitConfig()
+	case "P":
+		m.gitPushNow()
+	case "L":
+		m.gitPullNow()
+	case "H":
+		if m.currentPath == "" {
+			m.flashStatus(tr("Open a note first", "请先打开笔记"), true, 2*time.Second)
+			return false
+		}
+		m.startGitHistory()
+	case "Ctrl+Shift+S":
+		nextTheme()
+		m.renderHelpContent()
+	case "Ctrl+G", "Ctrl+Shift+J":
+		m.startGotoLine()
+	case "Ctrl+Shift+X":
+		m.enterSelectionMode()
+	default:
+		return false
+	}
+	return true
+}
+
+// scrollHelpToSelection keeps the highlighted row inside the viewport.
+func (m *Model) scrollHelpToSelection() {
+	line := m.helpSelLine
+	if line < 0 {
+		return
+	}
+	h := max(1, m.helpHintView.Height)
+	if line < m.helpHintView.YOffset {
+		m.helpHintView.SetYOffset(line)
+	} else if line >= m.helpHintView.YOffset+h {
+		m.helpHintView.SetYOffset(line - h + 1)
+	}
 }
 
 // renderHelpContent lays the shortcut list into the help viewport. The height
@@ -5186,8 +5829,10 @@ func (m Model) helpBoxWidth() int {
 }
 
 // helpContent renders the shortcut list, keys in an aligned column so the
-// descriptions read as a single list rather than ragged pairs.
-func (m Model) helpContent() string {
+// descriptions read as a single list rather than ragged pairs. The visible
+// rows are stashed on the model so the selection can highlight and execute
+// them; group titles are rendered between entries but are not selectable.
+func (m *Model) helpContent() string {
 	q := strings.ToLower(strings.TrimSpace(m.helpHintQ))
 	groups := make([][]helpRow, len(helpGroupsData))
 	keyWidth, total := 0, 0
@@ -5202,32 +5847,55 @@ func (m Model) helpContent() string {
 		}
 	}
 	keyWidth = min(keyWidth, max(8, m.helpHintView.Width/2))
+
+	m.helpVisible = m.helpVisible[:0]
+	m.helpSelLine = -1
 	var b strings.Builder
+	lineNo := 0
 	keySty := lipgloss.NewStyle().Foreground(text)
+	selClamped := false
 	for i, rows := range groups {
 		if len(rows) == 0 {
 			continue
 		}
-		b.WriteString(mutedSty.Render(helpGroupsData[i].title) + "\n")
+		b.WriteString(mutedSty.Render(tr(helpGroupsData[i].title, helpGroupTitleZh(helpGroupsData[i].title))) + "\n")
+		lineNo++
 		for _, r := range rows {
 			pad := max(1, keyWidth-lipgloss.Width(r.keys)+2)
-			b.WriteString("  " + keySty.Render(r.keys) + strings.Repeat(" ", pad) +
-				mutedSty.Render(r.desc) + "\n")
+			line := "  " + keySty.Render(r.keys) + strings.Repeat(" ", pad) +
+				tr(r.desc, helpRowDescZh(r))
+			if len(m.helpVisible) == m.helpIndex {
+				b.WriteString(lipgloss.NewStyle().Background(selection).Foreground(accent).Bold(true).
+					Render("▸"+line[1:]) + "\n")
+				m.helpSelLine = lineNo
+				selClamped = true
+			} else {
+				b.WriteString(line + "\n")
+			}
+			m.helpVisible = append(m.helpVisible, r)
+			lineNo++
 		}
 		b.WriteString("\n")
+		lineNo++
 	}
 	if q != "" && total == 0 {
-		b.WriteString(errorSty.Render("No matching shortcuts"))
+		m.helpVisible = nil
+		m.helpSelLine = -1
+		b.WriteString(errorSty.Render(tr("No matching shortcuts", "没有匹配的快捷键")))
+	}
+	// Keep the selection within range; drop leftover out-of-range index.
+	if !selClamped && m.helpIndex >= len(m.helpVisible) {
+		m.helpIndex = max(0, len(m.helpVisible)-1)
 	}
 	return b.String()
 }
 
 func (m Model) helpView() string {
 	var b strings.Builder
-	b.WriteString(brandSty.Render("TN shortcuts") + "\n\n")
+	b.WriteString(brandSty.Render(tr("TN shortcuts", "TN 快捷键")) + "\n\n")
 	b.WriteString(m.input.View() + "\n\n")
 	b.WriteString(m.helpHintView.View())
-	hint := "↑/↓ scroll · Esc close"
+	hint := tr("↑/↓ select · ↵ run · esc close", "↑/↓ 选择 · ↵ 执行 · esc 关闭")
 	if total := m.helpHintView.TotalLineCount(); total > m.helpHintView.Height {
 		hint = fmt.Sprintf("%d%% · %s", m.helpScrollPercent(), hint)
 	}
@@ -5376,6 +6044,262 @@ func (m *Model) webdavConfigView() string {
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, dialog, lipgloss.WithWhitespaceBackground(bg))
 }
 
+// --- Git sync: settings dialog, manual push/pull, per-note history ---
+
+// gitConfigSteps labels the fields of the Git sync form.
+var gitConfigPrompts = []string{
+	"远程仓库 URL（空 = 仅本地提交）: ",
+	"分支: ",
+	"提交作者（姓名 <邮箱>）: ",
+	"自动同步 (y/n): ",
+}
+
+func (m *Model) startGitConfig() {
+	m.mode = modeGitConfig
+	m.gitConfig = loadGitSyncConfig(m.store.Root)
+	m.gitConfigStep = 0
+	m.input.Prompt = gitConfigPrompts[0]
+	m.input.Placeholder = "git@github.com:user/notes.git"
+	m.input.SetValue(m.gitConfig.Remote)
+	m.input.Width = max(20, min(80, m.width-12))
+	m.input.Focus()
+	m.statusErr = false
+	m.status = ""
+}
+
+func (m Model) updateGitConfig(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.mode = modeNormal
+		m.input.Blur()
+		m.input.Prompt = "› "
+		return m, nil
+	case "enter", "tab":
+		return m.advanceGitConfig()
+	}
+	var cmd tea.Cmd
+	m.input, cmd = m.input.Update(msg)
+	return m, cmd
+}
+
+// advanceGitConfig stores the current field and moves to the next one; the
+// last step persists the config to disk.
+func (m Model) advanceGitConfig() (tea.Model, tea.Cmd) {
+	val := strings.TrimSpace(m.input.Value())
+	switch m.gitConfigStep {
+	case 0:
+		m.gitConfig.Remote = val
+		m.input.Prompt = gitConfigPrompts[1]
+		m.input.Placeholder = "main"
+		m.input.SetValue(m.gitConfig.Branch)
+	case 1:
+		m.gitConfig.Branch = val
+		if m.gitConfig.Branch == "" {
+			m.gitConfig.Branch = "main"
+		}
+		m.input.Prompt = gitConfigPrompts[2]
+		m.input.Placeholder = "tn <tn@example.com>"
+		m.input.SetValue(m.gitConfig.Author)
+	case 2:
+		m.gitConfig.Author = val
+		m.input.Prompt = gitConfigPrompts[3]
+		m.input.Placeholder = "y/n"
+		if m.gitConfig.AutoSync {
+			m.input.SetValue("y")
+		} else {
+			m.input.SetValue("n")
+		}
+	case 3:
+		m.gitConfig.AutoSync = strings.EqualFold(val, "y") || strings.EqualFold(val, "yes") || val == "1"
+		m.gitConfig.AutoMins = 10
+		if err := saveGitSyncConfig(m.store.Root, m.gitConfig); err != nil {
+			m.flashStatus("保存失败: "+err.Error(), true, 2*time.Second)
+		} else {
+			m.flashStatus("✓ Git 同步设置已保存 · P 推送 / L 拉取", false, 3*time.Second)
+		}
+		m.mode = modeNormal
+		m.input.Blur()
+		m.input.Prompt = "› "
+		m.gitConfigStep = 0
+		return m, m.takePending()
+	}
+	m.gitConfigStep++
+	m.input.Width = max(20, min(80, m.width-12))
+	m.input.Focus()
+	return m, nil
+}
+
+// gitConfigView renders the Git sync form with step indicator.
+func (m Model) gitConfigView() string {
+	var b strings.Builder
+	b.WriteString(brandSty.Render(tr("Git sync settings", "Git 同步设置")) + "\n\n")
+	b.WriteString(m.input.View() + "\n\n")
+	stepHint := fmt.Sprintf(tr("Step %d/%d · Tab/Enter next · Esc cancel", "步骤 %d/%d · Tab/Enter 下一步 · Esc 取消"), m.gitConfigStep+1, len(gitConfigPrompts))
+	if m.gitConfigStep == len(gitConfigPrompts)-1 {
+		stepHint += "\n" + tr("After saving: P push / L pull / search Git in the palette", "保存后可用 P 推送 / L 拉取 / 命令面板搜索 Git")
+	}
+	b.WriteString(mutedSty.Render(stepHint))
+	dialog := lipgloss.NewStyle().Background(surface).Foreground(text).Border(lipgloss.RoundedBorder()).BorderForeground(accent).Padding(1, 3).Width(min(80, max(44, m.width-6))).Render(b.String())
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, dialog, lipgloss.WithWhitespaceBackground(bg))
+}
+
+// gitPushNow kicks off an asynchronous push; results land in the status bar.
+func (m *Model) gitPushNow() {
+	root, config := m.store.Root, loadGitSyncConfig(m.store.Root)
+	m.setStatus("推送中…", false)
+	m.pending = gitActionCmd("推送", func() (string, error) { return gitPush(root, config) })
+}
+
+// gitPullNow kicks off an asynchronous pull.
+func (m *Model) gitPullNow() {
+	root, config := m.store.Root, loadGitSyncConfig(m.store.Root)
+	m.setStatus("拉取中…", false)
+	m.pending = gitActionCmd("拉取", func() (string, error) { return gitPull(root, config) })
+}
+
+func (m *Model) startGitHistory() {
+	if !gitInstalled() {
+		m.flashStatus("git 未安装或不在 PATH 中", true, 3*time.Second)
+		return
+	}
+	versions, err := gitNoteHistory(m.store.Root, m.currentPath)
+	if err != nil {
+		m.flashStatus("读取历史失败: "+err.Error(), true, 3*time.Second)
+		return
+	}
+	if len(versions) == 0 {
+		m.flashStatus("该笔记还没有历史版本（需要先推送过一次）", true, 3*time.Second)
+		return
+	}
+	m.commandBeforeMode = m.mode
+	m.gitVersions = versions
+	m.gitHistoryIdx = 0
+	m.gitViewing = false
+	m.gitViewContent = ""
+	m.gitViewScroll = 0
+	m.mode = modeGitHistory
+	m.status = ""
+}
+
+func (m Model) updateGitHistory(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		if m.gitViewing {
+			m.gitViewing = false
+			return m, nil
+		}
+		m.mode = modeNormal
+		return m, nil
+	case "up", "k":
+		if m.gitViewing {
+			m.gitViewScroll = max(0, m.gitViewScroll-1)
+			return m, nil
+		}
+		m.gitHistoryIdx = max(0, m.gitHistoryIdx-1)
+		return m, nil
+	case "down", "j":
+		if m.gitViewing {
+			m.gitViewScroll++
+			return m, nil
+		}
+		m.gitHistoryIdx = min(len(m.gitVersions)-1, m.gitHistoryIdx+1)
+		return m, nil
+	case "enter":
+		if !m.gitViewing {
+			v := m.gitVersions[m.gitHistoryIdx]
+			content, err := gitShowFile(m.store.Root, v.Hash, m.currentPath)
+			if err != nil {
+				m.flashStatus("读取版本失败: "+err.Error(), true, 3*time.Second)
+				return m, nil
+			}
+			m.gitViewing = true
+			m.gitViewContent = content
+			m.gitViewScroll = 0
+			return m, nil
+		}
+		// Enter while previewing: roll back to this version.
+		m.revertToVersion()
+		return m, nil
+	case "r":
+		if !m.gitViewing {
+			m.revertToVersion()
+			return m, nil
+		}
+	}
+	return m, nil
+}
+
+// revertToVersion writes the selected revision back into the note and reloads
+// it into the editor. The change lands in the undo stack via loadNoteContent.
+func (m *Model) revertToVersion() {
+	if m.gitHistoryIdx >= len(m.gitVersions) {
+		return
+	}
+	v := m.gitVersions[m.gitHistoryIdx]
+	content, err := gitShowFile(m.store.Root, v.Hash, m.currentPath)
+	if err != nil {
+		m.flashStatus("回退失败: "+err.Error(), true, 3*time.Second)
+		return
+	}
+	if err := m.store.Write(m.currentPath, content); err != nil {
+		m.flashStatus("写入失败: "+err.Error(), true, 3*time.Second)
+		return
+	}
+	before := m.editor.Value()
+	beforePos := m.cursorPos()
+	m.loadNoteContent(content)
+	m.recordEdit(before, content, beforePos, m.cursorPos())
+	m.renderMarkdown()
+	m.mode = modeNormal
+	m.flashStatus(fmt.Sprintf("✓ 已回退到 %s 的版本（Ctrl+Z 可撤销）", v.Date), false, 4*time.Second)
+}
+
+// gitHistoryView renders the version list, or the version preview when one is
+// being inspected.
+func (m Model) gitHistoryView() string {
+	name := filepath.Base(m.currentPath)
+	var b strings.Builder
+	if m.gitViewing {
+		b.WriteString(brandSty.Render(tr("Version preview · ", "版本预览 · ")+name) + "\n")
+		v := m.gitVersions[m.gitHistoryIdx]
+		b.WriteString(mutedSty.Render(v.Date+" · "+v.Subject) + "\n\n")
+		lines := strings.Split(strings.TrimRight(m.gitViewContent, "\n"), "\n")
+		start := min(m.gitViewScroll, max(0, len(lines)-1))
+		end := min(len(lines), start+m.historyVisibleRows())
+		if start >= end {
+			b.WriteString(mutedSty.Render(tr("(end · ↑ go back)", "（到底了，↑ 回看）")) + "\n")
+		}
+		for _, l := range lines[start:end] {
+			b.WriteString(" " + truncateANSI(l, max(10, m.width-12)) + "\n")
+		}
+		b.WriteString("\n" + mutedSty.Render(tr("↵ revert to this version · ↑↓ scroll · esc back", "↵ 回退到此版本 · ↑↓ 滚动 · esc 返回列表")))
+	} else {
+		b.WriteString(brandSty.Render(tr("History · ", "历史版本 · ")+name) + "\n")
+		b.WriteString(mutedSty.Render(fmt.Sprintf(tr("%d versions", "%d 个版本"), len(m.gitVersions))) + "\n\n")
+		const window = 9
+		first := max(0, min(m.gitHistoryIdx-4, len(m.gitVersions)-window))
+		last := min(len(m.gitVersions), first+window)
+		for i := first; i < last; i++ {
+			v := m.gitVersions[i]
+			label := fmt.Sprintf("  %s  %s", v.Date, v.Subject)
+			if i == m.gitHistoryIdx {
+				b.WriteString(lipgloss.NewStyle().Background(selection).Foreground(accent).Bold(true).
+					Render(truncateANSI("▸ "+strings.TrimLeft(label, " "), max(20, m.width-10))) + "\n")
+			} else {
+				b.WriteString(mutedSty.Render(truncateANSI(label, max(20, m.width-10))) + "\n")
+			}
+		}
+		b.WriteString("\n" + mutedSty.Render(tr("↑↓ select · ↵ preview · r revert · esc close", "↑↓ 选择 · ↵ 查看 · r 直接回退 · esc 关闭")))
+	}
+	dialog := lipgloss.NewStyle().Background(surface).Foreground(text).Border(lipgloss.RoundedBorder()).BorderForeground(accent).Padding(1, 2).Width(min(90, max(50, m.width-8))).Height(min(18, m.height-4)).Render(b.String())
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, dialog, lipgloss.WithWhitespaceBackground(bg))
+}
+
+// historyVisibleRows is how many content rows fit inside the history dialog.
+func (m Model) historyVisibleRows() int {
+	return max(3, min(18, m.height-4)-6)
+}
+
 func (m *Model) updateCommand(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "esc":
@@ -5448,10 +6372,10 @@ func (m *Model) startMarkdown() {
 	m.mode = modeMarkdown
 	m.markdownIndex = 0
 	m.markdownQuery = ""
-	m.input.Prompt = "Format: "
-	m.input.Placeholder = "type to filter"
+	m.input.Prompt = ""
+	m.input.Placeholder = "filter…"
 	m.input.SetValue("")
-	m.input.Width = max(20, min(60, m.width-12))
+	m.input.Width = max(12, min(30, m.width-20))
 	m.input.Focus()
 	m.statusErr = false
 	m.status = ""
@@ -5464,6 +6388,7 @@ func (m *Model) exitMarkdown() {
 	m.input.Prompt = "› "
 	m.markdownQuery = ""
 	m.markdownIndex = 0
+	m.markdownFromSlash = false
 	m.restoreCommandFocus()
 }
 
@@ -5487,9 +6412,28 @@ func (m *Model) moveMarkdown(delta int) {
 }
 
 func (m *Model) applyMarkdown(item markdownItem) {
+	fromSlash := m.markdownFromSlash
 	m.exitMarkdown()
 	if item.prefix == "" && item.suffix == "" {
 		return
+	}
+	// When the menu was opened by typing "/", drop that slash so it does not
+	// linger in the text next to the inserted markup.
+	if fromSlash {
+		cur := m.editor.Value()
+		pos := m.cursorPos()
+		runes := []rune(cur)
+		off := 0
+		lines := strings.Split(cur, "\n")
+		for i := 0; i < pos.row && i < len(lines); i++ {
+			off += len([]rune(lines[i])) + 1
+		}
+		off += pos.col
+		if off > 0 && runes[off-1] == '/' {
+			newRunes := append(runes[:off-1], runes[off:]...)
+			m.editor.SetValue(string(newRunes))
+			m.setCursorAt(off - 1)
+		}
 	}
 	cur := m.editor.Value()
 	pos := m.cursorPos()
@@ -5504,7 +6448,11 @@ func (m *Model) applyMarkdown(item markdownItem) {
 	}
 	offset += pos.col
 
-	if !item.multiLine && !strings.HasSuffix(prefix, "\n") && !strings.HasPrefix(prefix, "---") && prefix != "" {
+	// Block-level items are the ones whose prefix is a line prefix ("# ",
+	// "- ", "> " …) — it ends with a space. Inline wrappers like "**" must
+	// fall through to the inline branch instead of being dumped at line start.
+	isBlockPrefix := strings.HasSuffix(prefix, " ") && prefix != " "
+	if !item.multiLine && !strings.HasSuffix(prefix, "\n") && !strings.HasPrefix(prefix, "---") && prefix != "" && isBlockPrefix {
 		// Block-level: insert at line start
 		lineStart := 0
 		for i := 0; i < pos.row && i < len(lines); i++ {
@@ -5594,36 +6542,119 @@ func (m Model) updateMarkdown(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-func (m Model) markdownView() string {
+// slashPopupLines renders the floating format menu as a small box: a filter
+// row, up to slashPopupMax items with the selection highlighted, and a hint
+// row. It is anchored under the cursor by overlaySlashPopup.
+func (m Model) slashPopupLines(visible int) []string {
 	items := m.filteredMarkdownItems()
-	if len(items) == 0 {
-		items = append(items, markdownItem{name: "No match"})
+	query := "/" + m.markdownQuery
+	first := 0
+	if n := len(items); n > visible {
+		first = min(n-visible, max(0, m.markdownIndex-2))
 	}
-	// Ultra-compact single line: [ filter ] ▸ Bold  Italic  Link  Code  ...
-	var b strings.Builder
-	b.WriteString(m.input.View())
-	b.WriteString("  ")
-	// Show items in a wrapping row, highlighted one in accent
-	parts := []string{}
-	for i, item := range items {
-		if i >= 12 {
-			parts = append(parts, mutedSty.Render("…"))
+	last := min(len(items), first+visible)
+
+	hint := tr("↑↓ select · ↵ apply · esc cancel", "↑↓ 选择 · ↵ 应用 · esc 取消")
+	rows := make([]string, 0, last-first+3)
+	rows = append(rows, lipgloss.NewStyle().Foreground(accent).Bold(true).Render(query))
+	if len(items) == 0 {
+		rows = append(rows, mutedSty.Render(tr("No match", "无匹配")))
+	}
+	for idx := first; idx < last; idx++ {
+		if idx == m.markdownIndex {
+			rows = append(rows, lipgloss.NewStyle().Background(selection).Foreground(accent).Bold(true).
+				Render("▸ "+items[idx].name))
+		} else {
+			rows = append(rows, mutedSty.Render("  "+items[idx].name))
+		}
+	}
+	if len(items) > visible {
+		hint = fmt.Sprintf("%d/%d · %s", m.markdownIndex+1, len(items), hint)
+	}
+	rows = append(rows, mutedSty.Render(hint))
+	return rows
+}
+
+// slashAnchor reports where the popup should anchor, in editor-content
+// coordinates: the row just below the cursor's visual row, at the cursor's
+// column relative to the editor text area.
+func (m Model) slashAnchor() (int, int, bool) {
+	rows := parseEditorRows(m.editor.View())
+	cp := m.cursorPos()
+	best := -1
+	for i, rm := range rows {
+		if rm.line != cp.row {
+			continue
+		}
+		best = i
+		lineLen := 0
+		if lines := strings.Split(m.editor.Value(), "\n"); cp.row < len(lines) {
+			lineLen = len([]rune(lines[cp.row]))
+		}
+		if cp.col < rm.startCol+max(0, lineLen-rm.startCol) {
 			break
 		}
-		if i == m.markdownIndex {
-			parts = append(parts, lipgloss.NewStyle().Foreground(accent).Bold(true).Render(item.name))
-		} else {
-			parts = append(parts, mutedSty.Render(item.name))
-		}
 	}
-	b.WriteString(lipgloss.JoinHorizontal(lipgloss.Left, parts...))
-	// Single-line bar at the very bottom (replaces status bar)
-	return lipgloss.NewStyle().
+	if best < 0 || best >= len(rows) {
+		return 0, 0, false
+	}
+	rm := rows[best]
+	return best + 1, rm.gutter + max(0, cp.col-rm.startCol), true
+}
+
+// overlaySlashPopup draws the floating menu on top of the editor content.
+// Rows the box covers are hidden behind it — it is opaque — so splicing is a
+// simple replace of the covered span.
+func (m Model) overlaySlashPopup(content string, innerWidth int) string {
+	anchorRow, anchorCol, ok := m.slashAnchor()
+	if !ok {
+		return content
+	}
+	rows := strings.Split(content, "\n")
+
+	// Shrink the item window until the box fits below the cursor (or above).
+	const chrome = 4 // filter row + hint row + top/bottom border
+	visible := 5
+	for visible > 1 {
+		h := visible + chrome
+		if anchorRow+1+h <= len(rows) {
+			break
+		}
+		if anchorRow-h >= 0 { // fits above: keep size, flip side
+			break
+		}
+		visible--
+	}
+
+	popup := m.slashPopupLines(visible)
+	popW := 0
+	for _, p := range popup {
+		popW = max(popW, lipgloss.Width(p))
+	}
+	popW += 4 // padding + borders
+	popW = min(popW, max(12, innerWidth-1))
+
+	boxStyle := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(accent).
 		Background(surface).
 		Foreground(text).
-		Width(m.width).
-		MaxHeight(1).
-		Render(" " + b.String())
+		Width(popW).
+		Padding(0, 1)
+	box := strings.Split(boxStyle.Render(strings.Join(popup, "\n")), "\n")
+
+	top := anchorRow + 1
+	if top+len(box) > len(rows) && anchorRow-len(box) >= 0 {
+		// No room below the cursor but enough above: flip the box upward.
+		top = anchorRow - len(box)
+	}
+	top = max(0, min(top, max(0, len(rows)-len(box))))
+	left := max(0, min(anchorCol, innerWidth-popW))
+
+	for i := 0; i < len(box) && top+i < len(rows); i++ {
+		rows[top+i] = strings.Repeat(" ", left) + box[i]
+	}
+	return strings.Join(rows, "\n")
 }
 
 func (m *Model) restoreCommandFocus() {
@@ -5662,6 +6693,22 @@ func (m *Model) commandList() []command {
 		{"Rename", func() { m.startPrompt(promptRename) }},
 		{"Delete", m.startDelete},
 		{"Toggle tag filter", m.startTagFilter},
+		{tr("Language 语言", "Language 语言"), func() {
+			toggleLang()
+			saveUiPrefs(m.sessionPath)
+			m.renderHelpContent()
+			m.flashStatus(langFlash(), false, 2*time.Second)
+		}},
+		{"Git 推送", func() { m.gitPushNow() }},
+		{"Git 拉取", func() { m.gitPullNow() }},
+		{"Git 同步设置", m.startGitConfig},
+		{"笔记历史版本", func() {
+			if m.currentPath == "" {
+				m.flashStatus("Open a note first", true, 2*time.Second)
+				return
+			}
+			m.startGitHistory()
+		}},
 		{"Clean up unused images", func() {
 			m.cleanupImages()
 		}},
