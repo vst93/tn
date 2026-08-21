@@ -55,7 +55,7 @@ func TestContentDragSelectCopies(t *testing.T) {
 	// tags), so the first preview line renders at Y=3. The content area
 	// starts at X = treeWidth+2: the separator column plus the one column of
 	// padding the panel adds inside its frame.
-	startX := m.treeWidth + 2
+	startX := m.treeWidth + 1 // borderless pane: text starts right after the divider
 	m.handleMouse(tea.MouseEvent{X: startX, Y: 3, Button: tea.MouseButtonLeft, Action: tea.MouseActionPress})
 	if !m.contentDragging {
 		t.Fatal("expected contentDragging after press on preview text")
@@ -133,10 +133,11 @@ func TestContentDragOutsidePaneStartsNothing(t *testing.T) {
 		t.Fatal("expected no drag when pressing in tree pane")
 	}
 
-	// Click on the pane's right border column.
-	m.handleMouse(tea.MouseEvent{X: m.width - 1, Y: 3, Button: tea.MouseButtonLeft, Action: tea.MouseActionPress})
+	// Click on the divider column: it belongs to the tree pane, so it must
+	// not start a content drag.
+	m.handleMouse(tea.MouseEvent{X: m.treeWidth, Y: 3, Button: tea.MouseButtonLeft, Action: tea.MouseActionPress})
 	if m.contentDragging {
-		t.Fatal("expected no drag when pressing on pane border")
+		t.Fatal("expected no drag when pressing on the divider")
 	}
 
 	// Click in the pane's top border row.
@@ -156,7 +157,7 @@ func TestContentDragMultiLineSelection(t *testing.T) {
 		copied = s
 		return nil
 	}
-	startX := m.treeWidth + 2
+	startX := m.treeWidth + 1 // borderless pane: text starts right after the divider
 	// Each paragraph renders one row: first at Y=3 (below the metadata
 	// line), second at Y=4, third at Y=5.
 	m.handleMouse(tea.MouseEvent{X: startX, Y: 3, Button: tea.MouseButtonLeft, Action: tea.MouseActionPress})
@@ -200,7 +201,7 @@ func TestContentDragAfterScroll(t *testing.T) {
 		copied = s
 		return nil
 	}
-	startX := m.treeWidth + 2
+	startX := m.treeWidth + 1 // borderless pane: text starts right after the divider
 	// The first visible line is renderedPlain line 10 (each paragraph is
 	// one line); it must map to an offset starting at that line, not line
 	// 0. The anchor should therefore sit inside paragraph 10's text.
@@ -237,7 +238,7 @@ func TestContentDragAfterScroll(t *testing.T) {
 func TestSelectionHighlightClosesAtLineEnd(t *testing.T) {
 	m := openNoteForDrag(t, "line one\n\nline two\n\nline three")
 	m.copier = func(s string) error { return nil }
-	startX := m.treeWidth + 2
+	startX := m.treeWidth + 1 // borderless pane: text starts right after the divider
 	m.handleMouse(tea.MouseEvent{X: startX, Y: 3, Button: tea.MouseButtonLeft, Action: tea.MouseActionPress})
 	m.handleMouse(tea.MouseEvent{X: startX + 100, Y: 3, Button: tea.MouseButtonNone, Action: tea.MouseActionMotion})
 	// Capture offsets before release clears them.

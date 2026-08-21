@@ -10,6 +10,8 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
 
 	"github.com/vst93/tn/internal/storage"
 )
@@ -75,22 +77,14 @@ func TestSplitViewSeparatorVisible(t *testing.T) {
 	m.selectPath(note)
 	m.openSelectedNote()
 	lines := strings.Split(stripANSI(m.View()), "\n")
-	// The separator column joins the two panel frames: a tee on the frame
-	// rows, a vertical everywhere between them.
+	// The separator is a plain vertical column between the borderless panes.
 	for i := 1; i <= m.bodyHeight; i++ {
 		runes := []rune(lines[i])
 		if m.treeWidth >= len(runes) {
 			t.Fatalf("line %d is too short for a separator at col %d: %q", i, m.treeWidth, lines[i])
 		}
-		want := "│"
-		switch i {
-		case 1:
-			want = "┬"
-		case m.bodyHeight:
-			want = "┴"
-		}
-		if got := string(runes[m.treeWidth]); got != want {
-			t.Fatalf("line %d has %q at col %d, want %q: %q", i, got, m.treeWidth, want, lines[i])
+		if got := string(runes[m.treeWidth]); got != "│" {
+			t.Fatalf("line %d has %q at col %d, want a vertical: %q", i, got, m.treeWidth, lines[i])
 		}
 	}
 }
@@ -180,7 +174,7 @@ func TestCopyCurrentUsesMarkdownAndReportsResult(t *testing.T) {
 		copied = content
 		return nil
 	}
-	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
 	m = updated.(Model)
 	if cmd == nil {
 		t.Fatal("expected asynchronous copy command")
@@ -2690,5 +2684,285 @@ func TestPreviewPageKeysAndFeedback(t *testing.T) {
 	m = updated.(Model)
 	if m.mode != modeSearch {
 		t.Fatalf("f should start search, mode=%v", m.mode)
+	}
+}
+
+func TestCtrlCQuitsAndForceQuitsWhenDirty(t *testing.T) {
+	store := storage.New(t.TempDir())
+	note, err := store.CreateNote("", "quit-dirty")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := New(store)
+	m.resize(100, 30)
+	m.selectPath(note)
+	m.openSelectedNote()
+
+	// Clean state: Ctrl+C quits immediately.
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	if cmd == nil {
+		t.Fatal("Ctrl+C should quit when clean")
+	}
+	if msg := cmd(); msg != tea.Quit() {
+		t.Fatalf("Ctrl+C should produce tea.Quit, got %T", msg)
+	}
+
+	// Dirty state: first press warns, second press within 2s force-quits.
+	m.editor.SetValue("# dirty\n")
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	m = updated.(Model)
+	if cmd != nil {
+		t.Fatal("first Ctrl+C on dirty notes must not quit")
+	}
+	if !m.statusErr {
+		t.Fatal("first Ctrl+C on dirty notes must warn")
+	}
+	updated, cmd = m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	m = updated.(Model)
+	if cmd == nil {
+		t.Fatal("second Ctrl+C should force-quit")
+	}
+	if msg := cmd(); msg != tea.Quit() {
+		t.Fatalf("second Ctrl+C should produce tea.Quit, got %T", msg)
+	}
+
+	// After the 2s window the guard resets and warns again.
+	m.lastCtrlC = time.Now().Add(-3 * time.Second)
+	updated, cmd = m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	m = updated.(Model)
+	if cmd != nil {
+		t.Fatal("Ctrl+C after the window must warn again, not quit")
+	}
+}
+
+func TestCtrlCCopiesEditorSelection(t *testing.T) {
+	store := storage.New(t.TempDir())
+	note, err := store.CreateNote("", "sel-copy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := New(store)
+	m.resize(100, 30)
+	m.selectPath(note)
+	m.openSelectedNote()
+	m.toggleEdit()
+	m.editor.SetValue("hello world")
+	m.setCursorAt(0)
+
+	var copied string
+	m.copier = func(content string) error {
+		copied = content
+		return nil
+	}
+	// Shift+Right selects "hello".
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyShiftRight})
+	m = updated.(Model)
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	m = updated.(Model)
+	if cmd == nil {
+		t.Fatal("Ctrl+C with a selection should copy it")
+	}
+	updated, _ = m.Update(cmd())
+	m = updated.(Model)
+	if copied != "h" {
+		t.Fatalf("copied %q, want selected text %q", copied, "h")
+	}
+}
+
+func TestSeparatorHighlightsWithTreeFocus(t *testing.T) {
+	lipgloss.SetColorProfile(termenv.TrueColor)
+	defer lipgloss.SetColorProfile(termenv.Ascii)
+	store := storage.New(t.TempDir())
+	note, err := store.CreateNote("", "sep")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := New(store)
+	m.resize(100, 30)
+	m.selectPath(note)
+	m.openSelectedNote()
+
+	const accentFg = "\x1b[38;2;127;169;255m"
+	m.active = treePane
+	withAccent := m.View()
+	m.active = contentPane
+	withoutAccent := m.View()
+	if !strings.Contains(withAccent, accentFg+"│") {
+		t.Fatal("separator should carry the accent color when the tree pane is focused")
+	}
+	if strings.Contains(withoutAccent, accentFg+"│") {
+		t.Fatal("separator should be dim when the content pane is focused")
+	}
+}
+
+func TestPaintBackgroundCoversPadding(t *testing.T) {
+	lipgloss.SetColorProfile(termenv.TrueColor)
+	defer lipgloss.SetColorProfile(termenv.Ascii)
+	// Derive the expected sequence the same way paintBackground does.
+	probe := lipgloss.NewStyle().Background(bg).Render(" ")
+	bgSeq := probe[:strings.IndexByte(probe, ' ')]
+	view := "short"
+	painted := paintBackground(view, 10, 3)
+	lines := strings.Split(painted, "\n")
+	if len(lines) != 3 {
+		t.Fatalf("expected 3 lines, got %d", len(lines))
+	}
+	if !strings.HasPrefix(lines[0], bgSeq) {
+		t.Fatal("painted line should start with the background sequence")
+	}
+	if !strings.HasSuffix(lines[0], strings.Repeat(" ", 5)) {
+		t.Fatal("trailing padding should be present")
+	}
+	if strings.Contains(lines[0], "\x1b[0m") {
+		t.Fatal("plain content has no resets, background must stay active through padding")
+	}
+	for _, line := range lines[1:] {
+		if line != bgSeq+strings.Repeat(" ", 10) {
+			t.Fatalf("filler line should be a full background row, got %q", stripANSI(line))
+		}
+	}
+
+	// A reset inside the content must not cut the background short.
+	withReset := "a\x1b[0mb"
+	painted = paintBackground(withReset, 4, 1)
+	if !strings.Contains(painted, "\x1b[0m"+bgSeq+"b") {
+		t.Fatal("background must be re-applied after inner ANSI resets")
+	}
+}
+
+func TestSlashMenuWordBoundary(t *testing.T) {
+	store := storage.New(t.TempDir())
+	note, _ := store.CreateNote("", "slash")
+	m := New(store)
+	m.resize(100, 30)
+	m.selectPath(note)
+	m.openSelectedNote()
+	m.toggleEdit()
+
+	// Mid-word slash must NOT open the format menu: typing a path keeps
+	// working and Enter stays a plain newline.
+	m.editor.SetValue("see path/a/b")
+	m.setCursorAt(9) // right after "path/"
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	m = updated.(Model)
+	if m.mode == modeMarkdown {
+		t.Fatal("mid-word slash must not open the format menu")
+	}
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	if !strings.Contains(m.editor.Value(), "/\n") {
+		t.Fatalf("enter after mid-word slash should insert a newline, got %q", m.editor.Value())
+	}
+
+	// Slash at line start still opens the menu.
+	m2 := New(store)
+	m2.resize(100, 30)
+	m2.selectPath(note)
+	m2.openSelectedNote()
+	m2.toggleEdit()
+	m2.editor.SetValue("")
+	m2.setCursorAt(0)
+	updated, _ = m2.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	m2 = updated.(Model)
+	if m2.mode != modeMarkdown {
+		t.Fatal("slash at line start should open the format menu")
+	}
+}
+
+func TestMarkdownMenuEnterWithoutMatchInsertsNewline(t *testing.T) {
+	store := storage.New(t.TempDir())
+	note, _ := store.CreateNote("", "menu-enter")
+	m := New(store)
+	m.resize(100, 30)
+	m.selectPath(note)
+	m.openSelectedNote()
+	m.toggleEdit()
+	m.startMarkdown()
+	m.input.SetValue("zzz-no-match")
+	m.markdownQuery = "zzz-no-match"
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	if m.mode == modeMarkdown {
+		t.Fatal("enter with no matching items should close the menu")
+	}
+	if !strings.HasSuffix(m.editor.Value(), "\n") {
+		t.Fatalf("enter with no matching items should insert a newline, got %q", m.editor.Value())
+	}
+}
+
+func TestPreviewScrollbarAppearsWhenContentOverflows(t *testing.T) {
+	store := storage.New(t.TempDir())
+	note, _ := store.CreateNote("", "scroll")
+	long := strings.Repeat("word ", 600) + "\n"
+	os.WriteFile(filepath.Join(store.Root, note), []byte(long), 0o644)
+	m := New(store)
+	m.resize(100, 24)
+	m.selectPath(note)
+	m.openSelectedNote()
+	m.editor.SetValue(long)
+	m.renderMarkdown()
+
+	overlay := stripANSI(m.overlayScrollbar(m.preview.View()))
+	rows := strings.Split(overlay, "\n")
+	if len(rows) != m.preview.Height {
+		t.Fatalf("overlay should keep one row per viewport row: %d vs %d", len(rows), m.preview.Height)
+	}
+	thumbRows := 0
+	for _, r := range rows {
+		if strings.HasSuffix(r, "▐") {
+			thumbRows++
+		}
+	}
+	if thumbRows == 0 {
+		t.Fatal("overflowing content should show the thumb hugging the right edge")
+	}
+	if lipgloss.Width(rows[0]) != m.preview.Width {
+		t.Fatalf("overlay must not widen the preview beyond %d, got %d", m.preview.Width, lipgloss.Width(rows[0]))
+	}
+
+	// Short content: returned unchanged, no thumb.
+	short, _ := store.CreateNote("", "short")
+	m.selectPath(short)
+	m.openSelectedNote()
+	m.editor.SetValue("tiny\n")
+	m.renderMarkdown()
+	before := m.preview.View()
+	if m.overlayScrollbar(before) != before {
+		t.Fatal("fitting content should be returned unchanged")
+	}
+}
+
+func TestRepaintLineBackgroundsNesting(t *testing.T) {
+	lipgloss.SetColorProfile(termenv.TrueColor)
+	defer lipgloss.SetColorProfile(termenv.Ascii)
+	app := "\x1b[48;2;20;22;33m"     // app background
+	surface := "\x1b[48;2;27;30;43m" // bar background
+	card := "\x1b[48;2;10;12;16m"    // code card background
+	fg := "\x1b[38;2;200;200;200m"
+	R := "\x1b[0m"
+
+	// Inside a surface bar, inner fg resets must restore surface, not app bg.
+	line := surface + " " + fg + "brand" + R + " rest"
+	got := repaintLineBackgrounds(line, app)
+	if !strings.HasSuffix(stripANSI(got), "brand"+" rest") {
+		t.Fatalf("text must be preserved, got %q", stripANSI(got))
+	}
+	if strings.Count(got, surface) < 2 {
+		t.Fatal("inner reset inside a surface bar must re-arm the surface background")
+	}
+
+	// Inside a code card, fg resets must restore the card bg; after the card
+	// closes, back to app bg.
+	line = app + "x" + card + "y" + fg + "z" + R + "w" + R + "end"
+	got = repaintLineBackgrounds(line, app)
+	// Sequence of backgrounds after each reset: card, then app.
+	firstReset := strings.Index(got, R)
+	secondReset := strings.Index(got[firstReset+1:], R) + firstReset + 1
+	if !strings.HasPrefix(got[firstReset+len(R):], card) {
+		t.Fatal("reset inside code card must re-arm the card background")
+	}
+	if !strings.HasPrefix(got[secondReset+len(R):], app) {
+		t.Fatal("reset closing the code card must fall back to the app background")
 	}
 }

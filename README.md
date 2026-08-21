@@ -8,6 +8,7 @@ A quiet, keyboard-first terminal note. TN stores every note as a normal Markdown
 - Multi-level folder tree with mouse clicks, wheel scrolling, and touch-friendly targets
 - Live Markdown editing with rendered preview, smart list continuation, and auto-indent
 - Typeset Markdown preview: heading rules, hanging-indent lists, framed code cards with syntax highlighting, right-sized tables, task lists, footnotes and definition lists
+- Preview scrollbar with a position thumb, so long notes always show where you are
 - Undo/redo with cursor preservation, plus auto-save after two seconds of idle typing
 - One-key clipboard copy plus native terminal text selection mode
 - In-note search with highlighted matches, global search across all notes, and jump-to-line
@@ -74,8 +75,8 @@ tn -dir /path/to/notes
 | Edit / preview | `Ctrl+E` |
 | Save | `Ctrl+S` |
 | Undo | `Ctrl+Z` |
-| Redo | `Ctrl+Shift+Z`, `Ctrl+Y` |
-| Copy current Markdown | `Ctrl+C`, `Ctrl+Y` |
+| Redo | `Ctrl+Shift+Z`, `Ctrl+Y` (edit mode) |
+| Copy current Markdown | `y` |
 | Copy current line | `Ctrl+L` (edit mode) |
 | Select preview text | `Ctrl+G` |
 | Search note | `Ctrl+F` |
@@ -92,7 +93,7 @@ tn -dir /path/to/notes
 | Export as HTML | `Alt+H` |
 | Refresh | `Ctrl+R` |
 | Help | `?` |
-| Quit | `Ctrl+Q` |
+| Quit | `Ctrl+Q` / `Ctrl+C` |
 | Cancel / close | `Esc` |
 
 While editing, standard terminal text editing keys and `Ctrl+V` paste are available. Press `Esc` to return to preview.
@@ -106,7 +107,8 @@ While editing, standard terminal text editing keys and `Ctrl+V` paste are availa
 
 ### Copying text
 
-- Press `Ctrl+C` (or `Ctrl+Y`) or choose **Copy** to copy the complete current Markdown source automatically. TN uses the native system clipboard when available and falls back to the OSC 52 terminal clipboard protocol.
+- Press `y` or choose **Copy** to copy the complete current Markdown source automatically. TN uses the native system clipboard when available and falls back to the OSC 52 terminal clipboard protocol.
+- While editing, `Ctrl+C` copies the selected text; with no selection it quits (press twice to discard unsaved changes).
 - Press `Ctrl+G` or choose **Select** to temporarily release mouse control to the terminal. Drag across rendered preview text, then use the terminal's copy behavior. Many terminals automatically copy on selection; others use their normal copy shortcut. Press any key to restore TN mouse handling.
 - Termux clipboard copy requires the Termux:API add-on and `termux-api` package when OSC 52 is unavailable.
 

@@ -307,8 +307,8 @@ var helpGroupsData = []helpGroup{
 	{
 		title: "Copy",
 		rows: []helpRow{
-			{"Ctrl+C", "Copy text"},
-			{"y", "Copy text (preview)"},
+			{"y", "Copy note (preview)"},
+			{"Ctrl+C", "Copy selection (edit) / quit"},
 			{"Ctrl+L", "Copy current line (edit)"},
 			{"Ctrl+G", "Select terminal text"},
 		},
@@ -336,7 +336,7 @@ var helpGroupsData = []helpGroup{
 			{"Ctrl+Shift+F", "Focus mode"},
 			{"Alt+T", "Switch theme"},
 			{"Ctrl+R", "Refresh"},
-			{"Ctrl+Q", "Quit"},
+			{"Ctrl+Q / Ctrl+C", "Quit (dirty: Ctrl+C twice force-quits)"},
 			{"?", "Help"},
 			{"Esc", "Close / cancel"},
 		},
@@ -505,6 +505,8 @@ type Model struct {
 
 	history      []string
 	historyIndex int
+
+	lastCtrlC time.Time
 
 	targetPath  string
 	pathFocused bool
@@ -733,8 +735,28 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if !m.focusing && (m.mode == modeNormal || m.mode == modeEdit) {
 			m.handleMouse(tea.MouseEvent(msg))
+			return m, m.takePending()
 		}
-		return m, m.takePending()
+		evt := tea.MouseEvent(msg)
+		if evt.IsWheel() {
+			delta := 1
+			if evt.Button == tea.MouseButtonWheelUp {
+				delta = -1
+			}
+			switch m.mode {
+			case modeHelp:
+				return m.updateHelp(msg)
+			case modeQuickOpen:
+				m.moveQuickOpen(delta)
+			case modeSearchGlobal:
+				m.moveGlobalSearch(delta)
+			case modeCommand:
+				m.moveCommand(delta)
+			case modeMarkdown:
+				m.moveMarkdown(delta)
+			}
+		}
+		return m, nil
 	case tea.KeyMsg:
 		key := msg.String()
 		if m.selecting {
@@ -742,9 +764,26 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.setStatus("Mouse restored", false)
 			return m, tea.EnableMouseCellMotion
 		}
-		if key == "ctrl+c" && (m.mode == modeNormal || m.mode == modeEdit) {
-			m.copyCurrent()
-			return m, m.takePending()
+		if key == "ctrl+c" {
+			// With an active editor selection, Ctrl+C copies the selection like
+			// a normal text editor. Otherwise it quits; with unsaved changes a
+			// second press within two seconds discards them and quits.
+			if m.mode == modeEdit {
+				if sel := m.selectionText(); sel != "" {
+					m.startCopy(sel)
+					return m, m.takePending()
+				}
+			}
+			if !m.dirty() {
+				m.saveSession()
+				return m, tea.Quit
+			}
+			if !m.lastCtrlC.IsZero() && time.Since(m.lastCtrlC) < 2*time.Second {
+				return m, tea.Quit
+			}
+			m.lastCtrlC = time.Now()
+			m.setStatus("Unsaved changes · press Ctrl+C again to discard and quit", true)
+			return m, nil
 		}
 		if m.mode == modePrompt {
 			return m.updatePrompt(msg)
@@ -809,8 +848,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.editSel != nil {
 					m.editSel.end = m.cursorPos()
 				}
-			} else if msg.String() == "/" {
-				// Slash opens markdown format menu, also insert slash into editor
+			} else if msg.String() == "/" && m.slashMenuAllowed() {
+				// Slash opens the markdown format menu and also inserts the slash
+				// into the editor. It only triggers at a word boundary (line start
+				// or after a blank) so typing paths, URLs or dates mid-word keeps
+				// every key — Enter included — flowing into the editor.
 				m.startMarkdown()
 				// Continue to let the slash be inserted into editor below
 				m.editSel = nil
@@ -952,8 +994,9 @@ func (m *Model) globalKey(key string) (handled, quit bool) {
 			m.redo()
 			return true, false
 		}
-		m.copyCurrent()
-		return true, false
+		// No copy binding here: Ctrl+Y only redoes in edit mode. Copy lives on
+		// "y" (preview) to keep one key per action.
+		return false, false
 	case "ctrl+shift+e":
 		if m.mode == modeEdit {
 			return false, false
@@ -1118,7 +1161,10 @@ func (m *Model) globalKey(key string) (handled, quit bool) {
 		} else if m.mode == modeEdit {
 			m.leaveEdit()
 		} else {
-			m.active = treePane
+			// Esc means "cancel/close": in the plain workbench there is nothing
+			// to close, so just clear the status message instead of yanking
+			// focus to the tree pane.
+			m.status = ""
 		}
 		return true, false
 	case "#":
@@ -1305,9 +1351,9 @@ func (m *Model) handleMouse(msg tea.MouseEvent) {
 			m.treeOffset = min(max(0, len(m.flat)-m.treeRows()), m.treeOffset+1)
 			return
 		}
-		if msg.Button == tea.MouseButtonLeft {
-			row := msg.Y - 2 + m.treeOffset
-			if row >= m.treeOffset && row < min(len(m.flat), m.treeOffset+m.treeRows()) {
+		if msg.Button == tea.MouseButtonLeft && msg.Y >= 2 {
+			row := m.treeOffset + msg.Y - 2 // Y=2 is the first tree row
+			if row < min(len(m.flat), m.treeOffset+m.treeRows()) {
 				m.selected = row
 				if m.flat[row].node.IsDir {
 					m.activateSelected()
@@ -1346,12 +1392,13 @@ func (m Model) contentOffsetAt(x, y int) int {
 	if m.mode != modeNormal || m.currentPath == "" || m.renderedPlain == "" {
 		return -1
 	}
-	// Panels pad their content by one column inside the border.
-	left := 2
+	// Borderless panes: content text starts right after the divider column
+	// (or at the screen edge in compact mode).
+	left := 0
 	if !m.compact && m.treeVisible {
-		left = m.treeWidth + 2
+		left = m.treeWidth + 1
 	}
-	if x < left || x >= m.width-1 || y < 2 || y >= m.bodyHeight {
+	if x < left || x >= left+m.preview.Width || y < 2 || y >= m.bodyHeight {
 		return -1
 	}
 	// The panel's top border is at y=1; inside it sit the metadata lines,
@@ -3628,7 +3675,7 @@ func (m *Model) scrollPreviewToLine(line0 int) {
 }
 
 func (m *Model) adjustPreviewHeight() {
-	base := max(1, m.contentHeight()-2)
+	base := max(1, m.bodyHeight-2) // title + meta rows
 	if m.mode == modeSearch {
 		base = max(1, base-1)
 	}
@@ -4028,7 +4075,7 @@ func (m *Model) ensureSelectionVisible() {
 	m.treeOffset = max(0, m.treeOffset)
 }
 
-func (m *Model) treeRows() int { return max(1, m.bodyHeight-2) }
+func (m *Model) treeRows() int { return max(1, m.bodyHeight-1) } // title row takes one
 
 func (m *Model) resize(width, height int) {
 	m.width, m.height = max(1, width), max(1, height)
@@ -4060,17 +4107,16 @@ func (m *Model) resize(width, height int) {
 		m.treeWidth = max(28, min(36, m.width/3))
 	}
 
-	// Panels pad their content by one column inside each border they draw; in
-	// the split layout the content pane leans on the shared separator instead
-	// of a left border, so it gets one column more.
+	// Borderless layout: the content pane owns every column right of the
+	// divider, and its rows are title + meta + content.
 	contentWidth := m.width
-	innerWidth := max(10, contentWidth-4)
+	innerWidth := max(10, contentWidth)
 	if !m.compact && m.treeVisible {
 		contentWidth = max(1, m.width-m.treeWidth-1)
-		innerWidth = max(10, contentWidth-3)
+		innerWidth = max(10, contentWidth)
 	}
 	m.editor.SetWidth(innerWidth)
-	m.editor.SetHeight(max(1, m.contentHeight()-2))
+	m.editor.SetHeight(max(1, m.bodyHeight-2))
 	m.preview.Width = innerWidth
 	m.adjustPreviewHeight()
 	m.ensureSelectionVisible()
@@ -4403,43 +4449,135 @@ func (m Model) View() string {
 	if m.width <= 1 || m.height <= 1 {
 		return "TN"
 	}
-	if m.mode == modeHelp {
-		return m.helpView()
-	}
-	if m.mode == modeCommand {
-		return m.commandView()
-	}
-	if m.mode == modeWebdavConfig {
-		return m.webdavConfigView()
-	}
-	if m.mode == modeExport {
-		return m.exportDialogView()
-	}
-	if m.mode == modeBackup {
-		return m.backupView()
-	}
-	if m.mode == modeImport {
-		return m.importView()
-	}
-	if m.mode == modeSearchGlobal {
-		return m.globalSearchView()
-	}
-	if m.mode == modeQuickOpen {
-		return m.quickOpenView()
-	}
-	if m.mode == modeTag {
-		return m.tagEditView()
-	}
-	if (m.mode == modePrompt && m.promptKind != promptGotoLine) || m.mode == modeConfirm {
-		return m.dialogView()
-	}
-	if m.focusing {
+	var view string
+	switch {
+	case m.mode == modeHelp:
+		view = m.helpView()
+	case m.mode == modeCommand:
+		view = m.commandView()
+	case m.mode == modeWebdavConfig:
+		view = m.webdavConfigView()
+	case m.mode == modeExport:
+		view = m.exportDialogView()
+	case m.mode == modeBackup:
+		view = m.backupView()
+	case m.mode == modeImport:
+		view = m.importView()
+	case m.mode == modeSearchGlobal:
+		view = m.globalSearchView()
+	case m.mode == modeQuickOpen:
+		view = m.quickOpenView()
+	case m.mode == modeTag:
+		view = m.tagEditView()
+	case (m.mode == modePrompt && m.promptKind != promptGotoLine) || m.mode == modeConfirm:
+		view = m.dialogView()
+	case m.focusing:
 		if m.mode == modeSearch {
-			return m.inNoteSearchFocusView()
+			view = m.inNoteSearchFocusView()
+		} else {
+			view = m.focusView()
 		}
-		return m.focusView()
+	default:
+		view = m.workbenchView()
 	}
+	return paintBackground(view, m.width, m.height)
+}
 
+// paintBackground re-paints the app background across a composed view.
+// Inner lipgloss styles end with an ANSI reset that cuts any outer background
+// short, which used to leave default-terminal-colored blocks around borders
+// and padding (visible as odd blocks at the panel corners and screen edges).
+// Injecting the background sequence after every reset keeps the backdrop
+// uniform; trailing and vertical padding are painted with it as well.
+//
+// The sequence is probed from lipgloss itself, so it always matches the
+// terminal's detected color profile (truecolor, 256 or 16 colors) instead of
+// assuming raw 48;2 support. Without color support there is nothing to paint.
+func paintBackground(view string, width, height int) string {
+	// Render one background-painted space and take its leading SGR as the
+	// background sequence — this is exactly what lipgloss feeds the terminal.
+	probe := lipgloss.NewStyle().Background(bg).Render(" ")
+	i := strings.IndexByte(probe, ' ')
+	if i <= 0 || !strings.HasSuffix(probe, "\x1b[0m") {
+		return view
+	}
+	bgSeq := probe[:i]
+	lines := strings.Split(view, "\n")
+	for i, line := range lines {
+		line = repaintLineBackgrounds(line, bgSeq)
+		if pad := width - termansi.StringWidth(line); pad > 0 {
+			line += bgSeq + strings.Repeat(" ", pad)
+		}
+		lines[i] = line
+	}
+	for len(lines) < height {
+		lines = append(lines, bgSeq+strings.Repeat(" ", width))
+	}
+	return strings.Join(lines, "\n")
+}
+
+// sgrRe matches ANSI SGR escape sequences.
+var sgrRe = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+
+// repaintLineBackgrounds re-arms backgrounds after every SGR reset using a
+// small style stack. Inner lipgloss styles end with a reset that would
+// otherwise strip the enclosing background for the rest of the line (light
+// blocks around the brand name inside the surface header bar, code cards
+// losing their card color mid-line, and so on). After each reset the nearest
+// enclosing background is re-emitted: surface inside bars, app background in
+// the body, card background inside code blocks.
+func repaintLineBackgrounds(line, appBg string) string {
+	type frame struct{ bg string } // "" = style without its own background
+	stack := []frame{{bg: appBg}}
+	nearest := func() string {
+		for i := len(stack) - 1; i >= 0; i-- {
+			if stack[i].bg != "" {
+				return stack[i].bg
+			}
+		}
+		return appBg
+	}
+	var b strings.Builder
+	b.WriteString(appBg) // paint plain-text lines too
+	last := 0
+	for _, loc := range sgrRe.FindAllStringIndex(line, -1) {
+		b.WriteString(line[last:loc[0]])
+		last = loc[1]
+		seq := line[loc[0]:loc[1]]
+		b.WriteString(seq)
+		fields := strings.Split(seq[2:len(seq)-1], ";")
+		setsBg, isReset := false, false
+		for k := 0; k < len(fields); k++ {
+			switch fields[k] {
+			case "", "0", "00", "49":
+				isReset = true
+			case "48": // extended background: 48;2;r;g;b or 48;5;n
+				setsBg = true
+				if k+1 < len(fields) && (fields[k+1] == "2" || fields[k+1] == "5") {
+					k += 2
+				}
+			case "40", "41", "42", "43", "44", "45", "46", "47",
+				"100", "101", "102", "103", "104", "105", "106", "107":
+				setsBg = true
+			}
+		}
+		switch {
+		case setsBg:
+			stack = append(stack, frame{bg: seq})
+		case isReset:
+			if len(stack) > 1 {
+				stack = stack[:len(stack)-1]
+			}
+			b.WriteString(nearest())
+		default:
+			stack = append(stack, frame{})
+		}
+	}
+	b.WriteString(line[last:])
+	return b.String()
+}
+
+func (m Model) workbenchView() string {
 	header := m.headerView()
 	var body string
 	if m.compact {
@@ -4452,14 +4590,18 @@ func (m Model) View() string {
 		body = m.contentView(m.width)
 	} else {
 		contentW := max(1, m.width-m.treeWidth-1)
-		// The separator column joins both panel frames, so its first and last
-		// cells are tees rather than plain verticals.
-		rows := max(2, m.bodyRenderHeight())
-		separator := "┬\n" + strings.Repeat("│\n", rows-2) + "┴"
+		// A single divider column separates the panes; it reads as the tree
+		// pane's inner edge, so it lights up with the tree's focus color.
+		sepColor := rule
+		if m.active == treePane {
+			sepColor = accent
+		}
+		separator := lipgloss.NewStyle().Foreground(sepColor).Render(
+			strings.Repeat("│\n", max(1, m.bodyHeight-1))+"│")
 		body = lipgloss.JoinHorizontal(lipgloss.Top,
-			m.treeViewSides(m.treeWidth, true, false),
-			lipgloss.NewStyle().Foreground(rule).Render(separator),
-			m.contentViewSides(contentW, false, true),
+			truncateToHeight(m.treePaneLines(m.treeWidth), m.bodyHeight),
+			separator,
+			truncateToHeight(m.contentPaneLines(contentW), m.bodyHeight),
 		)
 	}
 	var bottom string
@@ -4475,15 +4617,7 @@ func (m Model) View() string {
 	default:
 		bottom = m.statusView()
 	}
-	view := header + "\n" + body + "\n" + bottom
-	return lipgloss.NewStyle().Background(bg).Width(m.width).Height(m.height).Render(view)
-}
-
-func (m Model) bodyRenderHeight() int {
-	if m.mode == modeSearch {
-		return max(1, m.bodyHeight-1)
-	}
-	return m.bodyHeight
+	return header + "\n" + body + "\n" + bottom
 }
 
 func (m Model) headerView() string {
@@ -4609,12 +4743,18 @@ func (m Model) toolbarActionAt(x int) string {
 }
 
 func (m Model) treeView(width int) string {
-	return m.treeViewSides(width, true, true)
+	return truncateToHeight(m.treePaneLines(width), m.bodyHeight)
 }
 
-func (m Model) treeViewSides(width int, leftB, rightB bool) string {
+// treePaneLines renders the borderless tree pane: a title row followed by the
+// visible items, exactly bodyHeight rows so it joins the separator column.
+func (m Model) treePaneLines(width int) []string {
 	focused := m.active == treePane
-	title := "Lists"
+	titleStyle := lipgloss.NewStyle().Foreground(muted)
+	if focused {
+		titleStyle = lipgloss.NewStyle().Foreground(accent).Bold(true)
+	}
+	title := titleStyle.Render("Lists")
 	if len(m.flat) > 0 {
 		title += mutedSty.Render(fmt.Sprintf(" · %d", len(m.flat)))
 	}
@@ -4624,10 +4764,8 @@ func (m Model) treeViewSides(width int, leftB, rightB bool) string {
 	if m.tagFilter != "" {
 		title += " · " + lipgloss.NewStyle().Foreground(accent).Render("#"+m.tagFilter)
 	}
-	innerWidth := panelInnerWidth(width, leftB, rightB)
-	var lines []string
-	rows := m.treeRows()
-	end := min(len(m.flat), m.treeOffset+rows)
+	lines := []string{truncateANSI(title, width)}
+	end := min(len(m.flat), m.treeOffset+m.treeRows())
 	for i := m.treeOffset; i < end; i++ {
 		item := m.flat[i]
 		selected := i == m.selected
@@ -4667,9 +4805,9 @@ func (m Model) treeViewSides(width int, leftB, rightB bool) string {
 		}
 		// Depth guides keep deep trees readable without extra chrome.
 		indent := strings.Repeat(paint(rule, false).Render("│")+paint(muted, false).Render(" "), item.depth)
-		row := truncateANSI(indent+label, innerWidth)
+		row := truncateANSI(indent+label, width)
 		if selected {
-			gap := max(0, innerWidth-lipgloss.Width(row))
+			gap := max(0, width-lipgloss.Width(row))
 			row += lipgloss.NewStyle().Background(selection).Render(strings.Repeat(" ", gap))
 		}
 		lines = append(lines, row)
@@ -4683,33 +4821,46 @@ func (m Model) treeViewSides(width int, leftB, rightB bool) string {
 			key.Render("N")+mutedSty.Render("  new folder"),
 		)
 	}
-	return borderedPanelPart(title, strings.Join(lines, "\n"), width, m.bodyRenderHeight(), focused, leftB, rightB)
+	return lines
+}
+
+// truncateToHeight pads or clips lines to exactly n rows.
+func truncateToHeight(lines []string, n int) string {
+	for len(lines) < n {
+		lines = append(lines, "")
+	}
+	return strings.Join(lines[:max(0, min(len(lines), n))], "\n")
 }
 
 func (m Model) contentView(width int) string {
-	return m.contentViewSides(width, true, true)
+	return truncateToHeight(m.contentPaneLines(width), m.bodyHeight)
 }
 
-func (m Model) contentViewSides(width int, leftB, rightB bool) string {
+// contentPaneLines renders the borderless note pane: title row, one metadata
+// row, then the editor or preview content.
+func (m Model) contentPaneLines(width int) []string {
 	focused := m.active == contentPane || m.mode == modeEdit
-	title := "Note"
+	titleStyle := lipgloss.NewStyle().Foreground(muted)
+	if focused {
+		titleStyle = lipgloss.NewStyle().Foreground(accent).Bold(true)
+	}
+	title := titleStyle.Render("Note")
 	if m.currentPath != "" {
-		title = filepath.Base(m.currentPath)
+		name := filepath.Base(m.currentPath)
 		if m.nodePinned[m.currentPath] {
-			title += lipgloss.NewStyle().Foreground(warning).Render(" ★")
+			name += lipgloss.NewStyle().Foreground(warning).Render(" ★")
 		}
 		if m.mode == modeNormal && m.previewLineCount() > m.preview.Height {
 			if pct := m.previewPercent(); pct > 0 {
-				title += mutedSty.Render(fmt.Sprintf(" · %d%%", pct))
+				name += mutedSty.Render(fmt.Sprintf(" · %d%%", pct))
 			}
 		}
+		title = titleStyle.Render(truncateANSI(name, max(4, width)))
 	}
+	lines := []string{title}
 
-	innerWidth := panelInnerWidth(width, leftB, rightB)
-
-	// One quiet metadata line: the header already carries the path and the
+	// One quiet metadata row: the header already carries the path and the
 	// dirty flag, so this row only adds what nothing else shows.
-	var meta string
 	if m.currentPath != "" {
 		content := m.editor.Value()
 		stats := fmt.Sprintf("%d words · %d chars · %d lines · ~%s read",
@@ -4719,19 +4870,18 @@ func (m Model) contentViewSides(width int, leftB, rightB bool) string {
 			metaLine += mutedSty.Render(" · ") +
 				lipgloss.NewStyle().Foreground(warning).Render("unsaved")
 		}
-		meta = truncateANSI(metaLine, innerWidth) + "\n"
+		lines = append(lines, truncateANSI(metaLine, width))
 		if tags := m.nodeTags[m.currentPath]; len(tags) > 0 {
-			meta += m.tagsRow(tags, max(4, innerWidth)) + "\n"
+			lines = append(lines, m.tagsRow(tags, max(4, width)))
 		}
 	}
 
-	var content string
 	if m.currentPath == "" {
-		content = m.emptyContentView()
+		lines = append(lines, strings.Split(m.emptyContentView(), "\n")...)
 	} else if m.mode == modeEdit {
-		content = m.editor.View()
+		lines = append(lines, strings.Split(m.editor.View(), "\n")...)
 	} else {
-		content = m.preview.View()
+		preview := m.preview.View()
 		if m.contentDragging {
 			start, end := m.contentSelAnchor, m.contentSelEnd
 			if start > end {
@@ -4740,12 +4890,45 @@ func (m Model) contentViewSides(width int, leftB, rightB bool) string {
 			if end > start {
 				highlighted := renderSelectionContent(m.renderedContent, m.renderedPlain, start, end)
 				m.preview.SetContent(highlighted)
-				content = m.preview.View()
+				preview = m.preview.View()
 			}
 		}
+		lines = append(lines, strings.Split(m.overlayScrollbar(preview), "\n")...)
 	}
+	return lines
+}
 
-	return borderedPanelPart(title, meta+content, width, m.bodyRenderHeight(), focused, leftB, rightB)
+// overlayScrollbar paints the scroll thumb directly onto the preview's last
+// column, so the indicator hugs the panel edge without reserving any width.
+// Content that fits without scrolling is returned unchanged.
+func (m Model) overlayScrollbar(preview string) string {
+	total := m.previewLineCount()
+	visible := max(1, m.preview.Height)
+	if total <= visible {
+		return preview
+	}
+	thumb := lipgloss.NewStyle().Foreground(accent).Render("▐")
+	thumbSize := max(1, visible*visible/total)
+	if thumbSize > visible {
+		thumbSize = visible
+	}
+	pos := 0
+	if maxOffset := total - visible; maxOffset > 0 {
+		pos = m.preview.YOffset * (visible - thumbSize) / maxOffset
+	}
+	rows := strings.Split(preview, "\n")
+	for i := 0; i < len(rows) && i < visible; i++ {
+		if i < pos || i >= pos+thumbSize {
+			continue
+		}
+		// Pad to one cell short of the viewport, then replace the final cell
+		// with the thumb so it sits flush against the panel border.
+		if pad := m.preview.Width - 1 - termansi.StringWidth(rows[i]); pad > 0 {
+			rows[i] += strings.Repeat(" ", pad)
+		}
+		rows[i] = termansi.Truncate(rows[i], m.preview.Width-1, "") + thumb
+	}
+	return strings.Join(rows, "\n")
 }
 
 func (m Model) contentHeight() int {
@@ -4763,84 +4946,6 @@ func (m Model) emptyContentView() string {
 		key.Render("n") + mutedSty.Render("  new note") + "\n" +
 		key.Render("N") + mutedSty.Render("  new folder") + "\n" +
 		key.Render("?") + mutedSty.Render("  shortcuts")
-}
-
-// panelInnerWidth is the text width available inside a panel: the border on
-// each requested side plus one column of padding.
-func panelInnerWidth(width int, leftB, rightB bool) int {
-	inner := max(4, width) - 2
-	if leftB {
-		inner--
-	}
-	if rightB {
-		inner--
-	}
-	return max(1, inner)
-}
-
-// borderedPanelPart draws one pane: a titled top border, padded content rows
-// and a bottom border. leftB/rightB select which vertical borders are drawn so
-// two panes can share a single separator column between them.
-func borderedPanelPart(title, content string, width, height int, focused bool, leftB, rightB bool) string {
-	width, height = max(4, width), max(3, height)
-	borderColor := rule
-	titleColor := muted
-	if focused {
-		borderColor = accent
-		titleColor = accent
-	}
-	inner := panelInnerWidth(width, leftB, rightB)
-	frameWidth := inner + 2
-	innerHeight := max(1, height-2)
-	title = truncateANSI(title, max(1, inner))
-	border := lipgloss.NewStyle().Foreground(borderColor)
-	titleText := border.Render(" ") + lipgloss.NewStyle().Foreground(titleColor).Bold(focused).Render(title) + border.Render(" ")
-	topTail := max(0, frameWidth-lipgloss.Width(titleText))
-	top := ""
-	if leftB {
-		top += border.Render("┌")
-	}
-	top += titleText + border.Render(strings.Repeat("─", topTail))
-	if rightB {
-		top += border.Render("┐")
-	}
-
-	content = fitBlock(content, inner, innerHeight)
-	rows := strings.Split(content, "\n")
-	for i, row := range rows {
-		line := ""
-		if leftB {
-			line += border.Render("│")
-		}
-		line += " " + truncateANSI(row, inner) + strings.Repeat(" ", max(0, inner-lipgloss.Width(row))) + " "
-		if rightB {
-			line += border.Render("│")
-		}
-		rows[i] = line
-	}
-	bottom := ""
-	if leftB {
-		bottom += border.Render("└")
-	}
-	bottom += border.Render(strings.Repeat("─", frameWidth))
-	if rightB {
-		bottom += border.Render("┘")
-	}
-	return top + "\n" + strings.Join(rows, "\n") + "\n" + bottom
-}
-
-func fitBlock(content string, width, height int) string {
-	lines := strings.Split(content, "\n")
-	if len(lines) > height {
-		lines = lines[:height]
-	}
-	for len(lines) < height {
-		lines = append(lines, "")
-	}
-	for i, line := range lines {
-		lines[i] = truncateANSI(line, width)
-	}
-	return strings.Join(lines, "\n")
 }
 
 func (m Model) statusView() string {
@@ -4941,7 +5046,9 @@ func (m Model) gotoBarView() string {
 
 func (m Model) statusText(status string) string {
 	if m.statusErr {
-		return errorSty.Render(status)
+		// Errors get a glyph so state doesn't rely on color alone; success
+		// messages already carry their own ✓.
+		return errorSty.Render("✕ " + status)
 	}
 	if m.statusOK {
 		return successSty.Render(status)
@@ -5321,6 +5428,20 @@ func (m *Model) exitCommand() {
 	m.restoreCommandFocus()
 }
 
+// slashMenuAllowed reports whether a freshly typed "/" should open the
+// format menu: only at the start of a line or right after a blank. Mid-word
+// slashes (paths, URLs, dates) must not hijack the following keystrokes.
+func (m Model) slashMenuAllowed() bool {
+	line := m.currentLineText()
+	col := m.cursorPos().col
+	runes := []rune(line)
+	if col <= 0 || col > len(runes) {
+		return true
+	}
+	r := runes[col-1]
+	return r == ' ' || r == '\t'
+}
+
 func (m *Model) startMarkdown() {
 	m.commandBeforeMode = m.mode
 	m.commandBeforeActive = m.active
@@ -5431,7 +5552,7 @@ func (m *Model) applyMarkdown(item markdownItem) {
 	m.recordEdit(m.editor.Value(), m.editor.Value(), m.cursorPos(), m.cursorPos())
 }
 
-func (m *Model) updateMarkdown(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m Model) updateMarkdown(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.Type {
 	case tea.KeyEsc:
 		m.exitMarkdown()
@@ -5440,8 +5561,17 @@ func (m *Model) updateMarkdown(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		items := m.filteredMarkdownItems()
 		if len(items) > 0 && m.markdownIndex >= 0 && m.markdownIndex < len(items) {
 			m.applyMarkdown(items[m.markdownIndex])
+			return m, m.takePending()
 		}
-		return m, m.takePending()
+		// Nothing matches the filter: close the menu and let Enter be Enter —
+		// insert a plain newline into the editor instead of swallowing it.
+		m.exitMarkdown()
+		before := m.editor.Value()
+		beforePos := m.cursorPos()
+		var cmd tea.Cmd
+		m.editor, cmd = m.editor.Update(tea.KeyMsg{Type: tea.KeyEnter})
+		m.recordEdit(before, m.editor.Value(), beforePos, m.cursorPos())
+		return m, cmd
 	case tea.KeyUp:
 		m.moveMarkdown(-1)
 		return m, nil

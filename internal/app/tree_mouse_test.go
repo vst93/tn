@@ -97,10 +97,8 @@ func TestTreeMouseClickBelowVisibleRowSelectsNothing(t *testing.T) {
 	m.switchToTree()
 	m.selected = -1
 
-	// Y == bodyHeight is the bottom border row of the tree pane; the item it
-	// would map to (treeRows) is below the visible window, so the click must
-	// be ignored.
-	clickTree(&m, 3, m.bodyHeight)
+	// A click below the visible window (beyond the body area) must be ignored.
+	clickTree(&m, 3, m.bodyHeight+1)
 	if m.selected != -1 {
 		t.Fatalf("click below visible rows: selected = %d, want -1", m.selected)
 	}
